@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lunex Bot</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="login-screen"></div>
+
+    <div id="app-shell" hidden>
+      <header>
+        <h1>Lunex Bot</h1>
+        <div class="header-controls">
+          <button id="pause-btn" type="button">Pause</button>
+          <button id="resume-btn" type="button">Resume</button>
+          <button id="logout-btn" type="button">Logout</button>
+        </div>
+      </header>
+      <nav id="main-nav">
+        <button data-view="dashboard" class="active">Dashboard</button>
+        <button data-view="positions">Positions</button>
+        <button data-view="stuck">Stuck</button>
+        <button data-view="cooldowns">Cooldowns</button>
+        <button data-view="logs">Logs</button>
+        <button data-view="history">History</button>
+        <button data-view="settings">Settings</button>
+      </nav>
+      <main id="view-container"></main>
+    </div>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,255 @@
+// Lunex Bot — Prisma schema
+//
+// Models are added incrementally, module by module, as each module actually
+// needs persisted state. See README.md "Module status" for what's
+// implemented so far.
+//
+// Provider note: `provider` below targets SQLite (matches
+// DATABASE_PROVIDER=sqlite in .env.example) -- this is a SQL-DIALECT choice
+// fixed at schema/migration time, not a runtime switch. Prisma 7 removed
+// `datasource.url` from this file entirely (schema validation now rejects
+// it, error P1012); the connection URL for migrations lives in
+// `prisma7.config.ts` at the repo root, and the app's own runtime
+// connection (`storage/prismaClient.ts`) builds an explicit driver adapter
+// (`@prisma/adapter-better-sqlite3` / `@prisma/adapter-pg`) from
+// `config.database`, since Prisma 7 requires `new PrismaClient({ adapter })`
+// -- there is no more implicit "reads DATABASE_URL and connects."
+// Switching to Postgres for production means: change `provider` below to
+// "postgresql", run `prisma migrate dev` to regenerate migrations, and set
+// DATABASE_PROVIDER=postgresql (so `storage/prismaClient.ts` picks the pg
+// adapter) -- still a small, explicit change, never silently runtime-swapped.
+datasource db {
+  provider = "sqlite"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+/// Per-token post-exit cooldown (2h, per spec) -- NEVER a global cooldown.
+/// One row per token that has ever exited; upserted on every exit.
+model TokenCooldown {
+  /// Lowercased EVM address -- always normalized before read/write so
+  /// lookups can't miss due to checksum-casing differences.
+  tokenAddress   String   @id
+  exitedAt       DateTime
+  cooldownEndsAt DateTime
+  updatedAt      DateTime @updatedAt
+
+  @@index([cooldownEndsAt])
+}
+
+/// Tracks every critical on-chain operation (deploy or exit) through the
+/// mandatory Build -> Simulate -> Gas Check -> Nonce Check -> Send ->
+/// Wait Receipt -> Verify On-chain -> Update State pipeline.
+///
+/// This is what makes the pipeline crash-safe: `idempotencyKey` lets a
+/// resumed process find an in-flight attempt instead of starting a new
+/// one (which could double-spend or double-nonce), and `rawTx`/`txHash`
+/// are persisted BEFORE broadcasting -- computed from the locally-signed
+/// transaction, not from the broadcast response -- so even if the actual
+/// broadcast call throws/times out (network blip, RPC drop), a resumed
+/// process already knows the exact hash to look up on-chain rather than
+/// guessing whether anything was sent at all.
+model TransactionAttempt {
+  id             String   @id @default(cuid())
+  /// Caller-supplied, unique per logical operation (e.g.
+  /// "deploy:0xTOKEN:2026-09-06T12:00:00Z" or "exit:positionId=42"). The
+  /// one thing every idempotency/resume decision keys off of.
+  idempotencyKey String   @unique
+  /// Free-form description for logs/diagnostics only.
+  purpose        String
+  status         String
+  /// JSON-encoded {to, data, value} -- persisted once built so a resumed
+  /// process re-verifies against the SAME request rather than rebuilding
+  /// (and potentially computing subtly different calldata).
+  txRequest      String?
+  gasLimit       BigInt?
+  gasPrice       BigInt?
+  nonce          Int?
+  rawTx          String?
+  txHash         String?
+  lastError      String?
+  /// Set only when status is FAILED -- distinguishes WHY: rejected pre-broadcast
+  /// (SIMULATION_REJECTED / GAS_UNAFFORDABLE), rejected synchronously by the node
+  /// at broadcast time (BROADCAST_REJECTED -- e.g. nonce too low, insufficient
+  /// funds), reverted after being mined (REVERTED), or confirmed but failed a
+  /// post-hoc business check (VERIFICATION_FAILED). Added per explicit review --
+  /// not part of the original spec's status list, but needed so a stuck/failed
+  /// attempt's root cause is queryable (e.g. a future `/status` command) without
+  /// parsing `lastError` free text.
+  failureCode    String?
+  /// How many times `executeCriticalTransaction` has been called for this
+  /// key and actually done pipeline work (short-circuited VERIFIED/FAILED
+  /// re-checks don't count). Added per explicit review, for stuck-attempt
+  /// detection -- see `execution/stuckAttempt.ts`.
+  attemptCount     Int       @default(0)
+  /// Set on the first non-short-circuited call. Combined with
+  /// `attemptCount`, lets a resumable-but-not-progressing attempt (stuck
+  /// in an ambiguous state) be found by query -- e.g. "non-terminal AND
+  /// older than 10 minutes" -- without any push notification (Telegram
+  /// stays on-demand-only per spec).
+  firstAttemptedAt DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([status])
+}
+
+/// One row per LP position, active or historical. The source of truth
+/// for "1 coin = 1 active position" (queried by tokenAddress + status)
+/// and for capital/'s `totalDeployedUsdg` (sum of `entryUsdgRaw` across
+/// ACTIVE rows) -- both were left as honest gaps in Module 5 pending
+/// this model existing.
+model Position {
+  id             String  @id @default(cuid())
+  /// Lowercased EVM address -- normalized the same way as
+  /// TokenCooldown.tokenAddress, so lookups can't miss on casing.
+  tokenAddress   String
+  tokenSymbol    String
+  tokenDecimals  Int
+  /// v4 pool id (bytes32 hex) and the full PoolKey, decomposed (not a
+  /// JSON blob) so monitoring/ can reconstruct a `v4Sdk.Pool` without
+  /// re-parsing -- these came from `pools/` (Module 3) at selection time
+  /// and never change for this position's lifetime.
+  poolId         String
+  currency0      String
+  currency1      String
+  fee            Int
+  tickSpacing    Int
+  hooks          String
+  tickLower      Int
+  tickUpper      Int
+  /// PositionManager NFT tokenId -- set once the open transaction is
+  /// verified on-chain, not before (per the transaction-safety pipeline:
+  /// never record state that hasn't been confirmed).
+  positionTokenId String?
+  /// Amount deployed at entry (35% of free USDG balance, per capital/),
+  /// raw units, as a decimal STRING -- not BigInt. VERIFIED (an earlier
+  /// version of this schema used BigInt and it broke immediately in the
+  /// real-SQLite integration test): a routine 18-decimal USDG amount
+  /// like 1000 USDG = 1000 * 10^18 already exceeds SQLite's 64-bit
+  /// signed INTEGER range that Prisma's BigInt column maps to (max
+  /// ~9.2 * 10^18) -- this is not an edge case, it's the normal case for
+  /// any token with 18 decimals. The PNL basis -- never recomputed,
+  /// since "entry" is a point-in-time fact.
+  entryUsdgRaw   String
+  /// sqrtPriceX96 at entry, as a decimal STRING -- not BigInt, same
+  /// reasoning: Uniswap's sqrtPriceX96 can reach ~2^160, also far beyond
+  /// the 64-bit range.
+  entrySqrtPriceX96 String
+  entryTick      Int
+  status         String // OPENING | ACTIVE | CLOSING | CLOSED | FAILED
+  /// Ties this position to the `TransactionAttempt` that opened it.
+  openIdempotencyKey  String  @unique
+  /// Ties this position to the `TransactionAttempt` that closed it, once
+  /// exiting starts (Module 8, exits/ -- not built yet).
+  closeIdempotencyKey String? @unique
+  openedAt       DateTime?
+  closedAt       DateTime?
+  closeReason    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([status])
+  @@index([tokenAddress, status])
+}
+
+/// Persistent state for exits/'s stateful exit triggers (Module 8) — Trailing
+/// TP's peak/drawdown-confirm timer and OOR's grace timer MUST survive a bot
+/// restart mid-countdown (same principle as TransactionAttempt's crash-safety
+/// for Module 6), so none of this lives in an in-memory variable. One row per
+/// position, created lazily on first use by exits/, not by positions/create()
+/// — kept decoupled the same way TokenCooldown is its own standalone table
+/// rather than a Position column, since exits/ owns this state, not positions/.
+model ExitState {
+  positionId String @id
+
+  /// Highest PNL % ever observed once Trailing TP has armed (null = not yet
+  /// armed). Armed once PNL reaches the effective threshold (+5% normally,
+  /// 0% once PNL Protection has activated, see pnlProtectionActivatedAt).
+  trailingPeakPnlPct Float?
+  /// Set the moment PNL first breaches (peak - 2%) after arming; cleared the
+  /// moment PNL recovers back above that line OR a new peak is set. Trailing
+  /// TP closes once `now - this >= EXITS.TRAILING_TP.CONFIRM_WINDOW_MS`.
+  drawdownConfirmStartedAt DateTime?
+  /// Set the moment price first goes out of [tickLower, tickUpper); cleared
+  /// the moment it's back in range. OOR closes once
+  /// `now - this >= EXITS.OOR.GRACE_WINDOW_MS`.
+  oorStartedAt DateTime?
+  /// Set ONCE, the first time PNL <= EXITS.PNL_PROTECTION.TRIGGER_PNL_PCT
+  /// (-8%) — never cleared even if PNL later recovers (sticky, per spec:
+  /// "cuma mengubah parameter Trailing TP" is a permanent retarget, not a
+  /// momentary one). Non-null means Trailing TP's arm threshold is
+  /// EXITS.PNL_PROTECTION.NEW_TP_TARGET_PCT (0%) instead of
+  /// EXITS.TRAILING_TP.TRIGGER_PEAK_PNL_PCT (+5%).
+  pnlProtectionActivatedAt DateTime?
+  /// Set on the first tick this position's live metrics fail to read
+  /// (PositionMetricsResult.ok === false); cleared on the next successful
+  /// read. Safety Exit condition (a) — see EXITS.SAFETY_EXIT in constants.ts.
+  metricsFailureSince DateTime?
+  /// Incremented every time the exit SWAP sub-transaction (not the
+  /// remove-liquidity one) is found FAILED (definitive). Used to derive a
+  /// FRESH idempotencyKey for each swap retry
+  /// (`${closeIdempotencyKey}:swap:${swapAttemptCount}`) — reusing the same
+  /// key would make executeCriticalTransaction return the cached FAILED
+  /// result forever (see exits/executeExit.ts). Also the basis for
+  /// EXITS.SWAP_RETRY.STUCK_THRESHOLD detection.
+  swapAttemptCount Int @default(0)
+  /// USDG balance observed the moment the CURRENT swap attempt's tx was
+  /// built -- decimal STRING, not BigInt/Int, same 64-bit-overflow reason
+  /// as Position.entryUsdgRaw (an 18-decimal USDG amount routinely exceeds
+  /// SQLite's signed-INTEGER range). Set once per attempt (inside
+  /// exits/swapTx.ts's buildTransaction, which runs exactly once and is
+  /// skipped on resume) so a resumed verifyOnChain call -- potentially in a
+  /// different process after a restart -- still has the correct baseline.
+  swapUsdgBalanceBeforeRaw String?
+  /// Minimum USDG increase required for the CURRENT swap attempt to verify
+  /// as successful (decimal STRING, same overflow reasoning) -- 0/absent
+  /// when EXITS.MIN_RECEIVED_PROTECTION_ENABLED is false, in which case
+  /// verification degrades to "genuinely increased at all."
+  swapMinOutputAmountRaw String?
+  /// The exit-trigger reason (SAFETY_EXIT/HARD_STOP_LOSS/TRAILING_TP/OOR)
+  /// recorded at the moment markClosing() is called — read back to pass to
+  /// markClosed() once the exit actually completes, potentially ticks or a
+  /// restart later. Must be persisted here, not carried in a JS variable
+  /// across the two DB writes, since a restart can happen in between.
+  pendingCloseReason String?
+
+  updatedAt DateTime @updatedAt
+
+  @@index([oorStartedAt])
+  @@index([drawdownConfirmStartedAt])
+}
+
+/// Live, operator-editable parameters (Module 10) -- singleton row (`id`
+/// always "singleton", exactly one bot instance). Defaults below match
+/// today's frozen `config.rules.*` constants exactly, so behavior is
+/// byte-identical to pre-Module-10 until an operator actually PATCHes
+/// something or pauses. See `settings/types.ts`'s doc comment for which
+/// parameters were chosen and why (stateless thresholds only -- timer/
+/// window durations that interact with an already-running persisted
+/// countdown in `ExitState` stay frozen in `config`, restart-only).
+model BotSettings {
+  id                   String   @id @default("singleton")
+  /// True = the 30-min screening cycle skips entirely (no new
+  /// deployments). Monitoring and exit are NEVER affected by this flag --
+  /// see `composition/screeningCycle.ts`'s doc comment.
+  paused               Boolean  @default(false)
+  /// Fraction 0-1 -- replaces CAPITAL.POSITION_SIZE_PCT_OF_FREE_BALANCE (0.35).
+  positionSizePct      Float    @default(0.35)
+  /// Replaces CAPITAL.MAX_ACTIVE_POSITIONS (3).
+  maxActivePositions   Int      @default(3)
+  /// Fraction, always negative -- replaces EXITS.HARD_STOP_LOSS_PCT (-0.15).
+  /// Cross-validated at write time against the frozen
+  /// EXITS.PNL_PROTECTION.TRIGGER_PNL_PCT (-0.08) -- see
+  /// settings/validateSettingsPatch.ts -- so a PATCH can never silently
+  /// defeat PNL Protection by making Hard Stop Loss fire first.
+  hardStopLossPct      Float    @default(-0.15)
+  /// Fraction, always positive -- replaces EXITS.TRAILING_TP.TRIGGER_PEAK_PNL_PCT
+  /// (0.05). Only takes effect for a position while PNL Protection has NOT
+  /// activated for it -- once activated, resolveExitDecision always uses
+  /// the frozen 0% target instead, regardless of this value.
+  trailingTpTriggerPct Float    @default(0.05)
+  updatedAt            DateTime @updatedAt
+}

@@ -1,0 +1,71 @@
+import type { Address } from 'viem';
+import { config } from '../config';
+import { encodeErc20Approve, readErc20Allowance } from '../blockchain/erc20';
+import { getExecutorAddress } from '../blockchain/walletClient';
+import type { TxSafetyDeps } from '../execution/types';
+import * as txSteps from '../execution/viemTxSteps';
+
+export interface ApproveVerifyData {
+  allowanceRaw: bigint;
+}
+
+export interface BuildApproveDepsOptions {
+  /** Injectable for tests -- defaults to the real on-chain ERC20 allowance read. */
+  readAllowance?: (tokenAddress: Address, owner: Address, spender: Address) => Promise<bigint>;
+  /** Injectable for tests -- defaults to the real configured executor wallet. */
+  walletAddress?: Address;
+}
+
+/**
+ * A conditional first leg of the open-position flow: an ordinary USDG
+ * `approve()` for the v4 PositionManager, needed before it can pull USDG
+ * into a new LP position via `mintTx.ts`. Same pattern as
+ * `exits/approveTx.ts` -- deliberately NOT shared code between the two
+ * modules (positions/ and exits/ each own their tx-builders, matching this
+ * project's established per-module convention, and importing one from the
+ * other would create a circular dependency between positions/ and exits/,
+ * which already depends on positions/ for `PositionRepository`).
+ *
+ * Unlike `exits/approveTx.ts`, the spender here is always the (fixed,
+ * configured) PositionManager address, and the token is always USDG --
+ * both fixed by this module's purpose, not passed in as parameters.
+ *
+ * Approves for exactly `amountInRaw` (this deployment's decided position
+ * size), not an infinite/unbounded allowance -- consistent with the same
+ * "approve exactly what's needed, nothing more" choice `exits/approveTx.ts`
+ * makes.
+ */
+export function buildApproveDeps(amountInRaw: bigint, options: BuildApproveDepsOptions = {}): TxSafetyDeps<ApproveVerifyData> {
+  const readAllowance = options.readAllowance ?? readErc20Allowance;
+  const wallet = options.walletAddress ?? getExecutorAddress();
+  const usdgAddress = config.quoteAsset.ADDRESS as Address;
+  const positionManagerAddress = config.uniswap.v4.positionManager as Address;
+
+  return {
+    buildTransaction: async () => {
+      const { to, data } = encodeErc20Approve(usdgAddress, positionManagerAddress, amountInRaw);
+      return { to, data, value: 0n };
+    },
+    simulate: txSteps.simulateTx,
+    estimateGas: txSteps.estimateGasForTx,
+    getGasPrice: txSteps.getCurrentGasPrice,
+    checkGasAffordable: txSteps.checkGasAffordableOnChain,
+    getNonce: txSteps.getCurrentNonce,
+    signTransaction: txSteps.signTx,
+    broadcastRaw: txSteps.broadcastRawTx,
+    waitForReceipt: txSteps.waitForTxReceipt,
+    getReceiptIfAvailable: txSteps.getReceiptIfAvailable,
+    verifyOnChain: async () => {
+      const allowanceRaw = await readAllowance(usdgAddress, wallet, positionManagerAddress);
+      if (allowanceRaw < amountInRaw) {
+        return { ok: false, reason: `USDG allowance for PositionManager is only ${allowanceRaw}, need at least ${amountInRaw}` };
+      }
+      return { ok: true, data: { allowanceRaw } };
+    },
+  };
+}
+
+/** Pure check: is an approve transaction even necessary, given the current on-chain allowance? Same helper shape as `exits/approveTx.ts`'s. */
+export function needsApproval(currentAllowanceRaw: bigint, amountInRaw: bigint): boolean {
+  return currentAllowanceRaw < amountInRaw;
+}
