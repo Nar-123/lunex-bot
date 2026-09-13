@@ -13,5 +13,7 @@ data/
 *.db-shm
 *.log
 coverage/
+# Lunex AI supervisor runtime state, logs and reports (never committed)
+.ai/
 .DS_Store
 Thumbs.db

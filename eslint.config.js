@@ -37,6 +37,11 @@ const tsParser = require('@typescript-eslint/parser');
 const tseslint = require('@typescript-eslint/eslint-plugin');
 
 const forSrc = (entry) => ({ ...entry, files: ['src/**/*.ts'] });
+// ops/lunex-ai (the development supervisor) gets the SAME rule set, typed
+// against its own tsconfig -- it is a separate program, not part of the
+// trading runtime, so `npm run lint` (src/ only) is unaffected.
+const AI_FILES = ['ops/lunex-ai/src/**/*.ts'];
+const forAi = (entry) => ({ ...entry, files: AI_FILES });
 
 module.exports = [
   // Type information for every linted file, from the project's real
@@ -51,10 +56,22 @@ module.exports = [
       },
     },
   },
+  {
+    files: AI_FILES,
+    languageOptions: {
+      parser: tsParser,
+      parserOptions: {
+        project: ['./ops/lunex-ai/tsconfig.json'],
+        tsconfigRootDir: __dirname,
+      },
+    },
+  },
   ...tseslint.configs['flat/recommended-type-checked'].map(forSrc),
   ...tseslint.configs['flat/strict-type-checked'].map(forSrc),
+  ...tseslint.configs['flat/recommended-type-checked'].map(forAi),
+  ...tseslint.configs['flat/strict-type-checked'].map(forAi),
   {
-    files: ['src/**/*.ts'],
+    files: ['src/**/*.ts', ...AI_FILES],
     rules: {
       '@typescript-eslint/no-unused-vars': [
         'error',

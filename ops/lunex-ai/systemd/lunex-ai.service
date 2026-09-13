@@ -1,0 +1,58 @@
+# Lunex AI development supervisor -- Telegram-controlled, development only.
+# It never trades, never deploys, and must not be able to see production.
+# Install: see ops/lunex-ai/DEPLOYMENT.md
+[Unit]
+Description=Lunex AI development supervisor (Telegram control, no trading)
+Documentation=file:///opt/lunex/workspace/lunex/ops/lunex-ai/DEPLOYMENT.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=lunex-ai
+Group=lunex-ai
+UMask=0027
+
+# The deployed copy of the supervisor lives OUTSIDE the workspace, so edits
+# the agent makes in ops/lunex-ai/ never take effect without an operator redeploy.
+WorkingDirectory=/opt/lunex/workspace/lunex
+EnvironmentFile=/opt/lunex/ai/lunex-ai.env
+Environment=NODE_ENV=production
+Environment=HOME=/opt/lunex/ai/home
+Environment=npm_config_cache=/opt/lunex/ai/home/.npm
+ExecStart=/usr/bin/node /opt/lunex/ai/app/dist/main.js
+
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# ---- OS-level scope enforcement (in addition to the in-code scope guard) ----
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Writable: the Lunex workspace and the AI home only. Everything else is read-only (ProtectSystem=strict).
+ReadWritePaths=/opt/lunex/workspace/lunex /opt/lunex/ai
+# Invisible to this service even if file permissions were ever misconfigured ("-" = ignore if absent).
+InaccessiblePaths=-/opt/lunex/production -/opt/lunex/trading -/root -/etc/lunex -/opt/other-bots
+
+[Install]
+WantedBy=multi-user.target

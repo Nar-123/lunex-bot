@@ -23,7 +23,12 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "ai:typecheck": "tsc --noEmit -p ops/lunex-ai/tsconfig.json",
+    "ai:lint": "eslint \"ops/lunex-ai/src/**/*.ts\"",
+    "ai:test": "vitest run --config ops/lunex-ai/vitest.config.ts",
+    "ai:build": "tsc -p ops/lunex-ai/tsconfig.build.json",
+    "ai:start": "node ops/lunex-ai/dist/main.js"
   },
   "dependencies": {
     "@prisma/adapter-better-sqlite3": "^7.10.0",
