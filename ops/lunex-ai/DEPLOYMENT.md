@@ -1,352 +1,227 @@
 # Lunex AI Supervisor — Deployment VPS
 
-Dokumen ini menjelaskan cara memasang **Lunex AI Supervisor** (`ops/lunex-ai/`) di VPS sebagai
-service `lunex-ai.service`, dikendalikan lewat **satu** Telegram bot.
+Cara memasang **Lunex AI Supervisor** (`ops/lunex-ai/`) di VPS Ubuntu sebagai `lunex-ai.service`,
+dikendalikan lewat **satu** Telegram bot khusus.
 
-> **Status verifikasi (jujur):** kode, 243 unit/integration test, typecheck, lint, dan build
-> supervisor sudah lulus di mesin development. Yang **BELUM** diverifikasi: berjalan di VPS
-> sungguhan, systemd unit di Linux sungguhan, koneksi Telegram sungguhan, dan panggilan
-> TokenRouter sungguhan. Model ID `z-ai/glm-5.3-free` **UNVERIFIED** — tidak tercantum di
-> dokumentasi publik TokenRouter; cek di dashboard TokenRouter Anda (lihat §8).
+Target yang dirancang: Ubuntu 24.04, x86_64, 2 CPU, 3.6 GB RAM, Node.js 22, systemd 255,
+dengan project lain (`/opt/finance-bot`, `/opt/guardian`) di host yang sama.
 
----
-
-## 0. Apa yang dilakukan supervisor — dan apa yang tidak
-
-**Dilakukan:** menerima task dari Telegram (command atau bahasa natural), menjalankan loop
-*inspect → plan → implement → test → debug → verify → checkpoint → report* memakai GLM via
-TokenRouter, memverifikasi sendiri (typecheck, lint, seluruh test, build), commit ke branch
-`ai/<topik>-<id>`, fast-forward ke `ai/develop`, lalu mengirim laporan ke Telegram.
-
-**Tidak pernah dilakukan (dipaksakan di kode + systemd, bukan hanya prompt):**
-
-| Larangan | Mekanisme |
-|---|---|
-| Menyentuh `/opt/lunex/production`, `/opt/lunex/trading`, `/root`, repo/bot lain | `ScopeGuard` (realpath, anti-symlink/`..`) **dan** systemd `InaccessiblePaths` + `ProtectSystem=strict` |
-| Membaca `.env`, `*.pem`, `*.key`, `lunex-ai.env` | `ScopeGuard` menolak nama file tersebut untuk agent **dan** supervisor |
-| Menjalankan `node`, `npm start`, `validate-live`, install paket, shell | `commandPolicy` allowlist (hanya `git`, `npm run <script aman>`, `npx vitest/tsc/eslint/prisma generate`), tanpa shell |
-| `git push`, `reset`, `clean`, `rebase`, force, hapus branch, ubah config | `commandPolicy` |
-| Menulis ke `ops/lunex-ai/` (guardrail-nya sendiri), `.git`, `.ai`, `.github` | `ScopeGuard` write protection + pengecekan saat commit |
-| Commit secret | scan baris yang ditambahkan sebelum commit → BLOCKED + worker pause |
-| Mengubah strategi trading tanpa izin eksplisit | strategy guard: perubahan pada file sensitif hanya di-commit di branch task, **tidak di-merge**, dilaporkan BLOCKED sampai `/approve <taskId>` |
-| Membocorkan token/key ke child process, log, Telegram, atau model | env child di-allowlist; semua output di-mask |
-| Signing transaksi / trading / deploy | tidak ada kode untuk itu; `node` dan script live diblokir |
-
-Tidak ada yang otomatis masuk ke `main` atau remote. Merge ke `main` selalu manual oleh Anda.
+> **Status verifikasi:** ditulis dan diuji di mesin development (258 test supervisor, typecheck, lint,
+> build; `bash -n` pada script). Script deployment, unit systemd, Telegram dan TokenRouter
+> **belum** pernah dijalankan di VPS sungguhan. `20-validate.sh` adalah sumber kebenaran setelah install.
 
 ---
 
-## 1. Prasyarat VPS
+## 0. Ringkasan jaminan keamanan
 
-- Linux dengan systemd (Ubuntu 22.04/24.04 atau Debian 12 direkomendasikan).
-- Node.js **≥ 20** di `/usr/bin/node` (cek: `command -v node && node -v`). Jika path berbeda,
-  sesuaikan `ExecStart` di unit file.
-- `git`, `build-essential`, `python3` (dibutuhkan `better-sqlite3` saat `npm ci` di workspace Lunex).
-- Akses root/sudo untuk langkah instalasi.
+| Larangan | Lapisan 1: kode | Lapisan 2: OS |
+|---|---|---|
+| Akses `/opt/finance-bot`, `/opt/guardian`, `/opt/lunex/production`, `/opt/lunex/trading`, `/root` | `ScopeGuard` (realpath, anti-symlink/`..`), selalu ditolak | systemd `InaccessiblePaths`, `ProtectHome`, `ProtectSystem=strict` |
+| Membaca `.env`, `*.pem`, `*.key`, `lunex-ai.env` | `ScopeGuard` menolak nama file | env file `ReadOnlyPaths`, mode 600 |
+| `node`, `npm start`, `validate-live`, install paket, shell, `curl`, `systemctl` | `commandPolicy` allowlist tanpa shell | `NoNewPrivileges`, tanpa capability, tanpa sudo |
+| `git push`, `reset --hard`, `clean`, `rebase`, force, hapus branch, tambah remote | `commandPolicy` | workspace tanpa remote git |
+| Mengubah guardrail sendiri | agent tidak bisa menulis `ops/lunex-ai/`, `.git`, `.ai` | build yang dijalankan ada di `/opt/lunex/ai/lunex-ai`, read-only |
+| Commit secret / path terlarang | scan baris yang ditambahkan + path guard sebelum commit | — |
+| Strategi trading berubah tanpa izin | strategy guard → BLOCKED sampai `/approve <taskId>` | — |
+| Secret bocor ke child process / log / Telegram / model | env child di-allowlist, semua output di-mask | — |
+| Mengganggu bot lain di VPS | — | `CPUQuota=150%`, `MemoryMax=2048M`, `Nice=10` |
 
-```bash
-sudo apt-get update && sudo apt-get install -y git build-essential python3 rsync jq
-```
-
----
-
-## 2. Unix user `lunex-ai`
-
-User sistem khusus, tanpa shell login, tanpa sudo, **tidak** menjadi anggota grup user/bot produksi.
-
-```bash
-sudo useradd --system --create-home --home-dir /opt/lunex/ai/home --shell /usr/sbin/nologin lunex-ai
-id lunex-ai
-```
-
-Pastikan `id lunex-ai` **tidak** menampilkan grup yang dipakai bot produksi/trading.
+Tidak ada yang otomatis masuk ke `main` atau remote mana pun.
 
 ---
 
-## 3. Direktori dan permission
-
-Layout akhir:
+## 1. Layout
 
 ```
-/opt/lunex/workspace/lunex/        # repo Lunex (milik lunex-ai) — satu-satunya yang boleh diubah AI
-/opt/lunex/workspace/lunex/.ai/    # state/log/report runtime (gitignored)
-/opt/lunex/ai/                     # root:lunex-ai 0750
-/opt/lunex/ai/app/dist/            # salinan build supervisor (root-owned, read-only bagi service)
-/opt/lunex/ai/home/                # HOME service (cache npm)
-/opt/lunex/ai/lunex-ai.env         # secret (root:lunex-ai 0640)
-/opt/lunex/production/             # TIDAK dapat diakses lunex-ai
-/opt/lunex/trading/                # TIDAK dapat diakses lunex-ai
+/opt/lunex/                               (tidak diubah jika sudah ada; production tinggal di sini)
+├── workspace/                            root:lunex-ai 0750
+│   └── lunex/                            lunex-ai:lunex-ai 0750   repo Lunex (git, TANPA remote)
+│       └── .ai/{state,logs,reports}      lunex-ai 0750            state runtime (gitignored)
+├── ai/                                   root:lunex-ai 0750
+│   ├── lunex-ai/dist/                    root:lunex-ai 0750/0640  build supervisor yang dijalankan (read-only)
+│   ├── lunex-ai/DEPLOYED_COMMIT
+│   ├── lunex-ai.env                      lunex-ai:lunex-ai 0600   secret
+│   ├── lunex.bundle                      root:lunex-ai 0640       sumber git yang terverifikasi
+│   └── home/                             lunex-ai 0700            HOME service (cache npm)
+└── production/                           TIDAK dapat diakses lunex-ai
 ```
 
-```bash
-# AI home
-sudo mkdir -p /opt/lunex/ai/app /opt/lunex/ai/home /opt/lunex/workspace
-sudo chown root:lunex-ai /opt/lunex/ai && sudo chmod 0750 /opt/lunex/ai
-sudo chown -R lunex-ai:lunex-ai /opt/lunex/ai/home && sudo chmod 0700 /opt/lunex/ai/home
-
-# Workspace Lunex (clone repo development — BUKAN direktori produksi)
-sudo git clone <URL-REPO-LUNEX> /opt/lunex/workspace/lunex
-sudo chown -R lunex-ai:lunex-ai /opt/lunex/workspace/lunex
-sudo chmod 0750 /opt/lunex/workspace/lunex
-
-# Produksi/trading: pastikan lunex-ai tidak bisa masuk (sesuaikan owner dengan user bot produksi)
-sudo chmod 0750 /opt/lunex/production /opt/lunex/trading 2>/dev/null || true
-sudo -u lunex-ai ls /opt/lunex/production   # HARUS: Permission denied (atau No such file)
-```
-
-Identitas git untuk commit AI, dan **tanpa kredensial push** (supervisor tidak pernah push; jangan beri
-SSH key/token git ke user `lunex-ai`):
-
-```bash
-cd /opt/lunex/workspace/lunex
-sudo -u lunex-ai git config user.name  "Lunex AI"
-sudo -u lunex-ai git config user.email "lunex-ai@localhost"
-sudo -u lunex-ai git checkout <branch-dasar>     # mis. ai/fix-exit-proceeds-resumable atau main
-```
-
-Instal dependency dan pastikan baseline hijau **sebelum** menyalakan AI. Workspace development tidak
-butuh `.env` — test Lunex memakai fixture palsu dari `tests/setup.ts`. **Jangan pernah menyalin `.env`
-produksi ke workspace.**
-
-```bash
-sudo -u lunex-ai env HOME=/opt/lunex/ai/home bash -c 'cd /opt/lunex/workspace/lunex && npm ci && npm run typecheck && npm run lint && npm test && npm run build'
-```
+Branch di workspace:
+- `ai/lunex-ai-supervisor` — branch deployment (berisi baseline Lunex + P1 fix + supervisor).
+- `ai/develop` — branch integrasi AI, dibuat dari `ai/lunex-ai-supervisor`; setiap task bekerja di
+  `ai/<topik>-<id>` lalu di-fast-forward ke sini.
+- `main` tidak pernah disentuh supervisor.
 
 ---
 
-## 4. Build dan pasang supervisor
+## 2. Script deployment
 
-Supervisor tidak punya dependency npm runtime (hanya modul bawaan Node: `fetch`, `child_process`, `fs`).
-Service menjalankan **salinan** build di `/opt/lunex/ai/app`, bukan kode di workspace — sehingga
-perubahan apa pun di `ops/lunex-ai/` tidak berlaku tanpa redeploy manual oleh Anda.
+Semua ada di `ops/lunex-ai/deploy/` dan dijalankan sebagai root di VPS:
 
-```bash
-cd /opt/lunex/workspace/lunex
-sudo -u lunex-ai env HOME=/opt/lunex/ai/home npm run ai:typecheck
-sudo -u lunex-ai env HOME=/opt/lunex/ai/home npm run ai:lint
-sudo -u lunex-ai env HOME=/opt/lunex/ai/home npm run ai:test
-sudo -u lunex-ai env HOME=/opt/lunex/ai/home npm run ai:build
+| Script | Mengubah sistem? | Fungsi |
+|---|---|---|
+| `00-discovery.sh` | **Tidak** | Fakta host, versi tool, layout `/opt`, owner/mode, service terkait, egress. Tidak pernah membaca isi project lain atau mencetak env. |
+| `10-install.sh` | Ya (idempoten) | User `lunex-ai`, direktori, repo dari bundle, `npm ci`, gate verifikasi, pasang build, env template, unit systemd. |
+| `20-validate.sh` | Hanya dengan `--restart-test` / `--recovery-test` (restart service lunex-ai saja) | PASS/FAIL untuk user, permission, systemd, sandbox, guard, git, kebocoran secret, checkpoint, konektivitas live. |
 
-sudo rsync -a --delete ops/lunex-ai/dist/ /opt/lunex/ai/app/dist/
-sudo chown -R root:lunex-ai /opt/lunex/ai/app
-sudo chmod -R u=rwX,g=rX,o= /opt/lunex/ai/app
-```
+`10-install.sh` **tidak** pernah: menyentuh finance-bot/guardian/production, menimpa isi env file yang sudah ada,
+membuang perubahan yang belum di-commit, push/force/rebase, atau mengubah permission `/opt/lunex` yang sudah ada.
 
 ---
 
-## 5. Environment variables
+## 3. Prosedur
+
+### 3.1 Dari laptop: buat bundle yang reproducible
 
 ```bash
-sudo install -o root -g lunex-ai -m 0640 ops/lunex-ai/lunex-ai.env.example /opt/lunex/ai/lunex-ai.env
+cd lunex_bot
+git status --short                                  # harus kosong
+git rev-parse ai/lunex-ai-supervisor                 # catat sebagai COMMIT
+git bundle create lunex-ai-supervisor.bundle ai/lunex-ai-supervisor
+git bundle verify lunex-ai-supervisor.bundle
+scp lunex-ai-supervisor.bundle <vps>:/tmp/
+```
+
+### 3.2 Di VPS: discovery (read-only)
+
+Untuk mendapatkan script sebelum repo ada, ekstrak dari bundle tanpa memasang apa pun:
+
+```bash
+mkdir -p /tmp/lunex-deploy && cd /tmp/lunex-deploy
+git clone -q --branch ai/lunex-ai-supervisor /tmp/lunex-ai-supervisor.bundle src
+git -C src rev-parse HEAD                            # harus sama dengan COMMIT
+sudo bash src/ops/lunex-ai/deploy/00-discovery.sh
+```
+
+Periksa terutama: path Node **tidak** di `/root` atau `/home`; `/opt/lunex` bisa ditelusuri (o+x);
+egress ke `api.telegram.org`, `api.tokenrouter.com`, `registry.npmjs.org`.
+
+### 3.3 Di VPS: install
+
+```bash
+sudo bash /tmp/lunex-deploy/src/ops/lunex-ai/deploy/10-install.sh \
+  --bundle /tmp/lunex-ai-supervisor.bundle --commit <COMMIT>
+```
+
+Tanpa secret, script berhenti di: `NOT STARTED: secrets missing`. Itu memang disengaja.
+
+### 3.4 Secret (dilakukan operator sendiri)
+
+```bash
 sudoedit /opt/lunex/ai/lunex-ai.env
 ```
 
-Isi nilai secret **langsung di editor** (jangan `echo` ke shell — masuk history). Supervisor sendiri tidak
-pernah membaca file ini; systemd yang menyuntikkannya ke environment proses.
+Isi langsung di editor (jangan `echo` ke shell):
 
-| Variabel | Wajib | Default | Keterangan |
-|---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | ya | — | Token bot **kontrol AI** (§6). Harus bot yang berbeda dari bot trading Lunex. |
-| `TELEGRAM_ADMIN_ID` | ya | — | ID numerik Telegram admin, pisahkan koma bila lebih dari satu. |
-| `TOKENROUTER_API_KEY` | ya | — | API key TokenRouter (§7). |
-| `TOKENROUTER_BASE_URL` | tidak | `https://api.tokenrouter.io/v1` | Harus `https://`. |
-| `LUNEX_AI_MODEL` | tidak | `z-ai/glm-5.3-free` | Tidak pernah diganti otomatis (§8). |
-| `LUNEX_AI_WORKSPACE` | tidak | `/opt/lunex/workspace/lunex` | Harus repo git; ditolak jika overlap path terlarang. |
-| `LUNEX_AI_HOME` | tidak | `/opt/lunex/ai` | |
-| `LUNEX_AI_EXTRA_DENIED_PATHS` | tidak | — | Path terlarang tambahan (koma). `production`, `trading`, `/root` selalu terlarang. |
-| `LUNEX_AI_INTEGRATION_BRANCH` | tidak | `ai/develop` | Harus diawali `ai/`. Tidak pernah di-push. |
-| `LUNEX_AI_MAX_AGENT_STEPS` | tidak | `60` | Aksi model per percobaan task. |
-| `LUNEX_AI_MAX_DEBUG_ROUNDS` | tidak | `3` | Putaran perbaikan setelah verifikasi gagal. |
-| `LUNEX_AI_COMMAND_TIMEOUT_MS` | tidak | `900000` | Timeout per command (test/build). |
-| `LUNEX_AI_LLM_TIMEOUT_MS` | tidak | `300000` | Timeout per panggilan model. |
-| `LUNEX_AI_AUTONOMOUS_IDLE` | tidak | `true` | Saat antrian kosong, buat task "Continue developing Lunex". |
-| `LUNEX_AI_IDLE_TASK_COOLDOWN_MS` | tidak | `1800000` | Jeda minimal antar task otomatis. |
-| `LUNEX_AI_MAX_SELF_TASKS_PER_DAY` | tidak | `10` | Batas task otomatis per hari (UTC). |
-| `LUNEX_AI_REPLY_UNAUTHORIZED` | tidak | `false` | `false` = user tak dikenal diabaikan diam-diam (tetap dicatat di log). |
-
-Konfigurasi salah → service keluar dengan kode 2 dan pesan yang **menyebut nama variabel, bukan nilainya**.
-
----
-
-## 6. Setup Telegram bot
-
-1. Di Telegram buka **@BotFather** → `/newbot` → beri nama, mis. `Lunex AI Control`.
-2. Salin token ke `TELEGRAM_BOT_TOKEN` (via `sudoedit`). **Jangan** memakai token bot trading Lunex:
-   dua proses yang long-polling token yang sama akan saling bentrok (HTTP 409).
-3. Dapatkan ID numerik Anda: kirim pesan ke **@userinfobot**, atau kirim pesan ke bot baru lalu buka
-   `https://api.telegram.org/bot<TOKEN>/getUpdates` di browser pribadi dan lihat `message.from.id`.
-   Isi ke `TELEGRAM_ADMIN_ID`.
-4. Kirim **`/start`** ke bot dari akun admin **sebelum** service dinyalakan — Telegram hanya mengizinkan bot
-   mengirim pesan (laporan, notifikasi) ke user yang pernah memulai chat.
-5. Disarankan: BotFather → `/setjoingroups` → **Disable** (bot hanya untuk chat pribadi).
-
----
-
-## 7. Setup TokenRouter
-
-1. Buat API key di dashboard TokenRouter, isi ke `TOKENROUTER_API_KEY`.
-2. Endpoint yang dipakai (sesuai docs.tokenrouter.io, OpenAI-compatible):
-   `POST https://api.tokenrouter.io/v1/chat/completions` dengan header `Authorization: Bearer <key>`.
-3. Uji key + model **tanpa** menaruh key di history atau argumen yang terlihat di `ps`:
-
-```bash
-read -rs TR_KEY && export TR_KEY
-curl -sS https://api.tokenrouter.io/v1/chat/completions \
-  -H "Authorization: Bearer ${TR_KEY}" -H 'content-type: application/json' \
-  -d '{"model":"z-ai/glm-5.3-free","messages":[{"role":"user","content":"Reply with OK"}]}' | head -c 600; echo
-unset TR_KEY
+```
+TELEGRAM_BOT_TOKEN=<token bot kontrol AI yang BARU>
+TELEGRAM_ADMIN_ID=<id numerik Telegram Anda>
+TOKENROUTER_API_KEY=<api key TokenRouter>
+LUNEX_AI_MODEL=z-ai/glm-5.3-free
+LUNEX_AI_BASE_URL=https://api.tokenrouter.com/v1
 ```
 
-Respons berisi `choices[0].message.content` → key dan model valid. Error 401 → key salah. Error 400/404
-tentang model → lihat §8.
+Lalu `sudo systemctl start lunex-ai`.
 
----
-
-## 8. Konfigurasi GLM
-
-- Default model: `z-ai/glm-5.3-free` (sesuai permintaan operator). Model ini **tidak tercantum** di dokumentasi
-  publik TokenRouter yang diperiksa saat implementasi (docs memakai format `provider:model` dan mode `auto:*`),
-  jadi statusnya **UNVERIFIED** sampai uji §7 berhasil.
-- Jika uji §7 gagal karena model: cari ID GLM yang tepat di dashboard/model list TokenRouter, lalu set
-  `LUNEX_AI_MODEL=<id-tepat>`. Supervisor **tidak pernah** berpindah model sendiri.
-- Protokol: supervisor tidak memakai `tools`/JSON mode (docs TokenRouter menyebut JSON mode bergantung
-  provider). Model menjawab satu objek JSON per langkah; jawaban tidak valid ditolak dan diminta ulang;
-  4 kali berturut-turut → task di-requeue dengan backoff 5 menit.
-- `temperature` 0.2. Ukuran kerja diatur via `LUNEX_AI_MAX_AGENT_STEPS` dan `LUNEX_AI_MAX_DEBUG_ROUNDS`.
-- Error gateway (429/5xx/timeout) di-retry dengan backoff; error 4xx tidak di-retry. Setelah 3 percobaan task
-  gagal karena gateway, task dilaporkan BLOCKED dengan instruksi memeriksa key/URL/model.
-
----
-
-## 9. systemd
+### 3.5 Validasi
 
 ```bash
-sudo install -o root -g root -m 0644 /opt/lunex/workspace/lunex/ops/lunex-ai/systemd/lunex-ai.service /etc/systemd/system/lunex-ai.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now lunex-ai.service
+sudo bash /opt/lunex/workspace/lunex/ops/lunex-ai/deploy/20-validate.sh
+sudo bash /opt/lunex/workspace/lunex/ops/lunex-ai/deploy/20-validate.sh --restart-test
+# kirim satu task dari Telegram, tunggu /status = WORKING, lalu:
+sudo bash /opt/lunex/workspace/lunex/ops/lunex-ai/deploy/20-validate.sh --recovery-test
 ```
 
-Unit ini:
-- `Restart=always`, `RestartSec=10` → hidup lagi setelah crash, `/restart` dari Telegram, atau reboot
-  (`WantedBy=multi-user.target` + `enable`).
-- `User=lunex-ai`, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, tanpa capability.
-- `ReadWritePaths` hanya workspace Lunex dan `/opt/lunex/ai`.
-- `InaccessiblePaths=-/opt/lunex/production -/opt/lunex/trading -/root -/etc/lunex -/opt/other-bots`.
-  Tambahkan direktori bot lain di VPS Anda ke baris ini (awali `-`), lalu `daemon-reload`.
-
-Periksa tingkat isolasi: `systemd-analyze security lunex-ai.service`.
-
 ---
 
-## 10. Start / stop / status
+## 4. Setup Telegram bot
+
+1. @BotFather → `/newbot` → mis. `Lunex AI Control`. **Jangan** memakai token bot trading Lunex
+   (dua proses polling token yang sama → HTTP 409).
+2. BotFather → `/setjoingroups` → Disable.
+3. ID numerik Anda: kirim pesan ke @userinfobot.
+4. Kirim `/start` ke bot baru **sebelum** service dinyalakan (bot hanya bisa mengirim laporan ke user yang pernah memulai chat).
+5. `20-validate.sh` bagian 9 menjalankan `checkTelegram.js`: menampilkan username bot dan memastikan tidak ada webhook. Token tidak pernah ditampilkan.
+
+## 5. TokenRouter dan GLM
+
+- Endpoint: `POST https://api.tokenrouter.com/v1/chat/completions`, header `Authorization: Bearer <key>`
+  (format OpenAI-compatible sesuai docs.tokenrouter.io). `GET /v1/models` tanpa key menjawab 401 pada 2026-09-13,
+  artinya host aktif dan butuh autentikasi.
+- Model: `z-ai/glm-5.3-free`, **UNVERIFIED** sampai `checkModel.js` (validate bagian 9) mengembalikan `"ok":true`.
+  Supervisor tidak pernah berpindah model sendiri; jika ID salah, ubah `LUNEX_AI_MODEL` di env file.
+- Protokol: satu objek JSON per langkah (tanpa `tools`/JSON mode). Error 429/5xx di-retry dengan backoff; 4xx tidak.
+
+## 6. Variabel environment
+
+| Variabel | Wajib | Default |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | ya | — |
+| `TELEGRAM_ADMIN_ID` | ya | — (angka, pisahkan koma) |
+| `TOKENROUTER_API_KEY` | ya | — |
+| `LUNEX_AI_MODEL` | tidak | `z-ai/glm-5.3-free` |
+| `LUNEX_AI_BASE_URL` (alias `TOKENROUTER_BASE_URL`) | tidak | `https://api.tokenrouter.com/v1`; dua nilai berbeda → ditolak |
+| `LUNEX_AI_WORKSPACE` / `LUNEX_AI_HOME` | tidak | `/opt/lunex/workspace/lunex` / `/opt/lunex/ai` |
+| `LUNEX_AI_EXTRA_DENIED_PATHS` | tidak | — (production, trading, finance-bot, guardian, /root selalu ditolak) |
+| `LUNEX_AI_INTEGRATION_BRANCH` | tidak | `ai/develop` |
+| `LUNEX_AI_MAX_AGENT_STEPS` / `LUNEX_AI_MAX_DEBUG_ROUNDS` | tidak | `60` / `3` |
+| `LUNEX_AI_COMMAND_TIMEOUT_MS` / `LUNEX_AI_LLM_TIMEOUT_MS` | tidak | `900000` / `300000` |
+| `LUNEX_AI_AUTONOMOUS_IDLE` / `..._IDLE_TASK_COOLDOWN_MS` / `..._MAX_SELF_TASKS_PER_DAY` | tidak | `true` / `1800000` / `10` |
+| `LUNEX_AI_REPLY_UNAUTHORIZED` | tidak | `false` (user tak dikenal diabaikan, tetap dicatat di log) |
+
+Konfigurasi salah → exit code 2, pesan menyebut **nama** variabel, bukan nilainya.
+
+## 7. systemd: start / stop / status
 
 ```bash
-sudo systemctl start lunex-ai        # nyalakan
-sudo systemctl stop lunex-ai         # matikan (task berjalan di-checkpoint, di-requeue saat start berikutnya)
-sudo systemctl restart lunex-ai      # restart
-systemctl status lunex-ai            # status proses
-systemctl is-enabled lunex-ai        # harus: enabled (auto-start setelah reboot)
+sudo systemctl start lunex-ai
+sudo systemctl stop lunex-ai          # task berjalan berhenti di titik aman, di-commit WIP, di-requeue
+sudo systemctl restart lunex-ai
+systemctl status lunex-ai
+systemctl is-enabled lunex-ai         # enabled = hidup lagi setelah reboot
+systemd-analyze security lunex-ai
 ```
 
-Dari Telegram: `/status`, `/progress`, `/queue`, `/pause`, `/resume`, `/stop`, `/restart`, `/help`.
+Dari Telegram: `/status /progress /queue /task /continue /pause /resume /stop /test /build /diff /git /log /audit /approve /restart /help`.
 
-Checklist setelah instalasi:
-1. Bot mengirim "LUNEX AI online" ke admin.
-2. `/help` dan `/status` dijawab; `/status` menampilkan `Production: NOT TOUCHED`.
-3. Dari akun Telegram **lain**: kirim `/status` → tidak ada balasan; `journalctl` mencatat `telegram_unauthorized`.
-4. `/test` → hasil test suite Lunex dikirim setelah selesai.
-5. Task kecil: `/task P4 Perbaiki typo pada komentar di src/api/server.ts` → tunggu laporan, cek
-   `/git` dan `git log ai/develop`.
-
----
-
-## 11. Inspeksi log
+## 8. Log
 
 ```bash
-journalctl -u lunex-ai -f                          # live (stdout JSON, sudah di-mask)
-journalctl -u lunex-ai --since "1 hour ago"
-sudo -u lunex-ai ls /opt/lunex/workspace/lunex/.ai/logs/
-sudo -u lunex-ai tail -n 50 /opt/lunex/workspace/lunex/.ai/logs/supervisor-$(date -u +%F).jsonl | jq -c '{ts,level,event}'
-sudo -u lunex-ai jq -c 'select(.level=="warn" or .level=="error")' /opt/lunex/workspace/lunex/.ai/logs/supervisor-$(date -u +%F).jsonl
+journalctl -u lunex-ai -f
+journalctl -u lunex-ai --since "1 hour ago" -o cat | jq -c '{ts,level,event}'
+sudo -u lunex-ai tail -n 50 /opt/lunex/workspace/lunex/.ai/logs/supervisor-$(date -u +%F).jsonl
+ls -l /var/log/lunex-ai-install-*.log
 ```
 
 Event penting: `task_started`, `task_finished`, `agent_action_refused`, `telegram_unauthorized`,
-`task_recovered_after_restart`, `state_file_corrupt`, `llm`-related errors. Dari Telegram: `/log 30`.
+`task_recovered_after_restart`, `stale_git_lock`, `state_file_corrupt`.
 
-Log harian tidak dirotasi otomatis; hapus file lama bila perlu:
-`sudo -u lunex-ai find /opt/lunex/workspace/lunex/.ai/logs -name '*.jsonl' -mtime +30 -delete`.
+## 9. Recovery
 
----
+- **Crash / reboot / restart:** `Restart=always` + `enable`. Saat start: lock git yang tertinggal dari perintah git yang terbunuh
+  dihapus (hanya jika tidak ada proses git lain di repo), task berstatus `running` ditandai `interrupted`, dicatat
+  state git-nya, dan dimasukkan lagi ke antrian di branch-nya sendiri. Task **tidak pernah** ditandai completed tanpa verifikasi penuh.
+- **Offset Telegram** disimpan sebelum command diproses → command tidak dieksekusi dua kali.
+- **Worker PAUSED** (working tree kotor di luar task, konten mirip secret, path terlarang, error supervisor):
+  periksa `sudo -u lunex-ai git -C /opt/lunex/workspace/lunex status`, selesaikan manual, lalu `/resume`.
+- **Strategy guard:** tinjau branch di laporan; `/approve <taskId>` menjalankan ulang verifikasi lalu fast-forward ke `ai/develop`.
+- **Reset state (terakhir):** `systemctl stop lunex-ai`, pindahkan `.ai/state` ke backup, `systemctl start lunex-ai`.
 
-## 12. Recovery
+## 10. Update supervisor
 
-**Crash / reboot / `systemctl restart`:** systemd menyalakan ulang service. Saat start, supervisor:
-1. membaca `.ai/state/current_task.json`;
-2. jika ada task berstatus `running` → ditandai `interrupted`, dicatat state git (branch, HEAD, jumlah file belum
-   di-commit), dikembalikan ke antrian dengan prioritas & urutan aslinya — **tidak pernah dianggap selesai**;
-3. task dilanjutkan di branch-nya sendiri, dan tetap harus lulus verifikasi penuh sebelum di-commit/merge;
-4. offset Telegram dipersist sebelum command diproses → command tidak dieksekusi dua kali setelah restart.
+Ulangi 3.1 (bundle baru) lalu 3.3 dengan `--commit` baru. Installer menolak jika workspace punya perubahan
+yang belum di-commit atau branch sudah diverge (tanpa force/rebase), memasang build baru, dan me-restart service.
 
-**File state:** `/opt/lunex/workspace/lunex/.ai/state/`
-`current_task.json`, `queue.json`, `progress.json`, `checkpoints.json`, `completed.json`, `blocked.json`.
-File rusak otomatis dipindah ke `<nama>.json.corrupt-<timestamp>` dan diganti default (dicatat `state_file_corrupt`).
+## 11. Pemetaan acceptance criteria
 
-**Worker PAUSED karena butuh manusia** (laporan BLOCKED: working tree kotor di luar task, konten mirip secret,
-path terlarang berubah, error supervisor):
-
-```bash
-cd /opt/lunex/workspace/lunex
-sudo -u lunex-ai git status
-sudo -u lunex-ai git diff --stat
-# putuskan secara manual: commit ke branch ai/*, atau pindahkan perubahan — supervisor tidak pernah membuang kerja
-```
-Setelah bersih: kirim `/resume`.
-
-**Task BLOCKED oleh strategy guard:** tinjau branch di laporan (`git log -p ai/develop..<branch>`). Jika setuju:
-`/approve <taskId>` (supervisor checkout branch, verifikasi ulang penuh, fast-forward ke `ai/develop`). Jika tidak:
-biarkan branch tidak di-merge.
-
-**Reset antrian/state (terakhir):**
-```bash
-sudo systemctl stop lunex-ai
-sudo -u lunex-ai mv /opt/lunex/workspace/lunex/.ai/state /opt/lunex/workspace/lunex/.ai/state.bak-$(date -u +%Y%m%dT%H%M%S)
-sudo systemctl start lunex-ai
-```
-
-**Membawa hasil AI ke `main`:** selalu manual — review `ai/develop`, jalankan test, merge/PR oleh Anda.
-Deployment ke produksi tetap lewat pipeline produksi Anda, bukan supervisor.
-
----
-
-## 13. Update supervisor
-
-```bash
-cd /opt/lunex/workspace/lunex
-sudo -u lunex-ai git log --oneline -5 -- ops/lunex-ai     # tinjau perubahan supervisor (hanya dari manusia)
-sudo -u lunex-ai env HOME=/opt/lunex/ai/home bash -c 'npm run ai:typecheck && npm run ai:lint && npm run ai:test && npm run ai:build'
-sudo rsync -a --delete ops/lunex-ai/dist/ /opt/lunex/ai/app/dist/
-sudo chown -R root:lunex-ai /opt/lunex/ai/app && sudo chmod -R u=rwX,g=rX,o= /opt/lunex/ai/app
-sudo install -o root -g root -m 0644 ops/lunex-ai/systemd/lunex-ai.service /etc/systemd/system/lunex-ai.service
-sudo systemctl daemon-reload && sudo systemctl restart lunex-ai
-```
-
----
-
-## 14. Arsitektur singkat
-
-```
-Telegram (admin) ──► telegram/bot.ts ──► commands.ts (auth → command / bahasa natural)
-                                             │
-                                             ▼
-                               supervisor/supervisor.ts (worker loop, pause/stop, idle task)
-                                             │
-                                             ▼
-                        supervisor/taskRunner.ts ── gitOps (branch/commit/ff) ── verification (typecheck/lint/test/build)
-                                             │                    ▲
-                                             ▼                    │ allowlist + scope guard
-                        agent/agentLoop.ts ◄──► llm/tokenRouterClient.ts (GLM via TokenRouter)
-                                             │
-                                             ▼
-                        agent/tools.ts ──► scopeGuard.ts / commandRunner.ts (commandPolicy.ts)
-State: stateStore.ts + taskQueue.ts + recovery.ts (.ai/state)   Log: logger.ts (.ai/logs)   Mask: secretMask.ts
-```
+| Kriteria | Dibuktikan oleh |
+|---|---|
+| Source tersedia, user dibuat, berjalan sebagai lunex-ai, systemd active | validate §1–3 |
+| Restart otomatis | validate `--restart-test` (restart + SIGKILL) |
+| Recovery setelah restart, checkpoint tersimpan | validate `--recovery-test`, §8 |
+| Filesystem guard, command guard, private key tidak dapat diakses | validate §4 (namespace service), §5 (probe build ter-deploy) |
+| finance-bot / guardian / production tidak tersentuh | validate §4; installer tidak pernah menyentuh path tersebut |
+| Tidak ada secret di git / log / state | validate §7 (hitungan saja) |
+| Tidak ada push ke main | workspace tanpa remote (validate §6); tidak ada push dari laptop |
+| TokenRouter terhubung, model GLM terpanggil | validate §9 `checkModel.js` |
+| Telegram /start, /status, /test, unauthorized ditolak, task dari Telegram, autonomous run, strategy guard | validate §12 (manual dari HP) + laporan task |

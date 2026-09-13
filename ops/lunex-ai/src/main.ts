@@ -5,6 +5,7 @@ import type { SupervisorConfig } from './config';
 import { GitOps } from './gitOps';
 import { TokenRouterClient } from './llm/tokenRouterClient';
 import { JsonlLogger } from './logger';
+import { clearStaleGitLocks } from './gitLock';
 import { recoverOnStartup } from './recovery';
 import { ScopeGuard } from './scopeGuard';
 import { collectSecretValues, createMasker } from './secretMask';
@@ -58,7 +59,13 @@ async function main(): Promise<void> {
     notifyText: async (text) => { await botRef.current?.notify(text); },
   });
 
-  const recovery = await recoverOnStartup({ store, queue, snapshotGit: () => git.snapshot(), logger });
+  const recovery = await recoverOnStartup({
+    store,
+    queue,
+    snapshotGit: () => git.snapshot(),
+    logger,
+    clearStaleGitLocks: () => clearStaleGitLocks(config.workspaceDir),
+  });
   const bot = new TelegramControlBot(api, store, { control: supervisor, adminIds: config.telegramAdminIds, logger, replyToUnauthorized: config.replyToUnauthorized }, logger);
   botRef.current = bot;
 

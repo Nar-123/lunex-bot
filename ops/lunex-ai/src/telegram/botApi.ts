@@ -82,6 +82,16 @@ export class TelegramHttpApi implements TelegramApi {
     return this.call<TelegramUpdate[]>('getUpdates', { offset, timeout: timeoutSec, allowed_updates: ['message'] }, (timeoutSec + 15) * 1000);
   }
 
+  /** Deployment check only: identifies the bot behind the token (never the token itself). */
+  getMe(): Promise<{ id: number; is_bot: boolean; username?: string }> {
+    return this.call('getMe', {}, 20_000);
+  }
+
+  /** Deployment check only: a configured webhook makes getUpdates polling fail. */
+  getWebhookInfo(): Promise<{ url: string; pending_update_count: number }> {
+    return this.call('getWebhookInfo', {}, 20_000);
+  }
+
   async sendMessage(chatId: number, text: string): Promise<void> {
     for (const chunk of chunkMessage(this.mask(text))) {
       await this.call('sendMessage', { chat_id: chatId, text: chunk, disable_web_page_preview: true }, 30_000);

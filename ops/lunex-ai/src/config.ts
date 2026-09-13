@@ -32,13 +32,19 @@ export interface SupervisorConfig {
 
 export class ConfigError extends Error {}
 
-/** Verified against docs.tokenrouter.io (OpenAI-compatible gateway). */
-export const DEFAULT_TOKENROUTER_BASE_URL = 'https://api.tokenrouter.io/v1';
+/**
+ * Operator-specified gateway. On 2026-09-13 both api.tokenrouter.com and
+ * api.tokenrouter.io answered GET /v1/models with 401 (endpoint exists, auth
+ * required); docs.tokenrouter.io documents the OpenAI-compatible
+ * /v1/chat/completions request shape this client uses.
+ */
+export const DEFAULT_TOKENROUTER_BASE_URL = 'https://api.tokenrouter.com/v1';
 /** Requested by the operator. Not listed in TokenRouter's public docs -- UNVERIFIED until the first real call. */
 export const DEFAULT_MODEL = 'z-ai/glm-5.3-free';
 export const DEFAULT_WORKSPACE = '/opt/lunex/workspace/lunex';
 export const DEFAULT_AI_HOME = '/opt/lunex/ai';
-export const DEFAULT_DENIED_ROOTS = ['/opt/lunex/production', '/opt/lunex/trading', '/root'] as const;
+/** Always denied, whatever the environment says: Lunex production/trading, the other bots on the VPS, and root's home. */
+export const DEFAULT_DENIED_ROOTS = ['/opt/lunex/production', '/opt/lunex/trading', '/opt/finance-bot', '/opt/guardian', '/root'] as const;
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name]?.trim();
@@ -81,8 +87,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): SupervisorConf
   const telegramAdminIds = parseAdminIds(required(env, 'TELEGRAM_ADMIN_ID'));
   const tokenRouterApiKey = required(env, 'TOKENROUTER_API_KEY');
 
-  const tokenRouterBaseUrl = (env.TOKENROUTER_BASE_URL?.trim() || DEFAULT_TOKENROUTER_BASE_URL).replace(/\/+$/, '');
-  if (!/^https:\/\//.test(tokenRouterBaseUrl)) throw new ConfigError('TOKENROUTER_BASE_URL must be an https:// URL');
+  // LUNEX_AI_BASE_URL is the operator's name for it; TOKENROUTER_BASE_URL stays accepted. Two different values are refused rather than silently picking one.
+  const baseUrlSetting = env.LUNEX_AI_BASE_URL?.trim().replace(/\/+$/, '') ?? '';
+  const legacyBaseUrlSetting = env.TOKENROUTER_BASE_URL?.trim().replace(/\/+$/, '') ?? '';
+  if (baseUrlSetting !== '' && legacyBaseUrlSetting !== '' && baseUrlSetting !== legacyBaseUrlSetting) {
+    throw new ConfigError('LUNEX_AI_BASE_URL and TOKENROUTER_BASE_URL are both set and differ -- set only one');
+  }
+  const tokenRouterBaseUrl = baseUrlSetting || legacyBaseUrlSetting || DEFAULT_TOKENROUTER_BASE_URL;
+  if (!/^https:\/\//.test(tokenRouterBaseUrl)) throw new ConfigError('LUNEX_AI_BASE_URL (or TOKENROUTER_BASE_URL) must be an https:// URL');
 
   const workspaceDir = path.resolve(env.LUNEX_AI_WORKSPACE?.trim() || DEFAULT_WORKSPACE);
   const aiHomeDir = path.resolve(env.LUNEX_AI_HOME?.trim() || DEFAULT_AI_HOME);

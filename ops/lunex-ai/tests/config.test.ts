@@ -36,7 +36,7 @@ describe('loadConfig', () => {
       replyToUnauthorized: false,
     });
     expect(config.stateDir).toBe(path.join(path.resolve('/opt/lunex/workspace/lunex'), '.ai', 'state'));
-    expect(config.deniedRoots).toEqual(expect.arrayContaining(['/opt/lunex/production', '/opt/lunex/trading', '/root'].map((p) => path.resolve(p))));
+    expect(config.deniedRoots).toEqual(expect.arrayContaining(['/opt/lunex/production', '/opt/lunex/trading', '/opt/finance-bot', '/opt/guardian', '/root'].map((p) => path.resolve(p))));
   });
 
   it.each(['TELEGRAM_BOT_TOKEN', 'TELEGRAM_ADMIN_ID', 'TOKENROUTER_API_KEY'])('requires %s', (name) => {
@@ -58,6 +58,18 @@ describe('loadConfig', () => {
   it('requires an https TokenRouter base URL and strips a trailing slash', () => {
     expect(configError(base({ TOKENROUTER_BASE_URL: 'http://api.tokenrouter.io/v1' })).message).toMatch(/https/);
     expect(loadConfig(base({ TOKENROUTER_BASE_URL: 'https://api.tokenrouter.io/v1/' })).tokenRouterBaseUrl).toBe('https://api.tokenrouter.io/v1');
+  });
+
+  it('reads the base URL from LUNEX_AI_BASE_URL or TOKENROUTER_BASE_URL, and refuses two different values', () => {
+    expect(loadConfig(base({ LUNEX_AI_BASE_URL: 'https://api.tokenrouter.com/v1' })).tokenRouterBaseUrl).toBe('https://api.tokenrouter.com/v1');
+    expect(loadConfig(base({ TOKENROUTER_BASE_URL: 'https://gateway.example/v1' })).tokenRouterBaseUrl).toBe('https://gateway.example/v1');
+    expect(loadConfig(base({ LUNEX_AI_BASE_URL: 'https://a.example/v1', TOKENROUTER_BASE_URL: 'https://a.example/v1/' })).tokenRouterBaseUrl).toBe('https://a.example/v1');
+    expect(configError(base({ LUNEX_AI_BASE_URL: 'https://a.example/v1', TOKENROUTER_BASE_URL: 'https://b.example/v1' })).message).toMatch(/both set and differ/);
+    expect(configError(base({ LUNEX_AI_BASE_URL: 'http://a.example/v1' })).message).toMatch(/https/);
+  });
+
+  it.each(['/opt/finance-bot', '/opt/guardian'])('always denies %s, even when not listed in the environment', (denied) => {
+    expect(configError(base({ LUNEX_AI_WORKSPACE: `${denied}/lunex` })).message).toMatch(/overlaps a denied path/);
   });
 
   it('validates numeric and boolean tuning variables', () => {

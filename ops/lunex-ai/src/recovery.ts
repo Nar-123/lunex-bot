@@ -9,6 +9,8 @@ export interface RecoveryDeps {
   snapshotGit: () => Promise<GitSnapshot>;
   logger: Logger;
   now?: () => Date;
+  /** Removes git lock files left by a killed git command -- see gitLock.ts. Runs before any git read. */
+  clearStaleGitLocks?: () => { action: 'none' | 'removed' | 'kept'; detail: string };
 }
 
 export interface RecoveryOutcome {
@@ -30,6 +32,18 @@ export interface RecoveryOutcome {
  */
 export async function recoverOnStartup(deps: RecoveryDeps): Promise<RecoveryOutcome> {
   const now = deps.now ?? (() => new Date());
+  let lockNote = '';
+  if (deps.clearStaleGitLocks) {
+    try {
+      const lock = deps.clearStaleGitLocks();
+      if (lock.action !== 'none') {
+        lockNote = `; git lock ${lock.action}: ${lock.detail}`;
+        deps.logger.warn('stale_git_lock', { action: lock.action, detail: lock.detail });
+      }
+    } catch (err) {
+      deps.logger.warn('stale_git_lock_check_failed', { message: err instanceof Error ? err.message : String(err) });
+    }
+  }
   let git: GitSnapshot | null = null;
   try {
     git = await deps.snapshotGit();
@@ -41,7 +55,7 @@ export async function recoverOnStartup(deps: RecoveryDeps): Promise<RecoveryOutc
 
   const current = deps.store.getCurrentTask();
   if (!current) {
-    const note = 'no task was in flight';
+    const note = `no task was in flight${lockNote}`;
     deps.store.addCheckpoint({ taskId: null, phase: 'startup', note, gitHead: git?.head ?? null, gitDirty: git?.dirty ?? null });
     return { recoveredTask: null, git, note };
   }
@@ -57,7 +71,7 @@ export async function recoverOnStartup(deps: RecoveryDeps): Promise<RecoveryOutc
       else deps.store.appendBlocked(current);
     }
     deps.store.setCurrentTask(null);
-    const note = `task ${current.id} was already ${current.status}; history reconciled`;
+    const note = `task ${current.id} was already ${current.status}; history reconciled${lockNote}`;
     deps.store.addCheckpoint({ taskId: current.id, phase: 'startup', note, gitHead: git?.head ?? null, gitDirty: git?.dirty ?? null });
     return { recoveredTask: null, git, note };
   }
@@ -66,7 +80,7 @@ export async function recoverOnStartup(deps: RecoveryDeps): Promise<RecoveryOutc
   const gitNote = git
     ? `branch=${git.branch ?? '?'} head=${git.head?.slice(0, 10) ?? '?'} uncommitted=${String(git.changedFiles.length)}`
     : 'git state unavailable';
-  const note = `process restarted while task was running (last step: ${lastStep ? `${lastStep.phase}: ${lastStep.note}` : 'none'}); ${gitNote}; completion NOT assumed -- re-queued`;
+  const note = `process restarted while task was running (last step: ${lastStep ? `${lastStep.phase}: ${lastStep.note}` : 'none'}); ${gitNote}; completion NOT assumed -- re-queued${lockNote}`;
 
   const interrupted: Task = {
     ...current,
