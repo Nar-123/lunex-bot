@@ -206,11 +206,17 @@ export const EXITS = {
    * closing -- a strictly weaker expression of the same intent.
    *
    * Note the interaction with Priority 1: with the stop at -6% and this
-   * arming at -8%, any PnL that arms this also breaches the stop, and the
-   * stop wins (Priority 1). This rule therefore only produces a close
-   * when the stop is live-widened past -8% via `BotSettings.hardStopLossPct`,
-   * or when price gaps straight through the stop between polls. That is
-   * Meridian's own arrangement, kept deliberately.
+   * arming at -8%, any PnL reading that arms this rule is also at or below
+   * the stop on that SAME tick, and the stop wins (Priority 1). A price gap
+   * between polls does not change that: max drawdown only moves on an
+   * actual PnL reading, and that reading is the one the stop evaluates.
+   * Under the shipped defaults this rule therefore only produces a close
+   * when (a) the stop is live-widened past -8% via
+   * `BotSettings.hardStopLossPct`, or (b) a stop-triggered exit failed
+   * definitively and reverted the position to ACTIVE (`executeExit.ts`),
+   * and the next PnL reading has already recovered to the target. That is
+   * Meridian's own arrangement, kept deliberately -- documentation only,
+   * no behaviour is implied or changed by this note.
    */
   SAFETY_EXIT: {
     ENABLED: true,

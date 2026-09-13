@@ -62,8 +62,16 @@ separate passes, not one):
 - [x] Module 7 — positions/ + monitoring/
 - [x] Module 8 — exits/ + swap/
 - [x] Module 9A — positions/openPosition.ts
-- [x] **Module 9B — composition root** (this commit — bot is now a real running process: three live cycles wired end-to-end)
-- [ ] api/ + auth/ + telegram/ + ui/
+- [x] Module 9B — composition root (bot is a real running process: three live cycles wired end-to-end)
+- [x] Module 10 — api/ + auth/
+- [x] Module 11 — telegram/ (Lunex's own on-demand control/reporting bot)
+- [x] Module 12 — ui/
+- [x] Tier 3 — Meridian exit-ladder alignment (Safety Exit, Over-extended %B, Trailing TP, OOR profit; LOW_YIELD disabled pending pool-level data)
+- [x] Validation phase — LOW_YIELD metric resolution, realized-PnL persistence, read-only live-validation harnesses (Phase 5)
+- [x] P1 fix — proceeds-read failure after a confirmed exit leg is resumable (see "P1 fix" at the end of this file)
+- [ ] Live validation with a real fill (tiny, separately approved) — not done; see LIVE VALIDATION CHECKLIST
+- [ ] LOW_YIELD re-enable — requires a real pool-level fee/TVL 24h feed first
+- [ ] ops/lunex-ai/ — development supervisor (in progress)
 
 ## Module 1 — assumptions & decisions
 
@@ -3213,3 +3221,48 @@ with the API's own `401 Unauthorized` error shape (correct fail-loud
 behaviour), and the router allow-list check PASSES against the verified
 Universal Router address. `/v1/swap` was never called; nothing was
 signed. A real quote requires the operator's real API key.
+
+## P1 fix — proceeds-read failure after a confirmed exit leg
+
+**Bug.** Both exit legs' `verifyOnChain` (`exits/removeLiquidityTx.ts`,
+`exits/swapTx.ts`) caught a failed receipt-log proceeds read and
+*returned* `{ ok: false }` — which `executeCriticalTransaction` records as
+a definitive `VERIFICATION_FAILED`, contrary to the code's own comments.
+Consequences, had an RPC read blipped at that exact moment:
+
+- remove-liquidity: the burn had landed, but `executeExit` reverted the
+  position to ACTIVE (`markExitFailed`) over an LP that no longer existed;
+- swap: an already-filled swap counted as failed, `swapAttemptCount` was
+  bumped and a fresh swap attempt started against a ~0 TOKEN balance.
+
+A related gap surfaced in the same path: a swap attempt left at
+SIGNED/SENT/CONFIRMED (broadcast uncertain, receipt wait interrupted) was
+resumed by re-reading the live TOKEN balance — already ~0 once the swap
+filled — which threw the "invariant violated" error on every tick.
+
+**Fix (no strategy change — exit triggers, thresholds and slippage tiers
+are untouched):**
+
+- `TxSafetyDeps.verifyOnChain` may return `{ ok: false, resumable: true }`
+  for "on-chain effect proven, a read needed to finish verifying it
+  failed". The pipeline keeps the attempt at CONFIRMED with no
+  `failureCode`; the next call with the same key re-runs only
+  `verifyOnChain` — nothing is rebuilt, re-signed or re-broadcast.
+  Omitted/false keeps the original definitive meaning.
+- Both exit legs use it for the proceeds read only; a non-zero liquidity
+  read or an insufficient balance increase stays definitive.
+- The swap leg persists the balance increase it accepted
+  (`ExitState.swapVerifiedUsdgIncreaseRaw`, migration
+  `20260913000000_add_exit_state_swap_verified_increase`, reset per new
+  attempt), so a resumed verification never re-reads a balance that a
+  concurrent mint may have moved.
+- `executeExit` resumes a swap attempt that already holds a signed payload
+  directly under its key, with resume-only deps (`quote: null`) — no
+  balance read, no re-quote, no approval, no second swap.
+
+**Tests:** pipeline (CONFIRMED retained, resume re-runs only verify,
+repeated failures never escalate, explicit non-resumable still FAILED),
+both legs' verify functions, four `executeExit` end-to-end scenarios
+(remove-leg and swap-leg proceeds failure, interrupted receipt wait with
+TOKEN balance 0, resumed signed swap that reverted), and a real-SQLite
+round-trip of the new column.
