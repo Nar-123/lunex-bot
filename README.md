@@ -71,7 +71,7 @@ separate passes, not one):
 - [x] P1 fix — proceeds-read failure after a confirmed exit leg is resumable (see "P1 fix" at the end of this file)
 - [ ] Live validation with a real fill (tiny, separately approved) — not done; see LIVE VALIDATION CHECKLIST
 - [ ] LOW_YIELD re-enable — requires a real pool-level fee/TVL 24h feed first
-- [ ] ops/lunex-ai/ — development supervisor (in progress)
+- [x] ops/lunex-ai/ — Lunex AI development supervisor (Telegram-controlled, never trades): code, tests and build done; VPS deployment is an operator step, see [ops/lunex-ai/DEPLOYMENT.md](ops/lunex-ai/DEPLOYMENT.md)
 
 ## Module 1 — assumptions & decisions
 
