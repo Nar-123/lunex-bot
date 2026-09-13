@@ -77,8 +77,8 @@ describe('PrismaExitStateRepository (real SQLite DB, real migration)', () => {
 
   it('a Date field genuinely survives a round-trip through real SQLite (not just JS-object identity)', async () => {
     const timestamp = new Date('2026-03-15T12:34:56.789Z');
-    await repo.update('pos-g', { pnlProtectionActivatedAt: timestamp });
+    await repo.update('pos-g', { safetyExitArmedAt: timestamp });
     const record = await repo.getOrCreate('pos-g');
-    expect(record.pnlProtectionActivatedAt?.toISOString()).toBe(timestamp.toISOString());
+    expect(record.safetyExitArmedAt?.toISOString()).toBe(timestamp.toISOString());
   });
 });

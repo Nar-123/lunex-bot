@@ -79,6 +79,32 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
     expect(allActive.find((p) => p.id === created.id)).toBeUndefined();
   });
 
+  it('VALIDATION PHASE: markClosed persists realizedUsdgRaw in the SAME atomic update as the CLOSED transition, round-tripping an extreme raw value exactly', async () => {
+    const created = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000021' }));
+    await repo.markActive(created.id, '1', new Date());
+
+    // A routine 18-decimal proceeds figure -- far beyond SQLite's signed
+    // INTEGER range, stored as a decimal string like every other raw field.
+    const proceeds = 970_123_456_789n * 10n ** 18n;
+    const closed = await repo.markClosed(created.id, new Date(), 'HARD_TP', proceeds);
+
+    expect(closed.status).toBe('CLOSED');
+    expect(closed.realizedUsdgRaw).toBe(proceeds); // strict equality, not closeTo
+
+    const reloaded = await repo.findById(created.id);
+    expect(reloaded?.realizedUsdgRaw).toBe(proceeds);
+  });
+
+  it('VALIDATION PHASE: markClosed without proceeds leaves realizedUsdgRaw honestly null (never 0-as-placeholder), against a real DB', async () => {
+    const created = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000022' }));
+    await repo.markActive(created.id, '1', new Date());
+    await repo.markClosed(created.id, new Date(), 'OOR_TIMEOUT'); // legacy-style call: no proceeds argument
+
+    const reloaded = await repo.findById(created.id);
+    expect(reloaded?.status).toBe('CLOSED');
+    expect(reloaded?.realizedUsdgRaw).toBeNull();
+  });
+
   it('findAllOpening returns only OPENING positions, excluding ACTIVE/CLOSING/CLOSED', async () => {
     const opening = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000013' }));
     const active = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000014' }));
@@ -174,6 +200,30 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
     expect(deployed.map((p) => p.id)).not.toContain(created.id);
 
     expect(await repo.findActiveByToken('0x000000000000000000000000000000000000000d')).toBeNull();
+  });
+
+  it('C7: claimForResume is a genuine atomic compare-and-swap against a real DB -- concurrent claims on the same row never both succeed', async () => {
+    const created = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000015' }));
+
+    // Fire many genuinely concurrent claim attempts against the SAME real
+    // SQLite connection -- proves the WHERE-guarded UPDATE is atomic at
+    // the database level, not just "usually fine" under JS's single
+    // thread.
+    const attempts = await Promise.all(
+      Array.from({ length: 10 }, () => repo.claimForResume(created.id, 'OPENING', 20_000)),
+    );
+
+    expect(attempts.filter(Boolean)).toHaveLength(1); // exactly one winner, no matter how many raced
+  });
+
+  it('C7: claimForResume respects the freshness window, and releaseResumeClaim allows an immediate re-claim', async () => {
+    const created = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000016' }));
+
+    expect(await repo.claimForResume(created.id, 'OPENING', 20_000)).toBe(true);
+    expect(await repo.claimForResume(created.id, 'OPENING', 20_000)).toBe(false); // still within freshness window
+
+    await repo.releaseResumeClaim(created.id);
+    expect(await repo.claimForResume(created.id, 'OPENING', 20_000)).toBe(true); // released -- immediately reclaimable
   });
 
   it('a second position for the same token while one is still open conflicts at the openIdempotencyKey level if reused, but otherwise both rows can exist -- findActiveByToken still returns one', async () => {

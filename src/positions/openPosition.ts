@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Address } from 'viem';
 import { config } from '../config';
 import { readErc20Allowance } from '../blockchain/erc20';
+import { discoverMintedTokenId } from '../blockchain/erc721';
 import { getExecutorAddress } from '../blockchain/walletClient';
 import { executeCriticalTransaction } from '../execution/executeCriticalTransaction';
 import type { TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
@@ -39,6 +40,8 @@ export interface OpenPositionDeps {
   buildMintDeps?: (input: MintInput, live: LivePositionStateProvider, pool: PoolPriceProvider) => TxSafetyDeps<MintVerifyData>;
   readAllowance?: (tokenAddress: Address, owner: Address, spender: Address) => Promise<bigint>;
   walletAddress?: Address;
+  /** Injectable for tests -- defaults to the real on-chain Transfer-log lookup (see the "defense-in-depth" fallback in `executeOpen`). */
+  discoverTokenId?: (txHash: `0x${string}`, contractAddress: Address, recipient: Address) => Promise<bigint>;
 }
 
 /**
@@ -119,9 +122,39 @@ export async function resumeOpenPosition(position: PositionRecord, deps: OpenPos
  * alone.
  */
 async function executeOpen(position: PositionRecord, deps: OpenPositionDeps): Promise<OpenPositionOutcome> {
+  // C7 concurrency fix: atomically claim this position before doing any
+  // transaction-executing work. Both entry points (`openPosition`'s
+  // brand-new candidate and `resumeOpenPosition`'s per-tick resume loop in
+  // `composition/exitCycle.ts`) funnel through here, so this is the single
+  // enforcement point that prevents the 30-minute screening cycle and the
+  // 15-second exit/open-resume cycle -- two independently-scheduled,
+  // unsynchronized timers (see `composition/app.ts`) -- from both acting
+  // on the SAME position at once (e.g. a mint that takes >15s to mine is
+  // otherwise guaranteed to be picked up mid-flight by the next exit-cycle
+  // tick's OPENING-resume pass). Losing the claim is NOT a failure --
+  // another caller already owns this position right now; deferring to it
+  // is the safe outcome, never a duplicate mint attempt.
+  const claimed = await deps.positions.claimForResume(position.id, 'OPENING', config.rules.execution.RESUME_CLAIM_FRESHNESS_MS);
+  if (!claimed) {
+    return { outcome: 'PENDING', reason: 'position is already claimed by a concurrent open/resume attempt' };
+  }
+  // Released unconditionally once this call's work is done (success,
+  // definitive failure, or ambiguous/PENDING) -- the claim's lifetime
+  // matches however long THIS attempt actually takes, not a fixed
+  // timeout, so a long-running mint doesn't stall a legitimate later
+  // resume once this call genuinely finishes.
+  try {
+    return await executeOpenClaimed(position, deps);
+  } finally {
+    await deps.positions.releaseResumeClaim(position.id);
+  }
+}
+
+async function executeOpenClaimed(position: PositionRecord, deps: OpenPositionDeps): Promise<OpenPositionOutcome> {
   const buildApproveDeps = deps.buildApproveDeps ?? realBuildApproveDeps;
   const buildMintDeps = deps.buildMintDeps ?? realBuildMintDeps;
   const readAllowance = deps.readAllowance ?? readErc20Allowance;
+  const discoverTokenId = deps.discoverTokenId ?? discoverMintedTokenId;
   const wallet = deps.walletAddress ?? getExecutorAddress();
   const usdgAddress = config.quoteAsset.ADDRESS as Address;
   const positionManagerAddress = config.uniswap.v4.positionManager as Address;
@@ -160,6 +193,31 @@ async function executeOpen(position: PositionRecord, deps: OpenPositionDeps): Pr
       return { outcome: 'FAILED', reason: mintResult.reason };
     }
     return { outcome: 'PENDING', reason: mintResult.reason };
+  }
+
+  // The type says `data` is non-nullable (MintVerifyData has no null
+  // fields) -- but this is documented defense-in-depth against a "should
+  // be unreachable" state: executeCriticalTransaction's VERIFIED
+  // short-circuit reconstructs verifyData from a LEGACY row that predates
+  // the field, which at runtime can be anything JSON round-tripped. A mint
+  // that has ALREADY SUCCEEDED on-chain must never crash here or, worse,
+  // fall through to markFailed and release capital that's actually
+  // already spent on a real, unmonitored LP position -- the runtime check
+  // stays, deliberately against the type.
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  if (mintResult.data == null) {
+    const attempt = await deps.txAttempts.find(mintKey);
+    if (attempt?.txHash) {
+      try {
+        const tokenId = await discoverTokenId(attempt.txHash, positionManagerAddress, wallet);
+        const updated = await deps.positions.markActive(position.id, tokenId.toString(), new Date());
+        return { outcome: 'ACTIVE', position: updated };
+      } catch {
+        // Ambiguous -- fall through to PENDING below. Never markFailed: the
+        // mint is VERIFIED, i.e. already confirmed successful on-chain.
+      }
+    }
+    return { outcome: 'PENDING', reason: 'mint verified on-chain but positionTokenId could not be recovered yet' };
   }
 
   const updated = await deps.positions.markActive(position.id, mintResult.data.positionTokenId, new Date());

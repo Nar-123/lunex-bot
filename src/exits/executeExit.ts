@@ -8,9 +8,25 @@ import type { PositionRecord, PositionRepository } from '../positions/types';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring/types';
 import type { SwapExecutor, SwapQuote } from '../swap/types';
 import type { ExitStateRepository } from './types';
-import { buildRemoveLiquidityDeps as realBuildRemoveLiquidityDeps } from './removeLiquidityTx';
+import { buildRemoveLiquidityDeps as realBuildRemoveLiquidityDeps, type RemoveLiquidityVerifyData } from './removeLiquidityTx';
 import { buildSwapDeps as realBuildSwapDeps, defaultLogImpact, shouldBlockForPriceImpact, type SwapVerifyData } from './swapTx';
 import { buildApproveDeps as realBuildApproveDeps, needsApproval, type ApproveVerifyData } from './approveTx';
+
+/**
+ * TIER 3 — maps a definitive-failure count to a slippage tier, clamping at
+ * the last one. `EXITS.SLIPPAGE_TIERS_BPS` is `[100, 200, 300]` (Meridian's
+ * `executor.rs`: attempt 1 => 100, 2 => 200, _ => 300).
+ *
+ * Exported for direct unit testing: the "never jump 100 -> 300" guarantee
+ * is a property of THIS function plus the fact that only definitive
+ * failures increment the counter, and both halves deserve to be pinned
+ * down explicitly rather than inferred from an integration test.
+ */
+export function exitSlippageBpsForAttempt(swapAttemptCount: number): number {
+  const tiers = config.rules.exits.SLIPPAGE_TIERS_BPS;
+  const index = Math.min(Math.max(0, Math.floor(swapAttemptCount)), tiers.length - 1);
+  return tiers[index] ?? tiers[tiers.length - 1] ?? 0;
+}
 
 export type ExitExecutionOutcome =
   | { outcome: 'CLOSED' }
@@ -35,7 +51,7 @@ export interface ExecuteExitDeps {
    * real RPC/API call. Tests inject a fake here to control exactly how
    * each leg "fails" without needing a live chain.
    */
-  buildRemoveLiquidityDeps?: (position: PositionRecord, live: LivePositionStateProvider, pool: PoolPriceProvider) => TxSafetyDeps<{ liquidityZero: true }>;
+  buildRemoveLiquidityDeps?: (position: PositionRecord, live: LivePositionStateProvider, pool: PoolPriceProvider) => TxSafetyDeps<RemoveLiquidityVerifyData>;
   buildSwapDeps?: (
     positionId: string,
     tokenAddress: PositionRecord['tokenAddress'],
@@ -48,7 +64,21 @@ export interface ExecuteExitDeps {
   readTokenBalance?: (tokenAddress: Address, wallet: Address) => Promise<bigint>;
   readAllowance?: (tokenAddress: Address, owner: Address, spender: Address) => Promise<bigint>;
   walletAddress?: Address;
-  logImpact?: (positionId: string, priceImpactPct: number) => void;
+  /** TIER 3: `priceImpactPct` is nullable -- a provider that omits the field is reported as UNAVAILABLE rather than logged as 0.000%. */
+  logImpact?: (positionId: string, priceImpactPct: number | null) => void;
+  /**
+   * C4 defense-in-depth: invoked ONLY when `finalizeClose` finds a
+   * position with no `pendingCloseReason` (a legacy/orphaned row --
+   * should be structurally impossible after the C4 write-order fix in
+   * `runExitCycle.ts`, but see that fix's doc comment for why this
+   * fallback exists anyway). Deliberately a plain callback rather than
+   * importing `composition/logger.ts`'s `Logger` type directly -- `exits/`
+   * doesn't otherwise depend on `composition/`, and this signature is
+   * structurally identical to `Logger.warn`, so the real logger can be
+   * passed straight through by composition/exitCycle.ts. Defaults to
+   * `console.warn` so a missing wiring is still loud, never silent.
+   */
+  warnLog?: (event: string, data?: Record<string, unknown>) => void;
 }
 
 /**
@@ -141,9 +171,7 @@ export async function executeExit(position: PositionRecord, deps: ExecuteExitDep
 
   const removeKey = `${position.closeIdempotencyKey}:removeLiquidity`;
   const removeDeps = buildRemoveLiquidityDeps(position, deps.livePositionState, deps.poolPrice);
-  const removeResult = await executeCriticalTransaction(removeKey, 'exit:removeLiquidity', removeDeps, deps.txAttempts);
-
-  if (!removeResult.ok) {
+  const removeResult = await executeCriticalTransaction(removeKey, 'exit:removeLiquidity', removeDeps, deps.txAttempts);  if (!removeResult.ok) {
     if (!removeResult.resumable) {
       // Definitive, and Tx A never reached VERIFIED -- LP fully intact.
       await deps.positions.markExitFailed(position.id);
@@ -158,27 +186,71 @@ export async function executeExit(position: PositionRecord, deps: ExecuteExitDep
   // swapAttemptCount, retry with a fresh key" response.
   const exitState = await deps.exitStates.getOrCreate(position.id);
 
+  // C3 fix: check whether THIS attempt's swap leg already reached VERIFIED
+  // BEFORE touching the live TOKEN balance at all. A successful swap
+  // leaves the TOKEN balance at (or near) zero -- the EXPECTED outcome of
+  // success, not evidence that "remove-liquidity succeeded but nothing
+  // happened yet." Unconditionally re-deriving `amountInRaw` here (the
+  // historical bug) read that expected post-swap zero balance as an
+  // invariant violation on every resume, throwing forever even though the
+  // exit had already fully succeeded on-chain -- permanently stuck at
+  // CLOSING with no cooldown ever recorded and a slot never freed.
+  const swapKey = `${position.closeIdempotencyKey}:swap:${exitState.swapAttemptCount}`;
+  const existingSwapAttempt = await deps.txAttempts.find(swapKey);
+  if (existingSwapAttempt?.status === 'VERIFIED') {
+    return finalizeClose(position, exitState, deps, removeKey, swapKey);
+  }
+
   const amountInRaw = await readTokenBalance(position.tokenAddress, wallet);
   if (amountInRaw <= 0n) {
     throw new Error(`position ${position.id}: remove-liquidity is VERIFIED but TOKEN balance reads 0 -- invariant violated`);
   }
-  const quote = await deps.swapExecutor.getQuote(position.tokenAddress, amountInRaw);
+  // TIER 3 — slippage ladder. The tier is `swapAttemptCount`, which Module
+  // 8 increments ONLY on a DEFINITIVE failure, so:
+  //  - attempt 1 always asks for the tight 100 bps;
+  //  - an AMBIGUOUS attempt (broadcast uncertain, process died mid-flight)
+  //    does NOT advance the tier -- the resumed attempt re-quotes at the
+  //    SAME width under the SAME idempotency key, rather than widening on
+  //    the strength of a failure nobody has actually established;
+  //  - only a proven failure earns 200, then 300 bps;
+  //  - past the last tier the index CLAMPS (stays 300) instead of
+  //    running off the end, and SWAP_RETRY.STUCK_THRESHOLD surfaces it.
+  // No new persisted state: the tier IS the attempt counter.
+  const slippageBps = exitSlippageBpsForAttempt(exitState.swapAttemptCount);
+
+  const quote = await deps.swapExecutor.getQuote(position.tokenAddress, amountInRaw, slippageBps);
   logImpact(position.id, quote.priceImpactPct);
   if (shouldBlockForPriceImpact(quote.priceImpactPct, config.rules.exits.IMPACT_CHECK_ENABLED, config.rules.priceImpact.MAX_EXIT_IMPACT_PCT)) {
     // Not a definitive failure -- conditions right now are bad, not
     // permanently invalid; no TransactionAttempt is even created for this
-    // tick. Retried next tick once impact may have improved.
+    // tick, and `swapAttemptCount` is NOT incremented (so this deferral
+    // can never widen the slippage tier -- price impact and slippage are
+    // separate protections and a bad quote is never "rescued" by asking
+    // for a looser fill). Retried next tick once impact may have improved.
+    const measured =
+      quote.priceImpactPct === null
+        ? 'could not be verified (provider did not report priceImpact)'
+        : `${(quote.priceImpactPct * 100).toFixed(2)}% exceeds max ${(config.rules.priceImpact.MAX_EXIT_IMPACT_PCT * 100).toFixed(2)}%`;
     return {
       outcome: 'PENDING',
-      reason: `exit swap price impact ${(quote.priceImpactPct * 100).toFixed(2)}% exceeds max ${(config.rules.priceImpact.MAX_EXIT_IMPACT_PCT * 100).toFixed(2)}% -- IMPACT_CHECK_ENABLED is on, deferring this swap`,
+      reason: `exit swap price impact ${measured} -- IMPACT_CHECK_ENABLED is on, deferring this swap`,
     };
   }
 
-  if (quote.allowanceTarget !== null) {
-    const currentAllowance = await readAllowance(position.tokenAddress, wallet, quote.allowanceTarget);
+  // C5 fix: the quote response has no `allowanceTarget` field on the real
+  // API -- the real mechanism is this separate check, which also returns
+  // the actual spender (decoded from the API's own approval calldata, see
+  // tradingApiMapper.ts's parseApprovalResponse). Our own on-chain
+  // allowance is still independently re-checked below before deciding to
+  // actually broadcast anything, so a prior attempt's already-sufficient
+  // approval is never redundantly re-approved.
+  const approvalCheck = await deps.swapExecutor.checkApproval(position.tokenAddress, amountInRaw);
+  if (approvalCheck.needsApproval && approvalCheck.spender) {
+    const spender = approvalCheck.spender;
+    const currentAllowance = await readAllowance(position.tokenAddress, wallet, spender);
     if (needsApproval(currentAllowance, amountInRaw)) {
       const approveKey = `${position.closeIdempotencyKey}:approve:${exitState.swapAttemptCount}`;
-      const approveDeps = buildApproveDeps(position.tokenAddress, quote.allowanceTarget, amountInRaw);
+      const approveDeps = buildApproveDeps(position.tokenAddress, spender, amountInRaw);
       const approveResult = await executeCriticalTransaction(approveKey, 'exit:approve', approveDeps, deps.txAttempts);
 
       if (!approveResult.ok) {
@@ -191,7 +263,6 @@ export async function executeExit(position: PositionRecord, deps: ExecuteExitDep
     }
   }
 
-  const swapKey = `${position.closeIdempotencyKey}:swap:${exitState.swapAttemptCount}`;
   const swapDeps = buildSwapDeps(position.id, position.tokenAddress, quote, deps.swapExecutor, deps.exitStates);
   const swapResult = await executeCriticalTransaction(swapKey, 'exit:swap', swapDeps, deps.txAttempts);
 
@@ -206,13 +277,77 @@ export async function executeExit(position: PositionRecord, deps: ExecuteExitDep
     return { outcome: 'PENDING', reason: swapResult.reason };
   }
 
+  return finalizeClose(position, exitState, deps, removeKey, swapKey);
+}
+
+/**
+ * VALIDATION PHASE: sums the on-chain-measured USDG proceeds of the two
+ * exit legs from their VERIFIED attempts' persisted `verifyData` (the same
+ * crash-safe mechanism that reconstructs any other post-verification
+ * payload). Returns null -- "not measured", never a fabricated number --
+ * when either leg's verifyData predates the proceeds fields (a legacy
+ * attempt verified by an older build, or a legacy row) or cannot be read:
+ * half a measurement is not a measurement, and under-counting realized
+ * proceeds would silently overstate the position's loss.
+ */
+function computeRealizedProceeds(
+  deps: Pick<ExecuteExitDeps, 'txAttempts'>,
+  removeKey: string,
+  swapKey: string,
+): Promise<bigint | null> {
+  return (async () => {
+    try {
+      const [removeAttempt, swapAttempt] = await Promise.all([deps.txAttempts.find(removeKey), deps.txAttempts.find(swapKey)]);
+      const removeProceeds = removeAttempt?.status === 'VERIFIED' ? removeAttempt.verifyData : null;
+      const swapProceeds = swapAttempt?.status === 'VERIFIED' ? swapAttempt.verifyData : null;
+      const removeUsdg =
+        typeof removeProceeds === 'object' && removeProceeds !== null && 'usdgProceedsRaw' in removeProceeds
+          ? (removeProceeds as RemoveLiquidityVerifyData).usdgProceedsRaw
+          : null;
+      const swapUsdg =
+        typeof swapProceeds === 'object' && swapProceeds !== null && 'usdgProceedsRaw' in swapProceeds
+          ? (swapProceeds as SwapVerifyData).usdgProceedsRaw
+          : null;
+      if (removeUsdg === null || swapUsdg === null) return null;
+      return removeUsdg + swapUsdg;
+    } catch {
+      return null; // honest "not measured" -- a close is never blocked by its own accounting read
+    }
+  })();
+}
+
+/**
+ * The final step of a successful exit -- shared by the normal swap-just-
+ * completed path and the C3 resume path (swap already found VERIFIED on
+ * entry, before any live balance read).
+ */
+async function finalizeClose(
+  position: PositionRecord,
+  exitState: { pendingCloseReason: string | null },
+  deps: Pick<ExecuteExitDeps, 'positions' | 'warnLog' | 'txAttempts'>,
+  removeKey: string,
+  swapKey: string,
+): Promise<ExitExecutionOutcome> {
+  // C4 defense-in-depth: `runExitCycle.ts` now writes `pendingCloseReason`
+  // BEFORE `markClosing` (reordered specifically so a crash between the
+  // two writes can never produce this state), so this should be
+  // unreachable in practice. It is NOT treated as a fatal invariant
+  // violation, though: the on-chain exit has ALREADY FULLY SUCCEEDED by
+  // the time this runs (remove-liquidity AND swap both VERIFIED) --
+  // throwing here would permanently strand a position that has no real
+  // problem left to resolve, purely because of a missing metadata field.
+  // A loud warning plus an honest 'UNKNOWN' close reason is safe: nothing
+  // downstream treats `closeReason` as anything but a display/audit label.
+  const closeReason = exitState.pendingCloseReason ?? 'UNKNOWN';
   if (!exitState.pendingCloseReason) {
-    // Invariant violation, not a recoverable condition: markClosing() is
-    // the only place `pendingCloseReason` is ever set, and it MUST be set
-    // before this function is ever called (see `runExitCycle.ts`) --
-    // never silently default to some trigger reason here.
-    throw new Error(`position ${position.id} completed its exit but ExitState.pendingCloseReason was never set`);
+    const warnLog = deps.warnLog ?? ((event, data) => { console.warn(event, data); });
+    warnLog('exit_missing_pending_close_reason', { positionId: position.id });
   }
-  await deps.positions.markClosed(position.id, new Date(), exitState.pendingCloseReason);
+  // Same "already fully succeeded on-chain" reasoning for the realized
+  // proceeds: a null here (unmeasurable) still closes the position -- the
+  // number is reported as unavailable for THIS row, never blocks the
+  // state transition.
+  const realizedUsdgRaw = await computeRealizedProceeds(deps, removeKey, swapKey);
+  await deps.positions.markClosed(position.id, new Date(), closeReason, realizedUsdgRaw);
   return { outcome: 'CLOSED' };
 }

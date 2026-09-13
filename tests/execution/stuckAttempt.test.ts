@@ -15,6 +15,7 @@ function baseAttempt(overrides: Partial<TransactionAttemptRecord> = {}): Transac
     rawTx: null,
     txHash: null,
     lastError: null,
+    verifyData: null,
     failureCode: null,
     attemptCount: 1,
     firstAttemptedAt: new Date(),

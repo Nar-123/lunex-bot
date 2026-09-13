@@ -3,7 +3,14 @@ import { config } from '../config';
 import type { PoolPriceState } from '../monitoring/types';
 
 /**
- * Safety Exit (spec section 8) -- deliberately given CONCRETE, testable
+ * INFRASTRUCTURE Safety Exit -- renamed in Tier 3 (the `SAFETY_EXIT`
+ * trigger name now belongs to Meridian's drawdown-recovery rule in
+ * `resolveExitDecision.ts`; this module is unchanged in behaviour and
+ * still produces the `INFRA_SAFETY_EXIT` reason). It is a data-integrity
+ * guard, NOT a trading rule: it fires when the bot cannot trust what it is
+ * reading, not when the market does something.
+ *
+ * Deliberately given CONCRETE, testable
  * conditions rather than left as a category that never actually fires
  * (flagged explicitly in review before this module started: "jangan
  * biarkan jadi kategori kosong"). Two conditions, both computed here
@@ -29,7 +36,7 @@ import type { PoolPriceState } from '../monitoring/types';
 
 export function evaluateMetricsFailureSafetyExit(metricsFailureSince: Date | null, now: Date): boolean {
   if (metricsFailureSince === null) return false;
-  return now.getTime() - metricsFailureSince.getTime() >= config.rules.exits.SAFETY_EXIT.MAX_METRICS_FAILURE_MS;
+  return now.getTime() - metricsFailureSince.getTime() >= config.rules.exits.INFRA_SAFETY_EXIT.MAX_METRICS_FAILURE_MS;
 }
 
 export function isPoolPriceStructurallyInvalid(poolPrice: PoolPriceState): boolean {
@@ -71,4 +78,44 @@ export function evaluateSafetyExit(input: { metricsFailureSince: Date | null; no
  */
 export function isSwapRetryStuck(swapAttemptCount: number, threshold: number = config.rules.exits.SWAP_RETRY.STUCK_THRESHOLD): boolean {
   return swapAttemptCount >= threshold;
+}
+
+/**
+ * H4 fix: a metrics-failure streak that has crossed
+ * `MAX_METRICS_FAILURE_MS` is the signature of EITHER a genuine
+ * position-specific anomaly (a broken pool, a bad on-chain read for THIS
+ * position only) OR a shared RPC/provider outage affecting every position
+ * at once -- and every ACTIVE position reads through the SAME transport
+ * (`monitoring/positionStateReader.ts`/`poolPrice`), so an outage produces
+ * IDENTICAL, PERFECTLY CORRELATED failures across the whole portfolio in
+ * the same tick. `resolveExitDecision`'s SAFETY_EXIT branch has no confirm
+ * timer and closes immediately -- without this check, a single shared
+ * outage lasting past the threshold would trigger a synchronized,
+ * simultaneous SAFETY_EXIT for every ACTIVE position at once, a full
+ * portfolio liquidation caused by nothing more than the RPC provider
+ * having a bad few minutes.
+ *
+ * `runExitCycle.ts` computes `failingCount`/`totalActiveCount` by reading
+ * metrics for every ACTIVE position FIRST, before deciding for any of
+ * them (see that file). When every single one is failing at once (and
+ * there's more than one to compare against -- with only one active
+ * position there is no peer to correlate against, so the existing
+ * behavior is preserved exactly), this is treated as a global outage: the
+ * metrics-failure SAFETY_EXIT trigger is suppressed for this tick.
+ *
+ * Critically, this does NOT reset or weaken anything: `metricsFailureSince`
+ * keeps counting, still persisted exactly as before. If the outage clears
+ * for every position except one, that one position is no longer
+ * correlated with its peers and correctly fires SAFETY_EXIT on the very
+ * next tick -- a genuinely isolated, still-failing position is never
+ * shielded by this check, only a portfolio-wide, all-failing tick is.
+ *
+ * The OTHER Safety Exit condition (`isPoolPriceStructurallyInvalid`, a
+ * successfully-read-but-corrupted/impossible price) is deliberately NOT
+ * subject to this correlation check -- it is a data-shape fact about one
+ * successful read, not an outage symptom, and stays exactly as
+ * immediate/unconditional as before.
+ */
+export function isMetricsFailureOutageCorrelated(failingCount: number, totalActiveCount: number): boolean {
+  return totalActiveCount > 1 && failingCount === totalActiveCount;
 }

@@ -85,7 +85,11 @@ function execFileOnce(
       { timeout: timeoutMs, env, maxBuffer: 10 * 1024 * 1024 },
       (error, stdout) => {
         if (error) {
-          reject(error);
+          // execFile's error is an ExecFileException (an Error carrying
+          // stdout/stderr); assert the shape rather than trusting it, so a
+          // non-Error rejection can never reach a `catch (err)` that
+          // assumes `.message` exists.
+          reject(error instanceof Error ? error : new Error('gmgn-cli child process failed with a non-Error value'));
           return;
         }
         resolve(stdout);

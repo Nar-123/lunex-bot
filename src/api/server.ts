@@ -61,7 +61,7 @@ export function createApiServer(deps: AppDeps, options: CreateApiServerOptions =
   // at `GET /app` via its default index-file lookup), so there is no
   // deep-link path that could 404 and need a fallback to catch.
   app.use('/app', express.static(path.join(__dirname, '../../ui/dist')));
-  app.get('/', (_req, res) => res.redirect('/app'));
+  app.get('/', (_req, res) => { res.redirect('/app'); });
 
   app.use('/auth', createAuthRouter(options.loginRateLimiterOptions));
 
@@ -81,6 +81,6 @@ export function createApiServer(deps: AppDeps, options: CreateApiServerOptions =
 export function startApiServer(deps: AppDeps, options: CreateApiServerOptions = {}): Promise<Server> {
   const app = createApiServer(deps, options);
   return new Promise((resolve) => {
-    const server = app.listen(config.api.port, config.api.host, () => resolve(server));
+    const server = app.listen(config.api.port, config.api.host, () => { resolve(server); });
   });
 }

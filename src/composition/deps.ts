@@ -15,7 +15,9 @@ import { StateViewPoolStateProvider } from '../pools/poolStateProvider';
 import { SwapLogPoolVolumeProvider } from '../pools/poolVolumeProvider';
 import { StateViewPoolPriceProvider } from '../pools/poolPriceProvider';
 import { PositionManagerLivePositionStateProvider } from '../monitoring/positionStateReader';
+import { PrismaPriceHistoryRepository } from '../monitoring/priceHistoryRepository';
 import { TradingApiSwapClient } from '../swap/tradingApiClient';
+import { PositionManagerLogNftLister, PositionManagerNftOwnerChecker } from '../reconciliation/nftReconciliationPorts';
 import { createConsoleFileLogger } from './logger';
 import type { AppDeps } from './types';
 
@@ -47,9 +49,12 @@ export function createRealAppDeps(): AppDeps {
     poolVolume: new SwapLogPoolVolumeProvider(),
     poolPrice: new StateViewPoolPriceProvider(),
     livePositionState: new PositionManagerLivePositionStateProvider(),
+    priceHistory: new PrismaPriceHistoryRepository(prisma),
     swapExecutor: new TradingApiSwapClient(),
     readTokenDecimals: readErc20Decimals,
     walletAddress,
     logger: createConsoleFileLogger(),
+    ownedNftLister: new PositionManagerLogNftLister(),
+    nftOwnerChecker: new PositionManagerNftOwnerChecker(),
   };
 }

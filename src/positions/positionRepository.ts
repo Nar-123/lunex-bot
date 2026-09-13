@@ -27,6 +27,7 @@ interface PrismaRow {
   openedAt: Date | null;
   closedAt: Date | null;
   closeReason: string | null;
+  realizedUsdgRaw: string | null;
 }
 
 function normalizeAddress(address: string): Address {
@@ -59,6 +60,7 @@ function toRecord(row: PrismaRow): PositionRecord {
     openedAt: row.openedAt,
     closedAt: row.closedAt,
     closeReason: row.closeReason,
+    realizedUsdgRaw: row.realizedUsdgRaw === null ? null : BigInt(row.realizedUsdgRaw),
   };
 }
 
@@ -115,7 +117,12 @@ export class PrismaPositionRepository implements PositionRepository {
   }
 
   async findAllOpening(): Promise<PositionRecord[]> {
-    const rows = await this.prisma.position.findMany({ where: { status: 'OPENING' } });
+    // H1 fix: deterministic ordering (oldest-created first) -- without
+    // this, iteration order over a resume pass is whatever the DB engine
+    // happens to return, which can vary between calls/engines, making
+    // "which position gets processed before a mid-pass crash" impossible
+    // to reason about consistently.
+    const rows = await this.prisma.position.findMany({ where: { status: 'OPENING' }, orderBy: { createdAt: 'asc' } });
     return rows.map(toRecord);
   }
 
@@ -152,10 +159,17 @@ export class PrismaPositionRepository implements PositionRepository {
     return toRecord(row);
   }
 
-  async markClosed(id: string, closedAt: Date, closeReason: string): Promise<PositionRecord> {
+  async markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null): Promise<PositionRecord> {
+    // Omitted -> null ("not measured") via Prisma's default-null on ADD COLUMN:
+    // legacy callers that don't pass proceeds keep the honest unavailable state.
     const row = await this.prisma.position.update({
       where: { id },
-      data: { status: 'CLOSED', closedAt, closeReason },
+      data: {
+        status: 'CLOSED',
+        closedAt,
+        closeReason,
+        ...(realizedUsdgRaw !== undefined && { realizedUsdgRaw: realizedUsdgRaw === null ? null : realizedUsdgRaw.toString() }),
+      },
     });
     return toRecord(row);
   }
@@ -174,5 +188,31 @@ export class PrismaPositionRepository implements PositionRepository {
       data: { status: 'ACTIVE', closeIdempotencyKey: null },
     });
     return toRecord(row);
+  }
+
+  async claimForResume(id: string, expectedStatus: 'OPENING' | 'CLOSING', freshnessMs: number): Promise<boolean> {
+    const freshnessCutoff = new Date(Date.now() - freshnessMs);
+    // A single conditional UPDATE -- the WHERE clause (status matches AND
+    // claim is absent/expired) and the SET (touch resumeClaimedAt) are
+    // evaluated and applied by the database as one atomic operation, so
+    // two concurrent callers can NEVER both see `count === 1`: whichever
+    // reaches the database first wins the row and the loser's WHERE clause
+    // no longer matches (resumeClaimedAt is now fresh).
+    const result = await this.prisma.position.updateMany({
+      where: {
+        id,
+        status: expectedStatus,
+        OR: [{ resumeClaimedAt: null }, { resumeClaimedAt: { lt: freshnessCutoff } }],
+      },
+      data: { resumeClaimedAt: new Date() },
+    });
+    return result.count === 1;
+  }
+
+  async releaseResumeClaim(id: string): Promise<void> {
+    // Unconditional by id -- orthogonal to `status` (which markActive/
+    // markFailed/etc. already transition independently), so this is safe
+    // to call regardless of the position's current status.
+    await this.prisma.position.update({ where: { id }, data: { resumeClaimedAt: null } });
   }
 }

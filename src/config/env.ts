@@ -57,7 +57,7 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 
   // Blockchain / RPC
-  RPC_URL: z.string().url(),
+  RPC_URL: z.url(),
   RPC_FALLBACK_URLS: z.string().default(''),
   CHAIN_ID: z.coerce.number().int().positive(),
   PRIVATE_KEY: z
@@ -84,9 +84,14 @@ const envSchema = z.object({
     .regex(/^0x[0-9a-fA-F]{40}$/)
     .default('0x8366a39cc670b4001a1121b8f6a443a643e40951'),
   // Lower bound for on-chain Initialize/Swap log scans (pools/ pool
-  // discovery + volume estimation) — scanning from block 0 on a live
-  // chain is impractical. Fill in the real PoolManager deployment block.
-  UNISWAP_V4_POOL_MANAGER_DEPLOY_BLOCK: z.coerce.bigint().default(0n),
+  // discovery + volume estimation). VERIFIED public fact (Phase 5): the
+  // PoolManager's creation tx
+  // 0x4fb28d4935866f462582c6c931c6f2705e55f5be5eb178c7d8d9329a95c44c41 was
+  // mined in block 9070 (2026-05-22), confirmed against both the robinscan
+  // index and a live node's eth_getTransactionByHash (see README's LIVE
+  // VALIDATION CHECKLIST for the full evidence). Still overridable for a
+  // different deployment/fork.
+  UNISWAP_V4_POOL_MANAGER_DEPLOY_BLOCK: z.coerce.bigint().default(9070n),
   UNISWAP_V4_QUOTER_ADDRESS: z.string().optional().default(''),
   // Real Robinhood Chain deployment address (confirmed, not guessed --
   // same "confirmed real address" status as UNISWAP_V4_POOL_MANAGER_ADDRESS/
@@ -99,6 +104,15 @@ const envSchema = z.object({
     .string()
     .regex(/^0x[0-9a-fA-F]{40}$/)
     .default('0x58daec3116aae6d93017baaea7749052e8a04fa7'),
+  // H5 (reconciliation): lower bound for the PositionManager ERC721
+  // Transfer-log scan used to enumerate every NFT the wallet currently
+  // owns (orphan-NFT detection). VERIFIED public fact (Phase 5): the
+  // PositionManager's creation tx
+  // 0x228c18ada6cb46b4fbcc18f4ec1519953415393e256fa8349aafbd5a2db037c8 was
+  // mined in block 9073 (2026-05-22), create2 createdContract = the
+  // configured address -- cross-checked the same way as the PoolManager's
+  // deploy block above.
+  UNISWAP_V4_POSITION_MANAGER_DEPLOY_BLOCK: z.coerce.bigint().default(9073n),
   UNISWAP_V4_STATE_VIEW_ADDRESS: z
     .string()
     .regex(/^0x[0-9a-fA-F]{40}$/)
@@ -116,8 +130,30 @@ const envSchema = z.object({
   // placeholder, not a guess presented as fact, and callers must treat the
   // exact endpoint/JSON shape as best-effort until checked against the
   // real service (see swap/tradingApiMapper.ts).
-  UNISWAP_API_KEY: z.string().optional().default(''),
-  UNISWAP_TRADING_API_BASE_URL: z.string().optional().default('https://trading-api-labs.interface.gateway.uniswap.org'),
+  // C5 fix: was `.optional().default('')` -- the Trading API is a
+  // MANDATORY dependency of the exit flow (every position close needs a
+  // TOKEN->USDG swap quote), not an opt-in feature like Telegram. Starting
+  // successfully with an empty key silently deferred the failure to the
+  // first real exit attempt (a 401 at the worst possible moment: AFTER
+  // liquidity has already been removed). Required now, same pattern as
+  // every other mandatory secret in this file (PRIVATE_KEY, RPC_URL, etc.).
+  UNISWAP_API_KEY: z.string().min(1, 'UNISWAP_API_KEY is required -- the Trading API is a mandatory dependency of the exit flow'),
+  // H9 fix: the ONLY contract address the exit swap's calldata is allowed
+  // to target (Universal Router or whatever real router the Trading API
+  // actually returns calldata for on Robinhood Chain) -- validateSwapQuote.ts
+  // rejects EVERY swap outright when this is empty, per explicit review:
+  // "if the official router address isn't confirmed, FAIL CLOSED," never
+  // fall back to accepting an arbitrary well-formed-looking address. Left
+  // unset (empty) by default deliberately -- this project has not
+  // confirmed Robinhood Chain's real router address from here, and a
+  // placeholder guess would be worse than refusing to swap at all.
+  UNISWAP_ALLOWED_SWAP_ROUTER_ADDRESS: z.string().optional().default(''),
+  // C5 fix: was an internal/undocumented interface-gateway host. This is
+  // the real, documented public endpoint -- confirmed by fetching the live
+  // OpenAPI spec at https://trade-api.gateway.uniswap.org/v1/api.json
+  // directly (not assumed). README.md already stated this correct URL,
+  // inconsistently with this file's old default.
+  UNISWAP_TRADING_API_BASE_URL: z.string().optional().default('https://trade-api.gateway.uniswap.org'),
 
   // GMGN — accessed via the `gmgn-cli` tool (child process), not a direct
   // HTTP call. GMGN_BASE_URL is kept only in case a future CLI build
@@ -204,8 +240,12 @@ const envSchema = z.object({
   ETH_GAS_RESERVE_ENABLED: booleanEnv(false),
   ETH_GAS_RESERVE_MIN: z.coerce.number().min(0).default(0),
 
-  // Optional safety toggles — locked OFF by spec, kept configurable
-  EXIT_IMPACT_CHECK_ENABLED: booleanEnv(false),
+  // TIER 3 (Meridian alignment): the exit price-impact gate is now ON by
+  // default -- Meridian's measured `maxExitPriceImpactPct: 0.5` is the
+  // single filter its own strategy doc credits with working against a
+  // round-trip cost 3.1x larger than the pool-level edge. Still
+  // overridable, but the safe default is now "check it."
+  EXIT_IMPACT_CHECK_ENABLED: booleanEnv(true),
   EXIT_MIN_RECEIVED_PROTECTION_ENABLED: booleanEnv(false),
 }).superRefine((data, ctx) => {
   if (data.TELEGRAM_BOT_TOKEN !== '' && data.AUTH_ADMIN_PASSWORD === '') {

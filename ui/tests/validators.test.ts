@@ -4,7 +4,6 @@ import {
   validateMaxActivePositions,
   validateHardStopLossPct,
   validateTrailingTpTriggerPct,
-  validateHardStopLossVsPnlProtection,
 } from '../src/validators';
 
 // Mirrors src/api/routes/settingsSchema.ts's bounds EXACTLY -- every
@@ -38,25 +37,27 @@ describe('validateTrailingTpTriggerPct -- mirrors settingsSchema.ts: gt(0).lte(1
   it('rejects above 1000', () => expect(validateTrailingTpTriggerPct(1000.01).valid).toBe(false));
 });
 
-describe('validateHardStopLossVsPnlProtection -- mirrors validateSettingsPatch.ts, threshold ALWAYS a parameter, never hardcoded', () => {
-  it('rejects a value looser than the given threshold', () => {
-    const result = validateHardStopLossVsPnlProtection(-5, -8);
-    expect(result.valid).toBe(false);
+/**
+ * TIER 3: the `validateHardStopLossVsPnlProtection` suite that used to sit
+ * here is GONE along with the function and its server-side original
+ * (`validateSettingsPatch.ts`). The rule required the stop to be at or
+ * below the protection threshold; the Meridian-aligned ladder makes the
+ * Hard Stop Loss (-6%) deliberately TIGHTER than the Safety Exit arming
+ * threshold (-8%), with the ladder's fixed priority order -- not their
+ * relative magnitudes -- deciding which fires. Mirroring a rule that no
+ * longer exists would have had the browser reject the product default.
+ *
+ * The per-field bounds above are unchanged and still mirror
+ * `settingsSchema.ts` exactly, which remains the real validation.
+ */
+describe('TIER 3: no cross-field stop-loss rule is exported any more', () => {
+  it('the per-field hard-stop bound alone accepts -6% (the product default) and -5% (looser than the -8% Safety Exit threshold)', () => {
+    expect(validateHardStopLossPct(-6).valid).toBe(true);
+    expect(validateHardStopLossPct(-5).valid).toBe(true);
   });
 
-  it('accepts a value worse (more negative) than the given threshold', () => {
-    expect(validateHardStopLossVsPnlProtection(-20, -8).valid).toBe(true);
-  });
-
-  it('accepts the exact boundary, inclusive', () => {
-    expect(validateHardStopLossVsPnlProtection(-8, -8).valid).toBe(true);
-  });
-
-  it('genuinely uses whatever threshold it is given, not a baked-in -8% -- proven with a DIFFERENT threshold value', () => {
-    // If this were hardcoded to -8 internally, this test (threshold -12)
-    // would give the wrong answer for -10.
-    expect(validateHardStopLossVsPnlProtection(-10, -12).valid).toBe(false); // -10 is looser than -12
-    expect(validateHardStopLossVsPnlProtection(-15, -12).valid).toBe(true); // -15 is worse than -12
-    expect(validateHardStopLossVsPnlProtection(-12, -12).valid).toBe(true); // exact boundary at the DIFFERENT threshold
+  it('and still rejects a positive or zero stop -- nothing was loosened beyond removing the cross-field rule', () => {
+    expect(validateHardStopLossPct(0).valid).toBe(false);
+    expect(validateHardStopLossPct(5).valid).toBe(false);
   });
 });

@@ -10,7 +10,7 @@ const USDG = (n: number): bigint => BigInt(n) * 10n ** 18n;
 const SWAP_TX = { to: '0x1111111111111111111111111111111111111111' as Address, data: '0xabcdef' as `0x${string}`, value: 0n };
 
 function makeQuote(overrides: Partial<SwapQuote> = {}): SwapQuote {
-  return { amountInRaw: USDG(0), expectedAmountOutRaw: USDG(100), minOutputAmountRaw: 0n, priceImpactPct: 0.001, allowanceTarget: null, ...overrides };
+  return { amountInRaw: USDG(0), expectedAmountOutRaw: USDG(100), minOutputAmountRaw: 0n, priceImpactPct: 0.001, slippageBps: 100, providerQuote: { fake: true }, ...overrides };
 }
 
 describe('shouldBlockForPriceImpact -- OFF by default per spec, both states directly testable', () => {
@@ -37,6 +37,7 @@ describe('buildSwapDeps -- takes an already-fetched quote, builds calldata for i
     const quote = makeQuote();
     const swapExecutor: SwapExecutor = {
       getQuote: vi.fn(),
+      checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })),
       buildSwapTx: vi.fn(async () => SWAP_TX),
     };
 
@@ -55,7 +56,7 @@ describe('buildSwapDeps -- takes an already-fetched quote, builds calldata for i
   it('persists the USDG balance baseline and the quote\'s minOutputAmountRaw before returning calldata', async () => {
     const exitStates = new InMemoryExitStateRepository();
     const quote = makeQuote({ minOutputAmountRaw: USDG(42) });
-    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), buildSwapTx: vi.fn(async () => SWAP_TX) };
+    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn(async () => SWAP_TX) };
 
     const deps = buildSwapDeps('pos-1', TOKEN, quote, swapExecutor, exitStates, {
       readBalance: vi.fn(async () => USDG(1000)),
@@ -73,7 +74,7 @@ describe('buildSwapDeps -- verifyOnChain requires a genuine USDG increase', () =
   it('fails verification when the balance did not increase at all, even with no minimum configured (protection OFF)', async () => {
     const exitStates = new InMemoryExitStateRepository();
     await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: 0n });
-    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), buildSwapTx: vi.fn() };
+    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() };
 
     const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, {
       readBalance: vi.fn(async () => USDG(1000)), // unchanged -- swap had zero effect
@@ -87,21 +88,22 @@ describe('buildSwapDeps -- verifyOnChain requires a genuine USDG increase', () =
   it('passes verification once the balance genuinely increased (protection OFF, no minimum enforced beyond "> 0")', async () => {
     const exitStates = new InMemoryExitStateRepository();
     await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: 0n });
-    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), buildSwapTx: vi.fn() };
+    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() };
 
     const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, {
       readBalance: vi.fn(async () => USDG(1050)),
+      readUsdgTransfersTo: vi.fn(async () => USDG(50)), // the swap's own receipt paid out exactly the increase
       walletAddress: WALLET,
     });
 
     const result = await deps.verifyOnChain('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`);
-    expect(result).toEqual({ ok: true, data: { usdgIncreaseRaw: USDG(50) } });
+    expect(result).toEqual({ ok: true, data: { usdgIncreaseRaw: USDG(50), usdgProceedsRaw: USDG(50) } });
   });
 
   it('fails verification when the increase is genuinely positive but below a configured minimum (protection ON)', async () => {
     const exitStates = new InMemoryExitStateRepository();
     await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: USDG(100) });
-    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), buildSwapTx: vi.fn() };
+    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() };
 
     const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, {
       readBalance: vi.fn(async () => USDG(1050)), // increased by 50, but the minimum required is 100
@@ -114,7 +116,7 @@ describe('buildSwapDeps -- verifyOnChain requires a genuine USDG increase', () =
 
   it('fails loudly (does not silently pass) when no baseline was ever recorded -- an invariant violation, not a valid state', async () => {
     const exitStates = new InMemoryExitStateRepository();
-    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), buildSwapTx: vi.fn() };
+    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() };
     const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, { readBalance: vi.fn(async () => USDG(1000)), walletAddress: WALLET });
 
     const result = await deps.verifyOnChain('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`);
@@ -126,7 +128,7 @@ describe('buildSwapDeps -- verifyOnChain requires a genuine USDG increase', () =
 describe('buildSwapDeps -- restart-safety of the verification baseline', () => {
   it('the baseline set during buildTransaction is what a LATER, independent verifyOnChain call reads back -- not a value re-read fresh at verify time', async () => {
     const exitStates = new InMemoryExitStateRepository();
-    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), buildSwapTx: vi.fn(async () => SWAP_TX) };
+    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn(async () => SWAP_TX) };
 
     // "Before restart": buildTransaction runs once, captures balance=1000 as the baseline.
     const beforeRestartDeps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, {
@@ -141,10 +143,11 @@ describe('buildSwapDeps -- restart-safety of the verification baseline', () => {
     // whatever readBalance happens to return generically.
     const afterRestartDeps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, {
       readBalance: vi.fn(async () => USDG(1075)), // current balance, post-swap
+      readUsdgTransfersTo: vi.fn(async () => USDG(75)), // receipt decoder, independently injectable (a restarted process re-reads the same receipt)
       walletAddress: WALLET,
     });
     const result = await afterRestartDeps.verifyOnChain('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`);
 
-    expect(result).toEqual({ ok: true, data: { usdgIncreaseRaw: USDG(75) } }); // 1075 - 1000 (the ORIGINAL baseline), not recomputed from scratch
+    expect(result).toEqual({ ok: true, data: { usdgIncreaseRaw: USDG(75), usdgProceedsRaw: USDG(75) } }); // 1075 - 1000 (the ORIGINAL baseline), not recomputed from scratch
   });
 });

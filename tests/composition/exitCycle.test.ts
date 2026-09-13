@@ -39,7 +39,14 @@ describe('runExitAndOpenResumeCycle', () => {
   });
 
   it('surfaces stuck TransactionAttempts (Module 6) and stuck swap retries (Module 8) in the summary and logs a warning', async () => {
-    const deps = createFakeAppDeps();
+    // H16 fix: stuck-swap-retry reporting is now conditioned on the
+    // position genuinely still being CLOSING (not just having a high
+    // historical swapAttemptCount) -- remove-liquidity is kept ambiguous
+    // so it actually stays CLOSING through this cycle call, rather than
+    // completing immediately via the default fake deps.
+    const deps = createFakeAppDeps({
+      buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n }, { broadcastRaw: vi.fn(async () => { throw new Error('ECONNRESET'); }) })),
+    });
     // A non-terminal, old-enough-to-be-flagged attempt.
     const attempt = await deps.txAttempts.create('deploy:stuck:1', 'test');
     await deps.txAttempts.update(attempt.id, {
@@ -48,7 +55,9 @@ describe('runExitAndOpenResumeCycle', () => {
       firstAttemptedAt: new Date(Date.now() - 20 * 60 * 1000), // 20 minutes ago -- past EXECUTION.STUCK_ATTEMPT_MAX_AGE_MS
     });
     const closingPosition = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000004' }));
-    await deps.exitStates.update(closingPosition.id, { swapAttemptCount: 5 }); // at the configured STUCK_THRESHOLD
+    await deps.positions.markActive(closingPosition.id, '1', new Date());
+    await deps.positions.markClosing(closingPosition.id, `exit:${closingPosition.id}:1`);
+    await deps.exitStates.update(closingPosition.id, { swapAttemptCount: 5, pendingCloseReason: 'HARD_STOP_LOSS' }); // at the configured STUCK_THRESHOLD
 
     const summary = await runExitAndOpenResumeCycle(deps);
 
@@ -59,12 +68,69 @@ describe('runExitAndOpenResumeCycle', () => {
     expect(logger.lines.some((l) => l.event === 'stuck_swap_retries')).toBe(true);
   });
 
+  describe('H16 regression: a CLOSED position with a high historical swapAttemptCount is never reported as stuck', () => {
+    it('swapAttemptCount=10 but status=CLOSED -- excluded from stuckSwapRetryPositionIds', async () => {
+      const deps = createFakeAppDeps();
+      const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000030' }));
+      await deps.positions.markActive(created.id, '1', new Date());
+      await deps.positions.markClosing(created.id, `exit:${created.id}:1`);
+      await deps.exitStates.update(created.id, { swapAttemptCount: 10 });
+      await deps.positions.markClosed(created.id, new Date(), 'HARD_STOP_LOSS');
+
+      const summary = await runExitAndOpenResumeCycle(deps);
+
+      expect(summary.stuckSwapRetryPositionIds).not.toContain(created.id);
+    });
+
+    it('CLOSING + 5 failed attempts -> stuck; then once CLOSED -> no longer stuck', async () => {
+      // Remove-liquidity kept ambiguous so the position genuinely STAYS
+      // CLOSING through the first cycle call, isolating this test to the
+      // stuck-detection reporting logic rather than the full exit flow.
+      const deps = createFakeAppDeps({
+        buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n }, { broadcastRaw: vi.fn(async () => { throw new Error('ECONNRESET'); }) })),
+      });
+      const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000031' }));
+      await deps.positions.markActive(created.id, '1', new Date());
+      await deps.positions.markClosing(created.id, `exit:${created.id}:1`);
+      await deps.exitStates.update(created.id, { swapAttemptCount: 5, pendingCloseReason: 'HARD_STOP_LOSS' }); // at STUCK_THRESHOLD
+
+      const whileClosing = await runExitAndOpenResumeCycle(deps);
+      expect(whileClosing.stuckSwapRetryPositionIds).toContain(created.id);
+      expect((await deps.positions.findById(created.id))?.status).toBe('CLOSING'); // confirms it genuinely stayed CLOSING
+
+      await deps.positions.markClosed(created.id, new Date(), 'HARD_STOP_LOSS');
+
+      const afterClosed = await runExitAndOpenResumeCycle(deps);
+      expect(afterClosed.stuckSwapRetryPositionIds).not.toContain(created.id);
+    });
+  });
+
   it('does NOT warn-log when nothing is stuck', async () => {
     const deps = createFakeAppDeps();
     await runExitAndOpenResumeCycle(deps);
     const logger = deps.logger as ReturnType<typeof import('../../src/composition/logger').createInMemoryLogger>;
     expect(logger.lines.some((l) => l.event === 'stuck_transaction_attempts')).toBe(false);
     expect(logger.lines.some((l) => l.event === 'stuck_swap_retries')).toBe(false);
+  });
+
+  it('H1: an uncaught throw resuming one OPENING position does not stop the next OPENING position from being processed', async () => {
+    const deps = createFakeAppDeps();
+    const openingA = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000006', openIdempotencyKey: 'deploy:a:1' }));
+    const openingB = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000007', openIdempotencyKey: 'deploy:b:1' }));
+
+    const originalClaim = deps.positions.claimForResume.bind(deps.positions);
+    deps.positions.claimForResume = vi.fn(async (id: string, status: 'OPENING' | 'CLOSING', freshnessMs: number) => {
+      if (id === openingA.id) throw new Error('simulated resume crash for position A');
+      return originalClaim(id, status, freshnessMs);
+    });
+
+    const summary = await runExitAndOpenResumeCycle(deps);
+
+    expect(summary.openResumeResults).toHaveLength(2); // BOTH positions were attempted, not just the one before the throw
+    const resultA = summary.openResumeResults.find((r) => r.positionId === openingA.id);
+    const resultB = summary.openResumeResults.find((r) => r.positionId === openingB.id);
+    expect(resultA?.outcome.outcome).toBe('PENDING'); // isolated failure, not a crash
+    expect(resultB?.outcome.outcome).toBe('ACTIVE'); // proves B was still processed despite A's throw
   });
 
   it('a definitive mint failure during open-resume does not crash the cycle -- other work still completes', async () => {

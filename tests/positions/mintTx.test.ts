@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Address } from 'viem';
 import { buildMintDeps } from '../../src/positions/mintTx';
+import { MintedTokenIdNotFoundError } from '../../src/blockchain/erc721';
 import type { MintInput } from '../../src/positions/mintTx';
 import { v3TickMathUtils } from '../../src/blockchain/uniswapSdk';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../../src/monitoring/types';
@@ -107,14 +108,39 @@ describe('buildMintDeps', () => {
       expect(result.ok).toBe(false);
     });
 
-    it('fails verification (does not throw uncaught) when no Transfer/mint event can be found', async () => {
+    it('fails verification DEFINITIVELY only for MintedTokenIdNotFoundError -- a genuine on-chain fact (receipt has no Transfer log for us)', async () => {
       const deps = buildMintDeps(makeMintInput(), { getLiveState: vi.fn() }, makePoolPrice(), {
         walletAddress: WALLET,
-        discoverTokenId: vi.fn(async () => { throw new Error('no mint event found'); }),
+        discoverTokenId: vi.fn(async () => {
+          throw new MintedTokenIdNotFoundError(DUMMY_HASH, '0x0000000000000000000000000000000000000009', WALLET);
+        }),
       });
       const result = await deps.verifyOnChain(DUMMY_HASH);
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.reason).toMatch(/could not discover minted tokenId/);
+    });
+
+    describe('C2 regression: transient RPC/transport errors must NEVER be classified as a definitive verification failure', () => {
+      const transientErrors = [
+        ['RPC timeout', new Error('RPC timeout')],
+        ['429 rate limited', new Error('HTTP 429: Too Many Requests')],
+        ['500 server error', new Error('HTTP 500: Internal Server Error')],
+        ['connection reset', new Error('ECONNRESET')],
+        ['CALL_EXCEPTION from provider', Object.assign(new Error('missing revert data'), { code: 'CALL_EXCEPTION' })],
+      ] as const;
+
+      for (const [label, err] of transientErrors) {
+        it(`${label}: verifyOnChain THROWS (never returns ok:false) -- receipt already confirmed the mint mined`, async () => {
+          const deps = buildMintDeps(makeMintInput(), { getLiveState: vi.fn() }, makePoolPrice(), {
+            walletAddress: WALLET,
+            discoverTokenId: vi.fn(async () => { throw err; }),
+          });
+          // A propagated throw is exactly what lets executeCriticalTransaction's
+          // outer catch treat this as ambiguous/resumable instead of
+          // VERIFICATION_FAILED -- see executeCriticalTransaction.ts.
+          await expect(deps.verifyOnChain(DUMMY_HASH)).rejects.toThrow();
+        });
+      }
     });
   });
 });

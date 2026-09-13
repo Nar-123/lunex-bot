@@ -45,7 +45,7 @@ describe('GET /positions', () => {
 });
 
 describe('GET /positions?status=closed (Module 11)', () => {
-  it('returns the scoped-down shape for a CLOSED position -- no PNL/fee numbers, honestly flagged as unavailable', async () => {
+  it('returns the scoped-down shape for a CLOSED position -- realized PnL honestly flagged as unavailable when not measured', async () => {
     const { app, deps } = buildTestApp();
     const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
     await deps.positions.markActive(created.id, '1', new Date());
@@ -59,7 +59,25 @@ describe('GET /positions?status=closed (Module 11)', () => {
     expect(position.id).toBe(created.id);
     expect(position.closeReason).toBe('HARD_STOP_LOSS');
     expect(position.realizedPnlAvailable).toBe(false);
+    expect(position.realizedPnlUsdgRaw).toBeUndefined(); // never a fabricated number
     expect(position.metrics).toBeUndefined(); // no computePositionMetrics call for a closed position
+  });
+
+  it('VALIDATION PHASE: reports the MEASURED realized PnL (exit receipts - entry) when the exit recorded proceeds', async () => {
+    const { app, deps } = buildTestApp();
+    const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
+    await deps.positions.markActive(created.id, '1', new Date());
+    // 90 USDG remove-liquidity proceeds + 10 USDG swap proceeds = 100 total;
+    // entry is 1000 USDG -> realized PnL = -900 USDG, raw-exact.
+    await deps.positions.markClosed(created.id, new Date(), 'TRAILING_TP', (90n + 10n) * 10n ** 18n);
+
+    const res = await request(app).get('/positions?status=closed').set('Authorization', authHeader());
+
+    expect(res.status).toBe(200);
+    const position = res.body.positions[0];
+    expect(position.realizedPnlAvailable).toBe(true);
+    expect(position.realizedUsdgRaw).toBe((100n * 10n ** 18n).toString());
+    expect(position.realizedPnlUsdgRaw).toBe((-900n * 10n ** 18n).toString());
   });
 
   it('excludes ACTIVE positions from the closed listing', async () => {

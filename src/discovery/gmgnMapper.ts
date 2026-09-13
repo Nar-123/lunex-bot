@@ -37,7 +37,7 @@ export const gmgnTrendingTokenSchema = z
     top_10_holder_rate: z.number().min(0).max(1),
     asset_type: z.string(),
   })
-  .passthrough();
+  .loose();
 
 export type GmgnTrendingToken = z.infer<typeof gmgnTrendingTokenSchema>;
 
@@ -55,7 +55,7 @@ export const gmgnTokenInfoSchema = z
     address: z.string().min(1),
     creation_timestamp: z.number(),
   })
-  .passthrough();
+  .loose();
 
 export type GmgnTokenInfo = z.infer<typeof gmgnTokenInfoSchema>;
 

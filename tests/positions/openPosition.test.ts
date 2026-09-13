@@ -319,6 +319,182 @@ describe('openPosition / resumeOpenPosition -- the open-side state machine', () 
     });
   });
 
+  describe('C1 regression: crash after mint VERIFIED, before markActive -- resume must never crash, never re-mint, never fabricate data', () => {
+    it('PROCESS 2 resumes a VERIFIED-but-not-yet-ACTIVE mint and reaches ACTIVE with the real tokenId, no duplicate mint', async () => {
+      const positions = new InMemoryPositionRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+
+      // "PROCESS 1": mint succeeded, verification succeeded, the attempt
+      // reached VERIFIED with real verifyData persisted -- then the
+      // process crashed before ever calling markActive.
+      const created = await positions.create({
+        tokenAddress: TOKEN,
+        tokenSymbol: 'MEME',
+        tokenDecimals: 18,
+        pool: POOL,
+        tickLower: -6960,
+        tickUpper: -60,
+        entryUsdgRaw: USDG(350),
+        entrySqrtPriceX96: 2n ** 96n,
+        entryTick: 0,
+        openIdempotencyKey: 'deploy:crash-test:1',
+      });
+      const mintKey = `${created.openIdempotencyKey}:mint`;
+      const attempt = await txAttempts.create(mintKey, 'deploy:mint');
+      await txAttempts.update(attempt.id, {
+        status: 'VERIFIED',
+        verifyData: { positionTokenId: '999', liquidity: 500n },
+        txHash: `0x${'ef'.repeat(32)}` as `0x${string}`,
+      });
+
+      // "PROCESS 2": resumeOpenPosition on the same still-OPENING row. If
+      // the mint were re-executed at all, buildTransaction would throw.
+      const buildTransaction = vi.fn(async () => {
+        throw new Error('must never rebuild/re-mint an already-VERIFIED attempt');
+      });
+      const resumedMintDeps = vi.fn(() => fakeTxDeps({ positionTokenId: '999', liquidity: 500n }, { buildTransaction }));
+
+      const resumed = await resumeOpenPosition(created, {
+        positions,
+        txAttempts,
+        ...baseDeps({ buildMintDeps: resumedMintDeps, readAllowance: vi.fn(async () => USDG(1000)) }),
+      });
+
+      expect(resumed.outcome).toBe('ACTIVE');
+      if (resumed.outcome !== 'ACTIVE') throw new Error('unreachable');
+      expect(resumed.position.positionTokenId).toBe('999'); // the REAL tokenId -- the historical bug crashed here (TypeError on undefined.data)
+      expect(buildTransaction).not.toHaveBeenCalled(); // proves no duplicate mint transaction
+
+      const capital = new PositionCapitalSnapshotProvider(positions, WALLET, async () => USDG(1000));
+      const snapshot = await capital.getSnapshot();
+      expect(snapshot.activePositionsCount).toBe(1); // correct capital accounting, no double-count
+    });
+
+    it('a VERIFIED mint attempt with missing verifyData (legacy row) is safely recovered -- never marked FAILED, capital never released', async () => {
+      const positions = new InMemoryPositionRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+
+      const created = await positions.create({
+        tokenAddress: TOKEN,
+        tokenSymbol: 'MEME',
+        tokenDecimals: 18,
+        pool: POOL,
+        tickLower: -6960,
+        tickUpper: -60,
+        entryUsdgRaw: USDG(350),
+        entrySqrtPriceX96: 2n ** 96n,
+        entryTick: 0,
+        openIdempotencyKey: 'deploy:crash-test:2',
+      });
+      const mintKey = `${created.openIdempotencyKey}:mint`;
+      const attempt = await txAttempts.create(mintKey, 'deploy:mint');
+      await txAttempts.update(attempt.id, {
+        status: 'VERIFIED',
+        verifyData: null, // simulates a legacy row verified before verifyData persistence existed
+        txHash: `0x${'ef'.repeat(32)}` as `0x${string}`,
+      });
+
+      // executeCriticalTransaction's own reconstruction re-runs verifyOnChain
+      // against the known txHash -- this stands in for that real on-chain read.
+      const resumedMintDeps = vi.fn(() => fakeTxDeps({ positionTokenId: '999', liquidity: 500n }));
+
+      const resumed = await resumeOpenPosition(created, {
+        positions,
+        txAttempts,
+        ...baseDeps({ buildMintDeps: resumedMintDeps, readAllowance: vi.fn(async () => USDG(1000)) }),
+      });
+
+      expect(resumed.outcome).toBe('ACTIVE'); // never FAILED, never PENDING-forever
+      const active = await positions.findAllActive();
+      expect(active).toHaveLength(1);
+      expect(active[0]?.positionTokenId).toBe('999');
+    });
+  });
+
+  describe('C7 regression: position claiming prevents two concurrent callers from both executing a mint for the same position', () => {
+    it('screening (fresh openPosition) racing exit-cycle resume on the SAME just-created row: only one owner executes the mint', async () => {
+      const positions = new InMemoryPositionRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+
+      let buildTransactionCalls = 0;
+      const buildMintDeps = vi.fn(() =>
+        fakeTxDeps(
+          { positionTokenId: '42', liquidity: 500n },
+          {
+            buildTransaction: vi.fn(async () => {
+              buildTransactionCalls++;
+              await new Promise((resolve) => setTimeout(resolve, 5)); // widen the race window
+              return TX;
+            }),
+          },
+        ),
+      );
+
+      const created = await positions.create({
+        tokenAddress: TOKEN,
+        tokenSymbol: 'MEME',
+        tokenDecimals: 18,
+        pool: POOL,
+        tickLower: -6960,
+        tickUpper: -60,
+        entryUsdgRaw: USDG(350),
+        entrySqrtPriceX96: 2n ** 96n,
+        entryTick: 0,
+        openIdempotencyKey: 'deploy:race:1',
+      });
+
+      // "Screening": resumeOpenPosition simulates the caller that DID the
+      // create() (openPosition() itself funnels through the same claimed
+      // executeOpen path). "Exit-cycle resume": a concurrent
+      // resumeOpenPosition call discovering the SAME row via
+      // findAllOpening(), exactly as composition/exitCycle.ts's loop does.
+      const [outcomeA, outcomeB] = await Promise.all([
+        resumeOpenPosition(created, {
+          positions,
+          txAttempts,
+          ...baseDeps({ buildMintDeps, readAllowance: vi.fn(async () => USDG(1000)) }),
+        }),
+        resumeOpenPosition(created, {
+          positions,
+          txAttempts,
+          ...baseDeps({ buildMintDeps, readAllowance: vi.fn(async () => USDG(1000)) }),
+        }),
+      ]);
+
+      const outcomes = [outcomeA, outcomeB];
+      const activeCount = outcomes.filter((o) => o.outcome === 'ACTIVE').length;
+      const pendingCount = outcomes.filter((o) => o.outcome === 'PENDING').length;
+
+      expect(activeCount).toBe(1); // exactly one caller did the work and reached ACTIVE
+      expect(pendingCount).toBe(1); // the other deferred, claim lost
+      expect(buildTransactionCalls).toBe(1); // proves only ONE mint transaction was ever built -- no duplicate mint
+    });
+
+    it('two workers attempting the same OPENING position: one claims successfully, the other exits without executing any transaction', async () => {
+      const positions = new InMemoryPositionRepository();
+
+      const created = await positions.create({
+        tokenAddress: TOKEN,
+        tokenSymbol: 'MEME',
+        tokenDecimals: 18,
+        pool: POOL,
+        tickLower: -6960,
+        tickUpper: -60,
+        entryUsdgRaw: USDG(350),
+        entrySqrtPriceX96: 2n ** 96n,
+        entryTick: 0,
+        openIdempotencyKey: 'deploy:race:2',
+      });
+
+      const [claimA, claimB] = await Promise.all([
+        positions.claimForResume(created.id, 'OPENING', 20_000),
+        positions.claimForResume(created.id, 'OPENING', 20_000),
+      ]);
+
+      expect([claimA, claimB].filter(Boolean)).toHaveLength(1); // exactly one winner
+    });
+  });
+
   describe('approve leg is skipped entirely when current allowance is already sufficient', () => {
     it('does not call buildApproveDeps at all', async () => {
       const positions = new InMemoryPositionRepository();

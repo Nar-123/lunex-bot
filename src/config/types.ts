@@ -23,6 +23,8 @@ export interface UniswapAddressBook {
     poolManagerDeployBlock: bigint;
     quoter: string;
     positionManager: string;
+    /** Block the PositionManager was deployed at — lower bound for reconciliation's ownership-enumerating Transfer log scans (H5). */
+    positionManagerDeployBlock: bigint;
     /** Periphery StateView contract — the standard way to read v4 pool state (slot0/liquidity/ticks) off-chain. */
     stateView: string;
   };
@@ -47,6 +49,8 @@ export interface GmgnConfig {
 export interface UniswapTradingApiConfig {
   baseUrl: string;
   apiKey: string;
+  /** H9: the ONLY contract address exit-swap calldata is allowed to target. Empty means unconfirmed -- `swap/validateSwapQuote.ts` fails closed in that case, never skips the check. */
+  allowedRouterAddress: string;
 }
 
 export interface DatabaseConfig {

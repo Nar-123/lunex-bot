@@ -28,12 +28,30 @@ describe('GET /positions/stuck', () => {
 
   it('surfaces a stuck swap retry (Module 8) via the existing findStuckSwapRetries primitive', async () => {
     const { app, deps } = buildTestApp();
+    // H16 fix: stuck-swap-retry reporting requires the position to
+    // genuinely be CLOSING right now, not merely have a high historical
+    // swapAttemptCount -- see exits/stuckSwapRetries.ts.
     const closing = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000004' }));
+    await deps.positions.markActive(closing.id, '1', new Date());
+    await deps.positions.markClosing(closing.id, `exit:${closing.id}:1`);
     await deps.exitStates.update(closing.id, { swapAttemptCount: 5 });
 
     const res = await request(app).get('/positions/stuck').set('Authorization', authHeader());
 
     expect(res.body.stuckSwapRetryPositionIds).toContain(closing.id);
+  });
+
+  it('H16: a CLOSED position with a high historical swapAttemptCount is excluded, not reported as stuck', async () => {
+    const { app, deps } = buildTestApp();
+    const closed = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000005' }));
+    await deps.positions.markActive(closed.id, '1', new Date());
+    await deps.positions.markClosing(closed.id, `exit:${closed.id}:1`);
+    await deps.exitStates.update(closed.id, { swapAttemptCount: 10 });
+    await deps.positions.markClosed(closed.id, new Date(), 'HARD_STOP_LOSS');
+
+    const res = await request(app).get('/positions/stuck').set('Authorization', authHeader());
+
+    expect(res.body.stuckSwapRetryPositionIds).not.toContain(closed.id);
   });
 
   it('401s without a valid token', async () => {

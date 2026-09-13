@@ -72,6 +72,7 @@ export function makeExitTestPosition(overrides: Partial<PositionRecord> = {}): P
     openedAt: new Date(),
     closedAt: null,
     closeReason: null,
+    realizedUsdgRaw: null,
     ...overrides,
   };
 }

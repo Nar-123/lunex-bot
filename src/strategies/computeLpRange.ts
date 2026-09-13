@@ -10,6 +10,25 @@ const { TickMath, nearestUsableTick, encodeSqrtRatioX96 } = v3TickMathUtils;
 const Q192 = 1n << 192n;
 
 /**
+ * H18/M1 fix: the 50%-below-entry boundary MUST round toward giving the
+ * position MORE downside room, never less -- `nearestUsableTick` rounds
+ * to the NEAREST tickSpacing multiple, which can round in EITHER
+ * direction and, at coarse tickSpacing, measurably violates the "lower
+ * boundary >= 50% below entry" guarantee (proven: 0.548828x entry instead
+ * of 0.500x at tickSpacing=2000 -- a ~10% narrower downside cushion than
+ * intended). `floorToSpacing`/`ceilToSpacing` round unconditionally
+ * toward -Infinity/+Infinity respectively, so the caller picks whichever
+ * direction is conservative for its orientation (see the two call sites
+ * below) instead of leaving it to chance.
+ */
+function floorToSpacing(tick: number, spacing: number): number {
+  return Math.floor(tick / spacing) * spacing;
+}
+function ceilToSpacing(tick: number, spacing: number): number {
+  return Math.ceil(tick / spacing) * spacing;
+}
+
+/**
  * Pure function (no I/O/RPC) implementing the LP strategy's range math:
  * lower = 0.5x entry price, upper = entry price (0% offset, rounded
  * STRICTLY below the current tick so the position is genuinely
@@ -65,10 +84,15 @@ const Q192 = 1n << 192n;
  * ratio encoder -- see `blockchain/uniswapSdk.ts` for why this v3-sdk
  * import is fine) fed with exact BigInt ratios, then converted to ticks
  * via `TickMath.getTickAtSqrtRatio` -- no floating point anywhere in
- * this path. Tick-spacing alignment uses `nearestUsableTick` throughout;
- * the "strictly below/above current tick" requirement is enforced with a
- * single, provably-sufficient one-step adjustment on top of that (see
- * inline comments), never a hand-rolled rounding algorithm.
+ * this path. The near-entry boundary uses `nearestUsableTick` plus a
+ * provably-sufficient one-step adjustment to force it strictly below/above
+ * the current tick (see inline comments). The 50%-below-entry boundary
+ * (H18/M1 fix) deliberately does NOT use `nearestUsableTick` --
+ * round-to-NEAREST can round in either direction, which measurably
+ * violates the "at least 50% below entry" guarantee at coarse
+ * tickSpacing (proven: 0.548828x instead of 0.500x at tickSpacing=2000).
+ * It instead floors/ceils directionally toward MORE downside room --
+ * see `floorToSpacing`/`ceilToSpacing` below.
  *
  * ---- 5. tickSpacing ----
  * Always taken from `input.tickSpacing` (the selected pool's real
@@ -134,7 +158,9 @@ export function computeLpRange(input: LpRangeInput): LpRangeResult {
     let tickLower: number;
     let tickUpper: number;
     if (usdgIsCurrency0) {
-      // Case B: raw ratio = TOKEN/USDG. Single-sided-USDG range sits AT/ABOVE current tick.
+      // Case B: raw ratio = TOKEN/USDG (INVERSE of the human USDG-per-TOKEN
+      // price -- higher raw tick = lower human price). Single-sided-USDG
+      // range sits AT/ABOVE current tick.
       let lower = nearestUsableTick(tickCurrent, tickSpacing);
       // nearestUsableTick rounds to the NEAREST multiple, which could land
       // at-or-below tickCurrent -- force strictly ABOVE. One adjustment is
@@ -143,10 +169,18 @@ export function computeLpRange(input: LpRangeInput): LpRangeResult {
       // isn't already strictly greater guarantees strictly-greater.
       if (lower <= tickCurrent) lower += tickSpacing;
       tickLower = lower;
-      tickUpper = nearestUsableTick(tickDouble, tickSpacing);
+      // H18/M1 fix: this is the 50%-below-entry boundary in human-price
+      // terms. Because the raw ratio is INVERTED here, "round the human
+      // price DOWN (more downside room)" means rounding the RAW tick UP
+      // (ceil) -- a higher raw tick corresponds to a lower human price.
+      tickUpper = ceilToSpacing(tickDouble, tickSpacing);
     } else {
-      // Case A: raw ratio = USDG/TOKEN directly. Range sits AT/BELOW current tick.
-      tickLower = nearestUsableTick(tickHalf, tickSpacing);
+      // Case A: raw ratio = USDG/TOKEN directly (higher tick = higher
+      // human price). Range sits AT/BELOW current tick.
+      // H18/M1 fix: this IS the 50%-below-entry boundary, and the raw
+      // ratio is direct here, so "round the human price DOWN" means
+      // flooring the raw tick directly.
+      tickLower = floorToSpacing(tickHalf, tickSpacing);
       let upper = nearestUsableTick(tickCurrent, tickSpacing);
       if (upper >= tickCurrent) upper -= tickSpacing; // symmetric one-step guarantee, strictly BELOW
       tickUpper = upper;

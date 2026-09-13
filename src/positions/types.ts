@@ -30,6 +30,14 @@ export interface PositionRecord {
   openedAt: Date | null;
   closedAt: Date | null;
   closeReason: string | null;
+  /**
+   * VALIDATION PHASE: total USDG (raw) the exit actually returned to the
+   * wallet, measured from the two exit transactions' confirmed receipts.
+   * null = not measured (legacy rows, or receipts that couldn't be
+   * decoded) -- honestly unavailable, never a 0 placeholder. Realized PnL
+   * = this - entryUsdgRaw, computed at read time by reporting only.
+   */
+  realizedUsdgRaw: bigint | null;
 }
 
 export interface CreatePositionInput {
@@ -132,7 +140,12 @@ export interface PositionRepository {
   countNonClosed(): Promise<number>;
   markActive(id: string, positionTokenId: string, openedAt: Date): Promise<PositionRecord>;
   markClosing(id: string, closeIdempotencyKey: string): Promise<PositionRecord>;
-  markClosed(id: string, closedAt: Date, closeReason: string): Promise<PositionRecord>;
+  /**
+   * `realizedUsdgRaw` (optional, null = not measured) is persisted in the
+   * SAME atomic update as the status transition -- the proceeds and the
+   * CLOSED state can never disagree. See `PositionRecord.realizedUsdgRaw`.
+   */
+  markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null): Promise<PositionRecord>;
   /**
    * Terminal, non-consuming status for an OPENING position whose deploy
    * transaction ended in a DEFINITIVE (`resumable: false`) failure from
@@ -183,4 +196,31 @@ export interface PositionRepository {
    * with a fresh swap-specific key, since there is no LP left to revert to.
    */
   markExitFailed(id: string): Promise<PositionRecord>;
+  /**
+   * C7 concurrency fix: atomic compare-and-swap claim -- succeeds (`true`)
+   * ONLY if `id` is currently at `expectedStatus` AND was not claimed
+   * within the last `freshnessMs`. Implemented as a single conditional
+   * `UPDATE ... WHERE id = ? AND status = ? AND (claim expired)` so the
+   * check-and-set is one atomic database operation, never a racy
+   * read-then-write. Callers that fail to claim MUST NOT proceed with any
+   * transaction-executing logic for this position this tick -- another
+   * cycle already owns it (or owned it moments ago and the claim hasn't
+   * expired yet). This is what makes it safe for the 30-minute screening
+   * cycle's `openPosition()` and the 15-second exit cycle's OPENING-resume
+   * pass to run on independent, unsynchronized schedules (see
+   * `composition/app.ts`) without both ever executing a transaction for
+   * the SAME position at once.
+   */
+  claimForResume(id: string, expectedStatus: 'OPENING' | 'CLOSING', freshnessMs: number): Promise<boolean>;
+  /**
+   * Releases a claim taken by `claimForResume` -- called unconditionally
+   * (success, definitive failure, OR ambiguous/PENDING outcome) once the
+   * claiming call's work is done, so the claim's lifetime matches the
+   * ACTUAL duration of the in-flight work (however long a mint/exit takes
+   * to mine) rather than a fixed timeout that could otherwise stall a
+   * legitimate next attempt. The `freshnessMs` window in `claimForResume`
+   * exists purely to recover from the one case this can't cover: the
+   * claiming process crashing before ever reaching this release.
+   */
+  releaseResumeClaim(id: string): Promise<void>;
 }

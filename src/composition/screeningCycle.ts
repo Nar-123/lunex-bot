@@ -1,5 +1,4 @@
 import { getAddress } from 'viem';
-import type { Address } from 'viem';
 import { Token } from '@uniswap/sdk-core';
 import { config } from '../config';
 import { screenCandidates, getPassingCandidates } from '../filters/screenCandidate';
@@ -94,6 +93,14 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
   };
 
   const usdgAddress = getAddress(config.quoteAsset.ADDRESS);
+  // Extracted through a `boolean`-typed interface so the guards below are
+  // genuinely conditional: `config.rules.cycle.TRY_NEXT_CANDIDATE_ON_FAILURE`
+  // is a frozen `true` literal, and a directly-typed local would make every
+  // `if (!flag)` guard type-level dead code (no-unnecessary-condition is
+  // right about THAT). The flag is a documented policy toggle -- `false`
+  // must keep working the moment the constant flips -- so the guards stay.
+  const cyclePolicy: { TRY_NEXT_CANDIDATE_ON_FAILURE: boolean } = config.rules.cycle;
+  const tryNextCandidateOnFailure = cyclePolicy.TRY_NEXT_CANDIDATE_ON_FAILURE;
 
   for (const candidate of passing) {
     if (summary.deployed >= config.rules.cycle.MAX_SUCCESSFUL_DEPLOYMENTS_PER_CYCLE) break;
@@ -102,11 +109,11 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
     const capitalDecision = decideCapitalAllocation(snapshot, capitalRules);
     if (!capitalDecision.ok) {
       summary.skipped.push({ symbol: candidate.symbol, stage: 'capital', reason: capitalDecision.reason });
-      if (!config.rules.cycle.TRY_NEXT_CANDIDATE_ON_FAILURE) break;
+      if (!tryNextCandidateOnFailure) break;
       continue;
     }
 
-    const tokenAddress = getAddress(candidate.address) as Address;
+    const tokenAddress = getAddress(candidate.address);
     const tokenDecimals = await deps.readTokenDecimals(tokenAddress);
     const tokenSdk = new Token(config.chain.chainId, tokenAddress, tokenDecimals, candidate.symbol);
     const usdgSdk = new Token(config.chain.chainId, usdgAddress, config.quoteAsset.DECIMALS, 'USDG');
@@ -118,7 +125,7 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
     });
     if (!poolResult.selected) {
       summary.skipped.push({ symbol: candidate.symbol, stage: 'pool', reason: poolResult.reason });
-      if (!config.rules.cycle.TRY_NEXT_CANDIDATE_ON_FAILURE) break;
+      if (!tryNextCandidateOnFailure) break;
       continue;
     }
 
@@ -136,7 +143,7 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
     });
     if (!rangeResult.ok) {
       summary.skipped.push({ symbol: candidate.symbol, stage: 'range', reason: rangeResult.reason });
-      if (!config.rules.cycle.TRY_NEXT_CANDIDATE_ON_FAILURE) break;
+      if (!tryNextCandidateOnFailure) break;
       continue;
     }
 
@@ -169,7 +176,7 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
       summary.deployed++;
     } else {
       summary.skipped.push({ symbol: candidate.symbol, stage: 'open', reason: openOutcome.reason });
-      if (!config.rules.cycle.TRY_NEXT_CANDIDATE_ON_FAILURE) break;
+      if (!tryNextCandidateOnFailure) break;
       continue;
     }
   }

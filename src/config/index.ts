@@ -41,6 +41,7 @@ const uniswap: UniswapAddressBook = {
     poolManagerDeployBlock: env.UNISWAP_V4_POOL_MANAGER_DEPLOY_BLOCK,
     quoter: env.UNISWAP_V4_QUOTER_ADDRESS,
     positionManager: env.UNISWAP_V4_POSITION_MANAGER_ADDRESS,
+    positionManagerDeployBlock: env.UNISWAP_V4_POSITION_MANAGER_DEPLOY_BLOCK,
     stateView: env.UNISWAP_V4_STATE_VIEW_ADDRESS,
   },
   uniswapX: {
@@ -57,6 +58,10 @@ const gmgn: GmgnConfig = {
 const uniswapTradingApi: UniswapTradingApiConfig = {
   baseUrl: env.UNISWAP_TRADING_API_BASE_URL,
   apiKey: env.UNISWAP_API_KEY,
+  // H9 fix: chain-specific, sourced from env -- never hardcoded here.
+  // Empty means "not confirmed yet," and validateSwapQuote.ts fails
+  // closed (rejects every swap) rather than skip the check.
+  allowedRouterAddress: env.UNISWAP_ALLOWED_SWAP_ROUTER_ADDRESS,
 };
 
 const database: DatabaseConfig = {

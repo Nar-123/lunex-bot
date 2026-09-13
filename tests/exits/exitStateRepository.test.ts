@@ -64,9 +64,11 @@ describe('ExitStateRepository', () => {
       const nowAfterRestart = new Date(breachStartedAt.getTime() + 16_000);
       const { decision } = resolveExitDecision({
         now: nowAfterRestart,
-        pnlPct: 0.08, // still at the drawdown line
-        inRange: true,
-        safetyExitTriggered: false,
+        // Peak 10% minus the 3-PERCENTAGE-POINT drawdown = 7% -- exactly on
+        // the line, so the breach is still live and the confirm timer is
+        // still the pre-restart one.
+        metrics: { pnlPct: 0.07, inRange: true, yieldPct: null, bbPercentB: null, positionAgeMs: null },
+        infraSafetyExitTriggered: false,
         exitState: readBack,
       }, RULES);
 
@@ -90,9 +92,16 @@ describe('ExitStateRepository', () => {
 
       // Only 2 more minutes pass post-restart (29 + 2 = 31 >= 30 -> closes).
       const nowAfterRestart = new Date(oorStartedAt.getTime() + 31 * 60 * 1000);
-      const { decision } = resolveExitDecision({ now: nowAfterRestart, pnlPct: 0, inRange: false, safetyExitTriggered: false, exitState: readBack }, RULES);
+      const { decision } = resolveExitDecision({
+        now: nowAfterRestart,
+        // PnL is a real, flat 0 -- below OOR_PROFIT's +2% floor, so the only
+        // rule that can fire here is the grace-window timeout itself.
+        metrics: { pnlPct: 0, inRange: false, yieldPct: null, bbPercentB: null, positionAgeMs: null },
+        infraSafetyExitTriggered: false,
+        exitState: readBack,
+      }, RULES);
 
-      expect(decision).toEqual({ shouldClose: true, reason: 'OOR' });
+      expect(decision).toEqual({ shouldClose: true, reason: 'OOR_TIMEOUT' });
     });
   });
 });

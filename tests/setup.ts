@@ -23,6 +23,13 @@ const testEnv: Record<string, string> = {
   // Module 9's openPosition.ts is the first consumer to need a real,
   // valid-shaped value here for its tests to run at all.
   UNISWAP_V4_POSITION_MANAGER_ADDRESS: '0x' + '33'.repeat(20),
+  // C5 fix: UNISWAP_API_KEY is now required (env.ts), not optional/default.
+  UNISWAP_API_KEY: 'test-uniswap-trading-api-key-not-for-real-use',
+  // H9 fix: matches tests/swap/tradingApiClient.test.ts's fixture swap
+  // response "to" address -- without this, every real buildSwapTx() test
+  // would fail closed (no router configured) rather than exercise the
+  // rest of the validation pipeline.
+  UNISWAP_ALLOWED_SWAP_ROUTER_ADDRESS: '0x1111111111111111111111111111111111111111',
   DATABASE_PROVIDER: 'sqlite',
   DATABASE_URL: 'file:./data/test.db',
   AUTH_ADMIN_USERNAME: 'test-admin',

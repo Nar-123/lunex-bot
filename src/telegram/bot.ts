@@ -89,14 +89,18 @@ export async function startTelegramBot(deps: TelegramBotDeps, signal?: AbortSign
   // `src/index.ts`) forever. Standard telegraf idiom: launch in the
   // background, attach a rejection handler for a genuine launch failure
   // (e.g. an invalid token), return control immediately.
-  bot.launch().catch((err) => {
+  bot.launch().catch((err: unknown) => {
     deps.logger.error('telegram_bot_launch_failed', { message: err instanceof Error ? err.message : String(err) });
   });
   deps.logger.info('telegram_bot_started', {});
 
   return {
-    stop: async () => {
+    stop: () => {
+      // grammY's stop() is synchronous fire-and-forget; returning an
+      // already-resolved Promise keeps the RunningTelegramBot contract
+      // (an awaited stop) without a no-op async.
       bot.stop('SIGTERM');
+      return Promise.resolve();
     },
   };
 }

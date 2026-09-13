@@ -121,17 +121,28 @@ export function createFakeAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
     poolVolume: { get6hVolumeUsd: vi.fn(async () => 500_000) },
     poolPrice: { getPriceState: vi.fn(async () => ({ sqrtPriceX96: 2n ** 96n, tickCurrent: 0 })) },
     livePositionState: { getLiveState: vi.fn(async () => ({ liquidity: 500n, tokensOwed0: 0n, tokensOwed1: 0n })) },
+    // No persisted price series in the fake wiring -- `recentSamples` returning
+    // an empty array is the honest "not enough history yet" state, which makes
+    // BB %B unavailable (null) and the OVEREXTENDED rule correctly inert here.
+    priceHistory: {
+      recordSample: vi.fn(async () => undefined),
+      recentSamples: vi.fn(async () => []),
+      pruneOlderThan: vi.fn(async () => undefined),
+    },
     swapExecutor: {
-      getQuote: vi.fn(async () => ({ amountInRaw: USDG(1), expectedAmountOutRaw: USDG(1), minOutputAmountRaw: 0n, priceImpactPct: 0.001, allowanceTarget: null })),
+      getQuote: vi.fn(async () => ({ amountInRaw: USDG(1), expectedAmountOutRaw: USDG(1), minOutputAmountRaw: 0n, priceImpactPct: 0.001, slippageBps: 100, providerQuote: { fake: true } })),
+      checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })),
       buildSwapTx: vi.fn(async () => TX),
     },
     readTokenDecimals: vi.fn(async () => 18),
     walletAddress: WALLET,
     logger: createInMemoryLogger(),
+    ownedNftLister: { listOwnedTokenIds: vi.fn(async () => []) },
+    nftOwnerChecker: { checkOwner: vi.fn(async () => ({ status: 'FOUND' as const, owner: WALLET })) },
     buildApproveDepsForOpen: vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(1000) })),
     buildMintDeps: vi.fn(() => fakeTxDeps({ positionTokenId: String(Math.floor(Math.random() * 100000)), liquidity: 500n })),
-    buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const })),
-    buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: USDG(10) })),
+    buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(90) })),
+    buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: USDG(10), usdgProceedsRaw: USDG(10) })),
     buildApproveDepsForExit: vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(1000) })),
     readAllowance: vi.fn(async () => USDG(1000)), // already sufficient -- approve legs skipped by default in tests unless a test overrides this
     readTokenBalanceForExit: vi.fn(async () => USDG(500)),

@@ -6,8 +6,14 @@ export interface SettingsResponse {
   maxActivePositions: number;
   hardStopLossPct: number;
   trailingTpTriggerPct: number;
-  /** Read-only, frozen server threshold -- never settable here. See Decision 5, Module 12. */
-  pnlProtectionTriggerPct: number;
+  /**
+   * Read-only, frozen server threshold -- never settable here. Renamed
+   * from `pnlProtectionTriggerPct` in TIER 3: this is the drawdown at
+   * which the Meridian-aligned Safety Exit ARMS (it then closes on a
+   * recovery back to breakeven). Displayed for context only; TIER 3
+   * removed the cross-field validation it used to feed.
+   */
+  safetyExitTriggerPct: number;
   updatedAt: string;
 }
 
@@ -15,14 +21,15 @@ export interface SettingsResponse {
  * Pure: data in, HTML string out. All four editable fields pre-filled
  * with the CURRENT server values (Decision 5 -- the gap this whole view
  * exists to close: Module 10 only ever built the write side). The frozen
- * `pnlProtectionTriggerPct` is embedded as a `data-` attribute so the
- * (impure, DOM-wiring) controller can read it for client-side validation
- * without a second fetch or a hardcoded copy.
+ * `safetyExitTriggerPct` is shown read-only for context; TIER 3 dropped
+ * the `data-` attribute that used to carry it into client-side
+ * cross-field validation, because that rule no longer exists on either
+ * side.
  */
 export function renderSettingsForm(s: SettingsResponse): string {
   return `
-    <form id="settings-form" data-pnl-protection-trigger-pct="${s.pnlProtectionTriggerPct}">
-      <p class="note">Nilai saat ini (per ${escapeHtml(new Date(s.updatedAt).toLocaleString())}). PNL Protection aktif otomatis di ${s.pnlProtectionTriggerPct}% (beku, tidak bisa diubah di sini).</p>
+    <form id="settings-form">
+      <p class="note">Nilai saat ini (per ${escapeHtml(new Date(s.updatedAt).toLocaleString())}). Safety Exit arming otomatis di ${s.safetyExitTriggerPct}% max drawdown (beku, tidak bisa diubah di sini).</p>
 
       <label>
         Position size (% dari free balance)

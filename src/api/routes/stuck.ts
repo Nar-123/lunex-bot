@@ -1,15 +1,22 @@
 import { Router } from 'express';
 import { isStuckAttempt } from '../../execution/stuckAttempt';
 import { config } from '../../config';
+import { filterToClosingPositions } from '../../exits/stuckSwapRetries';
+import { runReconciliation } from '../../reconciliation/runReconciliation';
 import type { AppDeps } from '../../composition/types';
 
 /**
- * `GET /positions/stuck` -- pure surfacing of two already-built primitives,
- * zero new stuck-detection logic: `findNonTerminal()` + `isStuckAttempt`
- * (Module 6) for stuck transaction attempts, `findStuckSwapRetries`
- * (Module 8) for stuck exit-swap retries. Same threshold
- * (`EXITS.SWAP_RETRY.STUCK_THRESHOLD`) already used by
- * `composition/exitCycle.ts`'s log surfacing.
+ * `GET /positions/stuck` -- pure surfacing of already-built primitives, no
+ * new stuck-detection logic of its own: `findNonTerminal()` +
+ * `isStuckAttempt` (Module 6) for stuck transaction attempts,
+ * `findStuckSwapRetries` (Module 8) for stuck exit-swap retries, and (H5)
+ * `runReconciliation`'s on-chain <-> DB divergence findings -- the exact
+ * same reconciliation check `composition/exitCycle.ts` already runs every
+ * 15s tick, surfaced here on-demand too. The wallet-wide orphan-NFT scan
+ * is deliberately skipped on this on-demand path (`includeOrphanScan:
+ * false`) -- an API request should never trigger an expensive whole-wallet
+ * log scan; that one only runs on the exit cycle's own cadence (see
+ * exitCycle.ts's doc comment).
  */
 export function createStuckRouter(deps: AppDeps): Router {
   const router = Router();
@@ -17,7 +24,21 @@ export function createStuckRouter(deps: AppDeps): Router {
   router.get('/', async (_req, res) => {
     const nonTerminal = await deps.txAttempts.findNonTerminal();
     const stuckAttempts = nonTerminal.filter((a) => isStuckAttempt(a));
-    const stuckSwapRetryPositionIds = await deps.exitStates.findStuckSwapRetries(config.rules.exits.SWAP_RETRY.STUCK_THRESHOLD);
+    // H16 fix -- see exits/stuckSwapRetries.ts's doc comment.
+    const rawStuckSwapRetryPositionIds = await deps.exitStates.findStuckSwapRetries(config.rules.exits.SWAP_RETRY.STUCK_THRESHOLD);
+    const currentlyClosing = await deps.positions.findAllClosing();
+    const stuckSwapRetryPositionIds = filterToClosingPositions(rawStuckSwapRetryPositionIds, currentlyClosing.map((p) => p.id));
+    const reconciliation = await runReconciliation(
+      {
+        positions: deps.positions,
+        txAttempts: deps.txAttempts,
+        livePositionState: deps.livePositionState,
+        ownedNftLister: deps.ownedNftLister,
+        nftOwnerChecker: deps.nftOwnerChecker,
+        walletAddress: deps.walletAddress,
+      },
+      { includeOrphanScan: false },
+    );
 
     res.status(200).json({
       stuckTransactionAttempts: stuckAttempts.map((a) => ({
@@ -29,6 +50,11 @@ export function createStuckRouter(deps: AppDeps): Router {
         firstAttemptedAt: a.firstAttemptedAt,
       })),
       stuckSwapRetryPositionIds,
+      reconciliation: {
+        findings: reconciliation.findings,
+        rpcHealthy: reconciliation.rpcHealthy,
+        checkedAt: reconciliation.checkedAt,
+      },
     });
   });
 

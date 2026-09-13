@@ -4,6 +4,9 @@ import type { ExitCycleResult } from '../exits/runExitCycle';
 import { resumeOpenPosition } from '../positions/openPosition';
 import type { OpenPositionOutcome } from '../positions/openPosition';
 import { isStuckAttempt } from '../execution/stuckAttempt';
+import { filterToClosingPositions } from '../exits/stuckSwapRetries';
+import { runReconciliation } from '../reconciliation/runReconciliation';
+import type { ReconciliationReport } from '../reconciliation/types';
 import type { AppDeps } from './types';
 
 export interface OpenResumeResult {
@@ -17,7 +20,19 @@ export interface ExitCycleSummary {
   openResumeResults: OpenResumeResult[];
   stuckTransactionAttemptIds: string[];
   stuckSwapRetryPositionIds: string[];
+  reconciliation: ReconciliationReport;
 }
+
+/**
+ * H5 fix: the (expensive, whole-wallet-history) orphan-NFT scan runs on
+ * this cycle's very FIRST invocation (satisfying "startup reconciliation")
+ * and is skipped on every subsequent 15s tick thereafter (satisfying
+ * "periodic reconciliation" for every OTHER check, which are all cheap,
+ * targeted reads) -- reusing the exit cycle's own existing
+ * `runImmediately: true` schedule (composition/app.ts) rather than adding
+ * a second scheduler for this.
+ */
+let hasRunStartupOrphanScan = false;
 
 /**
  * The second 15-second cycle (independent of monitoring's): exit
@@ -38,6 +53,7 @@ export async function runExitAndOpenResumeCycle(deps: AppDeps): Promise<ExitCycl
     txAttempts: deps.txAttempts,
     livePositionState: deps.livePositionState,
     poolPrice: deps.poolPrice,
+    priceHistory: deps.priceHistory,
     swapExecutor: deps.swapExecutor,
     settings: deps.settings,
     buildRemoveLiquidityDeps: deps.buildRemoveLiquidityDeps,
@@ -46,6 +62,7 @@ export async function runExitAndOpenResumeCycle(deps: AppDeps): Promise<ExitCycl
     readAllowance: deps.readAllowance,
     readTokenBalance: deps.readTokenBalanceForExit,
     walletAddress: deps.walletAddress,
+    warnLog: (event, data) => { deps.logger.warn(event, data); },
   });
 
   const closed = exitResults.filter((r) => r.outcome?.outcome === 'CLOSED');
@@ -55,25 +72,68 @@ export async function runExitAndOpenResumeCycle(deps: AppDeps): Promise<ExitCycl
     if (position) await deps.cooldown.recordExit(position.tokenAddress);
   }
 
+  // H1 fix: each OPENING position is isolated -- a throw resuming one
+  // (an RPC blip, a bug) must never abort the rest of this pass, exactly
+  // the same "runs independently per position" discipline runExitCycle.ts
+  // already uses for its own two passes. Before this fix, an exception
+  // from resumeOpenPosition propagated straight out of this loop, silently
+  // starving every OTHER OPENING position AND skipping the stuck-attempt
+  // surfacing below for the remainder of this tick.
   const openingPositions = await deps.positions.findAllOpening();
   const openResumeResults: OpenResumeResult[] = [];
   for (const position of openingPositions) {
-    const outcome = await resumeOpenPosition(position, {
-      positions: deps.positions,
-      txAttempts: deps.txAttempts,
-      livePositionState: deps.livePositionState,
-      poolPrice: deps.poolPrice,
-      buildApproveDeps: deps.buildApproveDepsForOpen,
-      buildMintDeps: deps.buildMintDeps,
-      readAllowance: deps.readAllowance,
-      walletAddress: deps.walletAddress,
-    });
-    openResumeResults.push({ positionId: position.id, outcome });
+    try {
+      const outcome = await resumeOpenPosition(position, {
+        positions: deps.positions,
+        txAttempts: deps.txAttempts,
+        livePositionState: deps.livePositionState,
+        poolPrice: deps.poolPrice,
+        buildApproveDeps: deps.buildApproveDepsForOpen,
+        buildMintDeps: deps.buildMintDeps,
+        readAllowance: deps.readAllowance,
+        walletAddress: deps.walletAddress,
+      });
+      openResumeResults.push({ positionId: position.id, outcome });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      deps.logger.error('open_resume_error', { positionId: position.id, message });
+      openResumeResults.push({ positionId: position.id, outcome: { outcome: 'PENDING', reason: message } });
+    }
   }
 
   const nonTerminalAttempts = await deps.txAttempts.findNonTerminal();
   const stuckAttempts = nonTerminalAttempts.filter((a) => isStuckAttempt(a));
-  const stuckSwapRetryPositionIds = await deps.exitStates.findStuckSwapRetries(config.rules.exits.SWAP_RETRY.STUCK_THRESHOLD);
+  // H16 fix: `findStuckSwapRetries` alone has no idea a position already
+  // CLOSED (or is otherwise no longer CLOSING) -- intersecting with the
+  // CURRENT set of CLOSING positions is what keeps a long-resolved exit
+  // from being reported as stuck forever. See stuckSwapRetries.ts.
+  const rawStuckSwapRetryPositionIds = await deps.exitStates.findStuckSwapRetries(config.rules.exits.SWAP_RETRY.STUCK_THRESHOLD);
+  const currentlyClosing = await deps.positions.findAllClosing();
+  const stuckSwapRetryPositionIds = filterToClosingPositions(rawStuckSwapRetryPositionIds, currentlyClosing.map((p) => p.id));
+
+  // H5: reconciliation is a diagnostic pass -- it never writes anything,
+  // and a failure in it must never take down the exit/open-resume cycle
+  // itself (isolated in its own try/catch, same "runs independently"
+  // discipline as every other per-position/per-pass isolation in this file).
+  const includeOrphanScan = !hasRunStartupOrphanScan;
+  let reconciliation: ReconciliationReport;
+  try {
+    reconciliation = await runReconciliation(
+      {
+        positions: deps.positions,
+        txAttempts: deps.txAttempts,
+        livePositionState: deps.livePositionState,
+        ownedNftLister: deps.ownedNftLister,
+        nftOwnerChecker: deps.nftOwnerChecker,
+        walletAddress: deps.walletAddress,
+      },
+      { includeOrphanScan },
+    );
+    if (includeOrphanScan) hasRunStartupOrphanScan = true;
+  } catch (err) {
+    reconciliation = { findings: [], checkedAt: new Date(), rpcHealthy: false, orphanScanRan: false };
+    deps.logger.error('reconciliation_error', { message: err instanceof Error ? err.message : String(err) });
+  }
 
   const summary: ExitCycleSummary = {
     exitResults,
@@ -81,6 +141,7 @@ export async function runExitAndOpenResumeCycle(deps: AppDeps): Promise<ExitCycl
     openResumeResults,
     stuckTransactionAttemptIds: stuckAttempts.map((a) => a.id),
     stuckSwapRetryPositionIds,
+    reconciliation,
   };
 
   deps.logger.info('exit_cycle', {
@@ -89,6 +150,8 @@ export async function runExitAndOpenResumeCycle(deps: AppDeps): Promise<ExitCycl
     openResumeAttempts: openResumeResults.length,
     stuckTransactionAttempts: stuckAttempts.length,
     stuckSwapRetries: stuckSwapRetryPositionIds.length,
+    reconciliationFindings: reconciliation.findings.length,
+    reconciliationRpcHealthy: reconciliation.rpcHealthy,
   });
   if (stuckAttempts.length > 0) {
     deps.logger.warn('stuck_transaction_attempts', {
@@ -98,6 +161,12 @@ export async function runExitAndOpenResumeCycle(deps: AppDeps): Promise<ExitCycl
   }
   if (stuckSwapRetryPositionIds.length > 0) {
     deps.logger.warn('stuck_swap_retries', { positionIds: stuckSwapRetryPositionIds });
+  }
+  if (reconciliation.findings.length > 0) {
+    deps.logger.warn('reconciliation_findings', { findings: reconciliation.findings });
+  }
+  if (!reconciliation.rpcHealthy) {
+    deps.logger.warn('reconciliation_rpc_unhealthy', { checkedAt: reconciliation.checkedAt.toISOString() });
   }
 
   return summary;

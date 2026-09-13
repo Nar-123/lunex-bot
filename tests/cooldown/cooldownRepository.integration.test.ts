@@ -5,6 +5,8 @@ import path from 'node:path';
 import { PrismaClient } from '@prisma/client';
 import { PrismaBetterSqlite3 } from '@prisma/adapter-better-sqlite3';
 import { PrismaCooldownRepository } from '../../src/cooldown/cooldownRepository';
+import { PrismaPositionRepository } from '../../src/positions/positionRepository';
+import { makeCreateInput } from '../positions/fixtures';
 
 /**
  * Real integration test: runs the ACTUAL `prisma migrate deploy` against a
@@ -89,5 +91,60 @@ describe('PrismaCooldownRepository (real SQLite DB, real migration)', () => {
     await repo.recordExit(TOKEN_B, longAgo);
     const status = await repo.getCooldownStatus(TOKEN_B);
     expect(status).toEqual({ inCooldown: false, remainingMs: 0 });
+  });
+
+  describe('H17 regression: crash between Position.markClosed and cooldown.recordExit', () => {
+    const TOKEN_C = '0x3333333333333333333333333333333333333333';
+
+    it('markClosed succeeds, recordExit NEVER runs (simulated crash) -- cooldown is still reconstructed and reported active, entirely from Position.closedAt', async () => {
+      const positions = new PrismaPositionRepository(prisma);
+      const created = await positions.create(makeCreateInput({ tokenAddress: TOKEN_C, openIdempotencyKey: 'deploy:h17:1' }));
+      await positions.markActive(created.id, '1', new Date());
+      // markClosed succeeds (the real, durable write)...
+      await positions.markClosed(created.id, new Date(), 'HARD_STOP_LOSS');
+      // ...but recordExit is deliberately NEVER called -- simulates the
+      // process dying between the two writes in composition/exitCycle.ts.
+
+      const status = await repo.getCooldownStatus(TOKEN_C);
+
+      expect(status.inCooldown).toBe(true);
+      expect(status.remainingMs).toBeGreaterThan(0);
+      expect(status.remainingMs).toBeLessThanOrEqual(2 * 60 * 60 * 1000);
+
+      // Confirms the dedicated row genuinely never got written (proving
+      // the reconstruction path, not the normal recordExit path, is what
+      // produced the active-cooldown result above).
+      const dedicatedRow = await prisma.tokenCooldown.findUnique({ where: { tokenAddress: TOKEN_C.toLowerCase() } });
+      expect(dedicatedRow).toBeNull();
+    });
+
+    it('an OLD closed position (well past the cooldown window) with no recordExit ever having run correctly reports NOT in cooldown', async () => {
+      const tokenD = '0x4444444444444444444444444444444444444444';
+      const positions = new PrismaPositionRepository(prisma);
+      const created = await positions.create(makeCreateInput({ tokenAddress: tokenD, openIdempotencyKey: 'deploy:h17:2' }));
+      await positions.markActive(created.id, '1', new Date());
+      const longAgo = new Date(Date.now() - 3 * 60 * 60 * 1000); // 3h ago > 2h cooldown
+      await positions.markClosed(created.id, longAgo, 'HARD_STOP_LOSS');
+
+      const status = await repo.getCooldownStatus(tokenD);
+      expect(status).toEqual({ inCooldown: false, remainingMs: 0 });
+    });
+
+    it('reconstruction never WEAKENS an existing dedicated row -- the later of the two sources always wins', async () => {
+      const tokenE = '0x5555555555555555555555555555555555555555';
+      const positions = new PrismaPositionRepository(prisma);
+      const created = await positions.create(makeCreateInput({ tokenAddress: tokenE, openIdempotencyKey: 'deploy:h17:3' }));
+      await positions.markActive(created.id, '1', new Date());
+      const earlierClose = new Date(Date.now() - 60 * 60 * 1000); // 1h ago
+      await positions.markClosed(created.id, earlierClose, 'HARD_STOP_LOSS');
+      // The dedicated row records a LATER exit (e.g. a subsequent
+      // recordExit call for a different close of the same token) --
+      // reconstruction from the OLDER position close must not shorten it.
+      await repo.recordExit(tokenE, new Date()); // now, i.e. later than earlierClose
+
+      const status = await repo.getCooldownStatus(tokenE);
+      const expectedFromDedicatedRow = await prisma.tokenCooldown.findUnique({ where: { tokenAddress: tokenE.toLowerCase() } });
+      expect(status.cooldownEndsAt).toBe(expectedFromDedicatedRow?.cooldownEndsAt.getTime());
+    });
   });
 });

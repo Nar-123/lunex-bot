@@ -8,11 +8,13 @@ import type { ActivePositionChecker } from '../filters/types';
 import type { CapitalSnapshotProvider } from '../capital/types';
 import type { DiscoveryService } from '../discovery/discoveryService';
 import type { PoolDiscoveryPort, PoolStateProviderPort, PoolVolumeProviderPort } from '../pools/types';
-import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring/types';
+import type { LivePositionStateProvider, PoolPriceProvider, PriceHistoryProvider } from '../monitoring/types';
 import type { SwapExecutor, SwapQuote } from '../swap/types';
+import type { NftOwnerChecker, OwnedNftLister } from '../reconciliation/types';
 import type { ApproveVerifyData as OpenApproveVerifyData } from '../positions/approveTx';
 import type { MintInput, MintVerifyData } from '../positions/mintTx';
 import type { ApproveVerifyData as ExitApproveVerifyData } from '../exits/approveTx';
+import type { RemoveLiquidityVerifyData } from '../exits/removeLiquidityTx';
 import type { SwapVerifyData } from '../exits/swapTx';
 import type { Logger } from './logger';
 
@@ -51,11 +53,16 @@ export interface AppDeps {
   poolVolume: PoolVolumeProviderPort;
   poolPrice: PoolPriceProvider;
   livePositionState: LivePositionStateProvider;
+  /** TIER 3: persisted pool-price series feeding Bollinger %B (the OVEREXTENDED exit). See `monitoring/priceHistoryRepository.ts`. */
+  priceHistory: PriceHistoryProvider;
   swapExecutor: SwapExecutor;
   /** No existing utility read this anywhere before Module 9A (`discovery/`'s `CandidateToken` doesn't carry it) -- `blockchain/erc20.ts`'s `readErc20Decimals` fills this. */
   readTokenDecimals: (tokenAddress: Address) => Promise<number>;
   walletAddress: Address;
   logger: Logger;
+  /** H5: on-chain <-> DB reconciliation ports -- see `reconciliation/runReconciliation.ts`. */
+  ownedNftLister: OwnedNftLister;
+  nftOwnerChecker: NftOwnerChecker;
 
   /**
    * Optional overrides for the on-chain leg builders `openPosition`/
@@ -72,7 +79,7 @@ export interface AppDeps {
    */
   buildApproveDepsForOpen?: (amountInRaw: bigint) => TxSafetyDeps<OpenApproveVerifyData>;
   buildMintDeps?: (input: MintInput, live: LivePositionStateProvider, pool: PoolPriceProvider) => TxSafetyDeps<MintVerifyData>;
-  buildRemoveLiquidityDeps?: (position: PositionRecord, live: LivePositionStateProvider, pool: PoolPriceProvider) => TxSafetyDeps<{ liquidityZero: true }>;
+  buildRemoveLiquidityDeps?: (position: PositionRecord, live: LivePositionStateProvider, pool: PoolPriceProvider) => TxSafetyDeps<RemoveLiquidityVerifyData>;
   buildSwapDeps?: (positionId: string, tokenAddress: Address, quote: SwapQuote, swap: SwapExecutor, exitStates: ExitStateRepository) => TxSafetyDeps<SwapVerifyData>;
   buildApproveDepsForExit?: (tokenAddress: Address, spender: Address, amountInRaw: bigint) => TxSafetyDeps<ExitApproveVerifyData>;
   /** Same reasoning as the tx-builder overrides above -- unused in production (real reads apply), lets the integration smoke test avoid ever hitting a real RPC for allowance/balance checks. */

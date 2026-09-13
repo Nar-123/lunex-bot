@@ -1,13 +1,29 @@
 import { getAddress } from 'viem';
+import type { Address } from 'viem';
 import { Percent, Token } from '@uniswap/sdk-core';
 import { v4Sdk } from '../blockchain/uniswapSdk';
 import { config } from '../config';
+import { readErc20TransfersTo } from '../blockchain/erc20';
+import { getExecutorAddress } from '../blockchain/walletClient';
 import type { TxSafetyDeps } from '../execution/types';
 import * as txSteps from '../execution/viemTxSteps';
 import type { PositionRecord } from '../positions/types';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring/types';
 
 const DEADLINE_WINDOW_SECONDS = 10 * 60; // 10 minutes from build time -- generous enough to survive the SIMULATED/GAS_CHECKED/SIGNED steps, short enough that a very stale resumed attempt fails loudly instead of executing against a long-gone price
+
+/** VALIDATION PHASE: `liquidityZero` proves the burn happened; `usdgProceedsRaw` is the USDG the SAME confirmed transaction paid the wallet (realized-PnL measurement). */
+export interface RemoveLiquidityVerifyData {
+  liquidityZero: true;
+  usdgProceedsRaw: bigint;
+}
+
+export interface BuildRemoveLiquidityDepsOptions {
+  /** Injectable for tests -- defaults to the real receipt-log decoder (`blockchain/erc20.ts`'s `readErc20TransfersTo`). */
+  readUsdgTransfersTo?: (txHash: `0x${string}`, tokenAddress: Address, walletAddress: Address) => Promise<bigint>;
+  /** Injectable for tests -- defaults to the real configured executor wallet. */
+  walletAddress?: Address;
+}
 
 /** Same construction pattern as `monitoring/computePositionMetrics.ts` -- real `Token` entities (not placeholders), since the v4 SDK's `Position`/`Pool` classes call real methods on them (`.isNative`, `.equals()`, etc.), not just read `.address`. */
 function buildV4Position(position: PositionRecord, liquidity: bigint, sqrtPriceX96: bigint, tickCurrent: number) {
@@ -70,8 +86,12 @@ export function buildRemoveLiquidityDeps(
   position: PositionRecord,
   livePositionState: LivePositionStateProvider,
   poolPrice: PoolPriceProvider,
-): TxSafetyDeps<{ liquidityZero: true }> {
+  options: BuildRemoveLiquidityDepsOptions = {},
+): TxSafetyDeps<RemoveLiquidityVerifyData> {
   const positionManagerAddress = config.uniswap.v4.positionManager as `0x${string}`;
+  const readUsdgTransfersTo = options.readUsdgTransfersTo ?? readErc20TransfersTo;
+  const wallet = options.walletAddress ?? getExecutorAddress();
+  const usdgAddress = config.quoteAsset.ADDRESS as Address;
 
   return {
     buildTransaction: async () => {
@@ -102,12 +122,27 @@ export function buildRemoveLiquidityDeps(
     broadcastRaw: txSteps.broadcastRawTx,
     waitForReceipt: txSteps.waitForTxReceipt,
     getReceiptIfAvailable: txSteps.getReceiptIfAvailable,
-    verifyOnChain: async () => {
+    verifyOnChain: async (confirmedTxHash) => {
       const live = await livePositionState.getLiveState(position);
       if (live.liquidity !== 0n) {
         return { ok: false, reason: `expected liquidity 0 after burn, still reads ${live.liquidity}` };
       }
-      return { ok: true, data: { liquidityZero: true } };
+      // VALIDATION PHASE: realized proceeds from THIS transaction's own
+      // confirmed receipt. A read failure here throws -- which the pipeline
+      // treats as ambiguous/resumable, never a definitive failure (the burn
+      // is already proven by the liquidity read above; reverting a VERIFIED
+      // burn because the PnL side-measurement's RPC read blipped would be
+      // exactly the "false definitive failure" the safety rules forbid).
+      // On resume, `resumeVerified` replays this same decoder against the
+      // same hash and gets the same number.
+      let usdgProceedsRaw: bigint;
+      try {
+        usdgProceedsRaw = await readUsdgTransfersTo(confirmedTxHash, usdgAddress, wallet);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { ok: false, reason: `burn verified but proceeds could not be measured (resumable): ${message}` };
+      }
+      return { ok: true, data: { liquidityZero: true, usdgProceedsRaw } };
     },
   };
 }

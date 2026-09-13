@@ -60,15 +60,36 @@ describe('PATCH /settings', () => {
     expect(res.status).toBe(401);
   });
 
-  describe('Decision 3b: hardStopLossPct cross-validated against the frozen PNL Protection threshold (-8%)', () => {
-    it('rejects a value looser than -8% (e.g. -5%), with an explicit message, and never touches the DB', async () => {
+  /**
+   * TIER 3 replaces Decision 3b's cross-field rule entirely. That rule
+   * required `hardStopLossPct <= -8%`, on the premise that the stop had to
+   * sit BELOW the (then) PNL-Protection arming threshold. Under the
+   * Meridian-aligned ladder the stop is -6% and Safety Exit arms at -8%,
+   * so the two deliberately sit the other way round: the stop is the
+   * TIGHTER of the pair and fires FIRST (priority 1 vs priority 2), and
+   * the old rule would now reject the product's own default value.
+   *
+   * The cross-field validator is therefore removed rather than inverted --
+   * there is no longer any ordering constraint between the two numbers to
+   * enforce, because the exit ladder's fixed priority order, not their
+   * relative magnitudes, decides which one wins when both apply. The
+   * per-field bounds in `settingsSchema.ts` remain the only validation,
+   * and are re-asserted here so the field is still genuinely guarded.
+   */
+  describe('TIER 3: hardStopLossPct is bounded per-field only -- no cross-field ordering rule against the Safety Exit threshold', () => {
+    it('accepts -5% (looser than the -8% Safety Exit arming threshold) -- legal now, and actually persisted', async () => {
       const { app, deps } = buildTestApp();
       const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ hardStopLossPct: -5 });
 
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/hardStopLossPct/);
-      expect(res.body.error).toMatch(/PNL Protection/);
-      expect((await deps.settings.get()).hardStopLossPct).toBeCloseTo(-0.15); // unchanged, still the DEFAULT_SETTINGS value
+      expect(res.status).toBe(200);
+      expect((await deps.settings.get()).hardStopLossPct).toBeCloseTo(-0.05);
+    });
+
+    it('accepts the product default -6% -- the value the OLD cross-field rule would have rejected outright', async () => {
+      const { app, deps } = buildTestApp();
+      const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ hardStopLossPct: -6 });
+      expect(res.status).toBe(200);
+      expect((await deps.settings.get()).hardStopLossPct).toBeCloseTo(-0.06);
     });
 
     it('accepts a value worse than -8% (e.g. -20%)', async () => {
@@ -78,17 +99,17 @@ describe('PATCH /settings', () => {
       expect((await deps.settings.get()).hardStopLossPct).toBeCloseTo(-0.2);
     });
 
-    it('accepts the exact boundary, -8%, inclusive', async () => {
+    it('still rejects a POSITIVE hardStopLossPct -- the per-field schema bound is intact, nothing was loosened wholesale', async () => {
       const { app, deps } = buildTestApp();
-      const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ hardStopLossPct: -8 });
-      expect(res.status).toBe(200);
-      expect((await deps.settings.get()).hardStopLossPct).toBeCloseTo(-0.08);
+      const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ hardStopLossPct: 5 });
+      expect(res.status).toBe(400);
+      expect((await deps.settings.get()).hardStopLossPct).toBeCloseTo(-0.06); // unchanged DEFAULT_SETTINGS value
     });
   });
 });
 
 describe('GET /settings (Module 12)', () => {
-  it('reads the current values (percent, API-boundary convention) including the frozen pnlProtectionTriggerPct', async () => {
+  it('reads the current values (percent, API-boundary convention) including the frozen safetyExitTriggerPct', async () => {
     const { app } = buildTestApp();
     const res = await request(app).get('/settings').set('Authorization', authHeader());
 
@@ -96,9 +117,12 @@ describe('GET /settings (Module 12)', () => {
     expect(res.body.paused).toBe(false);
     expect(res.body.positionSizePct).toBeCloseTo(35); // DEFAULT_SETTINGS, as percent
     expect(res.body.maxActivePositions).toBe(3);
-    expect(res.body.hardStopLossPct).toBeCloseTo(-15);
-    expect(res.body.trailingTpTriggerPct).toBeCloseTo(5);
-    expect(res.body.pnlProtectionTriggerPct).toBeCloseTo(-8); // read-only, frozen server threshold, not settable via PATCH
+    // TIER 3 (Meridian-aligned) defaults, replacing -15% / +5%.
+    expect(res.body.hardStopLossPct).toBeCloseTo(-6);
+    expect(res.body.trailingTpTriggerPct).toBeCloseTo(6);
+    // Renamed from pnlProtectionTriggerPct: still read-only and frozen
+    // server-side, not settable via PATCH.
+    expect(res.body.safetyExitTriggerPct).toBeCloseTo(-8);
   });
 
   it('reflects a value already changed via PATCH', async () => {

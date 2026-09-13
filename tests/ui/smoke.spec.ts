@@ -41,6 +41,7 @@ process.env.CHAIN_ID = '4663';
 process.env.PRIVATE_KEY = '0x' + '11'.repeat(32);
 process.env.USDG_TOKEN_ADDRESS = '0x' + '22'.repeat(20);
 process.env.UNISWAP_V4_POSITION_MANAGER_ADDRESS = '0x58daec3116aae6d93017baaea7749052e8a04fa7';
+process.env.UNISWAP_API_KEY = 'ui-smoke-test-uniswap-api-key-not-for-real-use';
 process.env.DATABASE_PROVIDER = 'sqlite';
 process.env.DATABASE_URL = `file:${DB_PATH}`;
 process.env.AUTH_ADMIN_USERNAME = 'ui-smoke-admin';
@@ -141,7 +142,9 @@ test.describe('ui/ end-to-end smoke test', () => {
     await page.click('button[data-view="stuck"]');
     await expect(page.locator('main')).toContainText('ui-smoke:stuck:1');
 
-    // History -- reflects the seeded CLOSED position, honestly discloses no PNL/fee.
+    // History -- reflects the seeded CLOSED position. Seeded without measured
+    // proceeds, it honestly shows the unmeasured disclosure (a measured close
+    // would show the receipt-derived PnL number instead).
     await page.click('button[data-view="history"]');
     await expect(page.locator('main')).toContainText('SMOKE');
     await expect(page.locator('main')).toContainText('HARD_STOP_LOSS');
@@ -160,12 +163,19 @@ test.describe('ui/ end-to-end smoke test', () => {
     await page.click('button[data-view="settings"]');
 
     const hardStopLossInput = page.locator('input[name="hardStopLossPct"]');
-    await expect(hardStopLossInput).toHaveValue('-15'); // DEFAULT_SETTINGS
+    await expect(hardStopLossInput).toHaveValue('-6'); // DEFAULT_SETTINGS, TIER 3 (Meridian-aligned), was -15
 
-    // Client-side cross-field check against the REAL server threshold (-8%), fetched via GET /settings, never hardcoded in the browser.
+    // TIER 3 removed the cross-field rule (see ui/src/validators.ts): -5%
+    // is now a legal value, so the form must show NO error for it. The
+    // per-field bound is still live and is proven right below.
     await hardStopLossInput.fill('-5');
     await hardStopLossInput.blur();
-    await expect(page.locator('[data-error-for="hardStopLossPct"]')).toContainText('PNL Protection');
+    await expect(page.locator('[data-error-for="hardStopLossPct"]')).toHaveText('');
+
+    // ...but a positive stop is still rejected client-side.
+    await hardStopLossInput.fill('5');
+    await hardStopLossInput.blur();
+    await expect(page.locator('[data-error-for="hardStopLossPct"]')).not.toHaveText('');
 
     await hardStopLossInput.fill('-20');
     await page.locator('input[name="maxActivePositions"]').fill('7');

@@ -1,5 +1,5 @@
 import type { Address } from 'viem';
-import { encodeFunctionData } from 'viem';
+import { decodeFunctionData, encodeFunctionData, parseEventLogs } from 'viem';
 import { getPublicClient } from './viemClient';
 
 const ERC20_ABI = [
@@ -38,6 +38,17 @@ const ERC20_ABI = [
     outputs: [{ name: '', type: 'uint8' }],
   },
 ] as const;
+
+/** Standard ERC20 `Transfer(address indexed from, address indexed to, uint256 value)` -- shared by the realized-proceeds receipt decoder below. */
+export const ERC20_TRANSFER_EVENT = {
+  type: 'event',
+  name: 'Transfer',
+  inputs: [
+    { name: 'from', type: 'address', indexed: true },
+    { name: 'to', type: 'address', indexed: true },
+    { name: 'value', type: 'uint256', indexed: false },
+  ],
+} as const;
 
 /**
  * Generic ERC20 `balanceOf` read for an arbitrary token -- factored out of
@@ -91,4 +102,76 @@ export function encodeErc20Approve(tokenAddress: Address, spender: Address, amou
     to: tokenAddress,
     data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [spender, amount] }),
   };
+}
+
+/**
+ * C5 fix: decodes the `spender` argument out of ERC20 `approve()`
+ * calldata -- used by `swap/tradingApiMapper.ts` to learn the real
+ * spender contract from the Trading API's `POST /check_approval` response
+ * (which returns ready-to-sign approval calldata, no separate explicit
+ * `spender` field). Deliberately used only to LEARN the spender, never to
+ * broadcast the API's own calldata directly -- `exits/approveTx.ts` builds
+ * its own exact-`amountInRaw` approve() from this spender, preserving this
+ * project's "approve exactly what's needed, never unbounded" discipline
+ * regardless of what amount the API's own transaction might have encoded.
+ * Returns `null` if `data` isn't a well-formed `approve()` call.
+ */
+export function decodeErc20ApproveSpender(data: `0x${string}`): Address | null {
+  try {
+    const decoded = decodeFunctionData({ abi: ERC20_ABI, data });
+    if (decoded.functionName !== 'approve') return null;
+    return decoded.args[0];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * VALIDATION PHASE (realized-PnL persistence): sums every ERC20
+ * `Transfer(... -> wallet)` of `tokenAddress` in one CONFIRMED
+ * transaction's own receipt -- i.e. exactly what that transaction paid out
+ * to the wallet in that token, nothing else.
+ *
+ * Why receipt logs rather than balance-before/after deltas (the swap leg's
+ * existing verification trick): with up to 3 concurrent positions, another
+ * cycle's mint/exit can land in the same wallet between the two balance
+ * reads and corrupt the delta. The receipt of a specific transaction is
+ * scoped to exactly that transaction's own effects -- immune to
+ * concurrent wallet activity by construction, and exact down to the last
+ * raw unit.
+ *
+ * REVERSED DIRECTION (`from` the wallet) is deliberately NOT counted --
+ * this measures proceeds TO the wallet. The exit flow's transactions never
+ * send USDG away (remove-liquidity and the swap both only receive), so a
+ * well-formed exit receipt has no USDG `from`-wallet transfers at all;
+ * counting them would only ever subtract gas-unrelated noise.
+ *
+ * A transaction with ZERO matching transfers returns 0n, not null: an
+ * empty log list is a real, decoded fact about that receipt. Only a
+ * failure to READ or DECODE the receipt propagates (throws) so callers
+ * can treat it as "not measured" rather than "proceeded zero".
+ */
+export async function readErc20TransfersTo(
+  txHash: `0x${string}`,
+  tokenAddress: Address,
+  walletAddress: Address,
+): Promise<bigint> {
+  const client = getPublicClient();
+  const receipt = await client.getTransactionReceipt({ hash: txHash });
+  const events = parseEventLogs({
+    abi: [ERC20_TRANSFER_EVENT],
+    logs: receipt.logs,
+    eventName: 'Transfer',
+  });
+
+  let total = 0n;
+  for (const event of events) {
+    if (
+      event.address.toLowerCase() === tokenAddress.toLowerCase() &&
+      event.args.to.toLowerCase() === walletAddress.toLowerCase()
+    ) {
+      total += event.args.value;
+    }
+  }
+  return total;
 }

@@ -46,3 +46,27 @@ export interface LivePositionStateProvider {
 export interface PoolPriceProvider {
   getPriceState(pool: PositionRecord['pool']): Promise<PoolPriceState>;
 }
+
+export interface PoolPriceSample {
+  /** USDG per TOKEN at `observedAt`, as a plain number (6 significant figures is ample for a 20-period SMA). */
+  price: number;
+  observedAt: Date;
+}
+
+/**
+ * TIER 3 — Port: the rolling pool-price history Bollinger %B is computed
+ * from (`monitoring/bollinger.ts`). Persistent, not in-memory: a restart
+ * must not reset the window to empty, or the OVEREXTENDED exit would go
+ * blind for 100 minutes after every deploy.
+ *
+ * Deliberately keyed by POOL, not by position -- several positions can
+ * share a pool, and the price series is a property of the pool.
+ */
+export interface PriceHistoryProvider {
+  /** Appends one observation. Called once per pool per monitoring tick, only when the price read genuinely succeeded. */
+  recordSample(poolId: string, price: number, observedAt?: Date): Promise<void>;
+  /** Most recent samples for a pool, oldest-first, covering at most `windowMs` back from now. */
+  recentSamples(poolId: string, windowMs: number, now?: Date): Promise<PoolPriceSample[]>;
+  /** Drops samples older than `retentionMs`, so the table stays bounded. Best-effort: a failure here must never break a monitoring tick. */
+  pruneOlderThan(retentionMs: number, now?: Date): Promise<void>;
+}

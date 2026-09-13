@@ -104,6 +104,7 @@ function makePosition(usdgIsCurrency0: boolean, overrides: Partial<PositionRecor
     openedAt: new Date(),
     closedAt: null,
     closeReason: null,
+    realizedUsdgRaw: null,
     ...overrides,
   };
 }

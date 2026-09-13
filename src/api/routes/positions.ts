@@ -30,7 +30,13 @@ async function getActivePositionsPayload(deps: AppDeps) {
   const now = Date.now();
   return Promise.all(
     active.map(async (position) => {
-      const metric = byId.get(position.id);
+      // runMonitoringCycle (called above) pushes EXACTLY ONE result per
+      // active position -- success or failure -- and `active` was re-read
+      // from the same repository right after, so a result for every
+      // position here is a structural invariant. Defaulting a missing one
+      // to an explicit ok:false keeps both the compiler and the runtime
+      // honest without a non-null assertion.
+      const metric = byId.get(position.id) ?? { ok: false as const, positionId: position.id, reason: 'no metrics read this request' };
       const exitState = await deps.exitStates.getOrCreate(position.id);
       const oor = computeOorStatus(exitState.oorStartedAt, now);
       return {
@@ -40,7 +46,7 @@ async function getActivePositionsPayload(deps: AppDeps) {
         entryUsdgRaw: position.entryUsdgRaw.toString(),
         openedAt: position.openedAt,
         metrics:
-          metric && metric.ok
+          metric.ok
             ? {
                 ok: true,
                 currentPriceUsdgPerToken: metric.currentPriceUsdgPerToken,
@@ -51,7 +57,12 @@ async function getActivePositionsPayload(deps: AppDeps) {
                 yieldPct: metric.yieldPct,
                 inRange: metric.inRange,
               }
-            : { ok: false, reason: metric && !metric.ok ? metric.reason : 'no metrics read this request' },
+            : {
+                ok: false,
+                // `metric.ok === false` is the only way into this branch;
+                // its reason is passed through verbatim.
+                reason: metric.reason,
+              },
         oor,
       };
     }),
@@ -62,21 +73,35 @@ async function getActivePositionsPayload(deps: AppDeps) {
  * `?status=closed` branch -- Module 11's `/report` command. Deliberately
  * plain `PositionRecord` fields only, NO `computePositionMetrics` call
  * (see `PositionRepository.findAllClosed`'s doc comment for why a closed
- * position's PNL/fee can't be computed that way) -- `realizedPnl`/
- * `feesEarnedUsdgRaw` are honestly reported as unavailable rather than
- * guessed, per the flagged gap in README's Module 11 section.
+ * position's PNL/fee can't be computed that way).
+ *
+ * VALIDATION PHASE: when `realizedUsdgRaw` was measured (the exit's two
+ * confirmed receipts decoded), the payload now carries the realized PnL
+ * it implies -- proceeds minus entry, computed here at read time from the
+ * two persisted point-in-time facts, never stored as a third denormalized
+ * number. `null` stays honest: a row the exit couldn't measure (legacy
+ * closes, undecodable receipts) reports `realizedPnlAvailable: false`,
+ * exactly as before, rather than a fabricated value.
  */
 async function getClosedPositionsPayload(deps: AppDeps) {
   const closed = await deps.positions.findAllClosed();
-  return closed.map((position) => ({
-    id: position.id,
-    tokenAddress: position.tokenAddress,
-    tokenSymbol: position.tokenSymbol,
-    entryUsdgRaw: position.entryUsdgRaw.toString(),
-    closedAt: position.closedAt,
-    closeReason: position.closeReason,
-    realizedPnlAvailable: false,
-  }));
+  return closed.map((position) => {
+    const realized = position.realizedUsdgRaw === null ? null : position.realizedUsdgRaw - position.entryUsdgRaw;
+    return {
+      id: position.id,
+      tokenAddress: position.tokenAddress,
+      tokenSymbol: position.tokenSymbol,
+      entryUsdgRaw: position.entryUsdgRaw.toString(),
+      closedAt: position.closedAt,
+      closeReason: position.closeReason,
+      realizedPnlAvailable: realized !== null,
+      // The non-null guard is `realized !== null` above; `realizedUsdgRaw` is
+      // non-null in exactly the same branch (realized is derived from it).
+      ...(realized !== null && position.realizedUsdgRaw !== null
+        ? { realizedPnlUsdgRaw: realized.toString(), realizedUsdgRaw: position.realizedUsdgRaw.toString() }
+        : {}),
+    };
+  });
 }
 
 /**

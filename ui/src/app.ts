@@ -20,7 +20,6 @@ import {
   validateMaxActivePositions,
   validateHardStopLossPct,
   validateTrailingTpTriggerPct,
-  validateHardStopLossVsPnlProtection,
 } from './validators.js';
 
 const loginScreen = document.getElementById('login-screen') as HTMLDivElement;
@@ -107,7 +106,6 @@ async function loadSettings(): Promise<void> {
 
 function wireSettingsForm(): void {
   const form = document.getElementById('settings-form') as HTMLFormElement;
-  const pnlProtectionTriggerPct = Number(form.dataset.pnlProtectionTriggerPct);
 
   const fieldValidators: Record<string, (value: number) => { valid: boolean; error?: string }> = {
     positionSizePct: validatePositionSizePct,
@@ -121,10 +119,9 @@ function wireSettingsForm(): void {
     const errorEl = form.querySelector(`[data-error-for="${name}"]`);
     if (!input || !errorEl) return true;
     const value = Number(input.value);
-    let result = fieldValidators[name]?.(value) ?? { valid: true };
-    if (result.valid && name === 'hardStopLossPct') {
-      result = validateHardStopLossVsPnlProtection(value, pnlProtectionTriggerPct);
-    }
+    // TIER 3: no cross-field rule any more -- per-field bounds only, the
+    // same set the server still enforces.
+    const result = fieldValidators[name]?.(value) ?? { valid: true };
     errorEl.textContent = result.valid ? '' : (result.error ?? '');
     return result.valid;
   }

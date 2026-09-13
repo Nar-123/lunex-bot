@@ -12,7 +12,7 @@ import type { PoolPriceState } from '../../src/monitoring/types';
 const { TickMath } = v3TickMathUtils;
 
 const T0 = new Date('2026-01-01T00:00:00.000Z');
-const MAX_METRICS_FAILURE_MS = config.rules.exits.SAFETY_EXIT.MAX_METRICS_FAILURE_MS;
+const MAX_METRICS_FAILURE_MS = config.rules.exits.INFRA_SAFETY_EXIT.MAX_METRICS_FAILURE_MS;
 
 describe('Safety Exit condition (a): sustained metrics-read failure', () => {
   it('does not trigger when there is no failure streak (null)', () => {

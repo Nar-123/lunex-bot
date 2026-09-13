@@ -8,6 +8,7 @@ import type {
 } from './types';
 import { classifyBroadcastError } from './classifyBroadcastError';
 import { isStuckAttempt } from './stuckAttempt';
+import { withExecutorLock } from './executorMutex';
 
 function statusIndex(status: TxAttemptStatus): number {
   const idx = (TX_ATTEMPT_STATUS_ORDER as readonly string[]).indexOf(status);
@@ -25,6 +26,61 @@ function ambiguousFailure(reason: string, attempt: TransactionAttemptRecord): Ex
 
 function definitiveFailure(reason: string, attempt: TransactionAttemptRecord): ExecutionResult<never> {
   return { ok: false, reason, resumable: false, stuck: false, attempt };
+}
+
+/**
+ * Handles a cached VERIFIED attempt (the crash-recovery short-circuit).
+ *
+ * The operation this attempt represents ALREADY SUCCEEDED on-chain -- that
+ * is what VERIFIED means. This function's only job is producing the
+ * `TVerifyData` payload the caller needs (e.g. `openPosition.ts`'s
+ * `mintResult.data.positionTokenId`); it must NEVER fabricate that payload
+ * (the historical bug: `undefined as TVerifyData`) and must NEVER
+ * downgrade an already-successful operation to FAILED just because the
+ * payload isn't immediately available.
+ *
+ * Normal case: `verifyData` was persisted atomically with `status:
+ * 'VERIFIED'` (see the bottom of `executeCriticalTransaction`) -- return
+ * it directly, no I/O.
+ *
+ * Recovery case (a legacy attempt verified before `verifyData` existed, or
+ * any other gap): re-run `verifyOnChain` against the already-confirmed
+ * `txHash`. This is safe to repeat -- `verifyOnChain` is a read-only
+ * on-chain check, never a re-broadcast -- and it is the SAME generic
+ * mechanism every `TxSafetyDeps` implementation already provides, so this
+ * fix is not specific to mint/openPosition; it protects every current and
+ * future caller of this function. If reconstruction itself fails or
+ * throws, the result stays `resumable: true` -- never FAILED -- since a
+ * VERIFIED attempt already has definitive on-chain proof of success; only
+ * our local read-model is temporarily unavailable.
+ */
+async function resumeVerified<TVerifyData>(
+  attempt: TransactionAttemptRecord,
+  deps: TxSafetyDeps<TVerifyData>,
+  repo: TransactionAttemptRepository,
+): Promise<ExecutionResult<TVerifyData>> {
+  if (attempt.verifyData !== null && attempt.verifyData !== undefined) {
+    return { ok: true, data: attempt.verifyData as TVerifyData, attempt };
+  }
+  if (!attempt.txHash) {
+    // Should be unreachable for any real VERIFIED row (txHash is set at
+    // SIGNED, long before VERIFIED) -- but never crash/never fabricate data.
+    return ambiguousFailure(
+      'VERIFIED attempt is missing both verifyData and txHash -- cannot reconstruct, manual review required',
+      attempt,
+    );
+  }
+  try {
+    const reverify = await deps.verifyOnChain(attempt.txHash);
+    if (!reverify.ok) {
+      return ambiguousFailure(`VERIFIED attempt's data could not be reconstructed yet: ${reverify.reason}`, attempt);
+    }
+    const updated = await repo.update(attempt.id, { verifyData: reverify.data });
+    return { ok: true, data: reverify.data, attempt: updated };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return ambiguousFailure(`VERIFIED attempt's data reconstruction threw, resume required: ${message}`, attempt);
+  }
 }
 
 /**
@@ -66,13 +122,15 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
   deps: TxSafetyDeps<TVerifyData>,
   repo: TransactionAttemptRepository,
 ): Promise<ExecutionResult<TVerifyData>> {
-  let attempt = await repo.find(idempotencyKey);
-  if (!attempt) {
-    attempt = await repo.create(idempotencyKey, purpose);
-  }
+  // Explicitly typed non-null (rather than inferred from `repo.find`'s
+  // nullable return) so TypeScript doesn't re-widen `attempt` to include
+  // `null` inside the nested `withExecutorLock` closure below -- a `let`
+  // inferred from a nullable initializer loses its narrowed non-null type
+  // across closure boundaries even when a human can see it's always set.
+  let attempt: TransactionAttemptRecord = (await repo.find(idempotencyKey)) ?? (await repo.create(idempotencyKey, purpose));
 
   if (attempt.status === 'VERIFIED') {
-    return { ok: true, data: undefined as TVerifyData, attempt };
+    return resumeVerified(attempt, deps, repo);
   }
   if (attempt.status === 'FAILED') {
     return definitiveFailure(attempt.lastError ?? 'previously failed', attempt);
@@ -126,79 +184,119 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       throw new Error('invariant violated: status is past GAS_CHECKED but gasLimit/gasPrice is missing');
     }
 
-    if (notYetReached(attempt.status, 'NONCE_ASSIGNED')) {
-      const nonce = await deps.getNonce();
-      attempt = await repo.update(attempt.id, { status: 'NONCE_ASSIGNED', nonce });
-    }
-    const nonce = attempt.nonce;
-    if (nonce === null) {
-      throw new Error('invariant violated: status is past NONCE_ASSIGNED but nonce is missing');
-    }
+    // C7 fix: the entire nonce-assignment -> sign -> broadcast span is
+    // serialized process-wide (see executorMutex.ts's doc comment for why
+    // -- two independently-scheduled cycles can otherwise both read the
+    // same pending nonce and sign different payloads under it). The
+    // locked callback re-fetches the freshest persisted `attempt` state
+    // FIRST, before deciding what work remains: without this, a second
+    // concurrent call for the SAME idempotencyKey that queued behind the
+    // lock would act on a stale in-memory snapshot and redundantly
+    // re-assign a nonce/re-sign, clobbering the first call's progress.
+    const lockOutcome = await withExecutorLock(async (): Promise<ExecutionResult<TVerifyData> | null> => {
+      attempt = (await repo.find(attempt.idempotencyKey)) ?? attempt;
 
-    if (notYetReached(attempt.status, 'SIGNED')) {
-      const signed = await deps.signTransaction(tx, nonce, gasLimit, gasPrice);
-      attempt = await repo.update(attempt.id, { status: 'SIGNED', rawTx: signed.raw, txHash: signed.hash });
-    }
-    const rawTx = attempt.rawTx;
-    const txHash = attempt.txHash;
-    if (!rawTx || !txHash) {
-      throw new Error('invariant violated: status is past SIGNED but rawTx/txHash is missing');
-    }
+      if (notYetReached(attempt.status, 'NONCE_ASSIGNED')) {
+        const nonce = await deps.getNonce();
+        attempt = await repo.update(attempt.id, { status: 'NONCE_ASSIGNED', nonce });
+      }
+      const lockedNonce = attempt.nonce;
+      if (lockedNonce === null) {
+        throw new Error('invariant violated: status is past NONCE_ASSIGNED but nonce is missing');
+      }
 
-    if (notYetReached(attempt.status, 'SENT')) {
-      try {
-        await deps.broadcastRaw(rawTx);
-        attempt = await repo.update(attempt.id, { status: 'SENT' });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        const classification = classifyBroadcastError(message);
+      if (notYetReached(attempt.status, 'SIGNED')) {
+        const signed = await deps.signTransaction(tx, lockedNonce, gasLimit, gasPrice);
+        attempt = await repo.update(attempt.id, { status: 'SIGNED', rawTx: signed.raw, txHash: signed.hash });
+      }
+      const lockedRawTx = attempt.rawTx;
+      const lockedTxHash = attempt.txHash;
+      if (!lockedRawTx || !lockedTxHash) {
+        throw new Error('invariant violated: status is past SIGNED but rawTx/txHash is missing');
+      }
 
-        if (classification.kind === 'ALREADY_KNOWN') {
-          // Our exact payload is already in the mempool -- not a failure.
+      if (notYetReached(attempt.status, 'SENT')) {
+        try {
+          await deps.broadcastRaw(lockedRawTx);
           attempt = await repo.update(attempt.id, { status: 'SENT' });
-        } else if (classification.kind === 'DEFINITIVE_REJECTED') {
-          attempt = await repo.update(attempt.id, {
-            status: 'FAILED',
-            failureCode: 'BROADCAST_REJECTED',
-            lastError: classification.reason,
-          });
-          return definitiveFailure(classification.reason, attempt);
-        } else if (classification.kind === 'POSSIBLY_OURS') {
-          // "nonce too low" / "replacement underpriced" -- could mean an
-          // unrelated tx consumed this nonce (payload permanently dead)
-          // OR our own earlier broadcast of this exact payload already
-          // landed. Never guess: check for a receipt under OUR hash.
-          let receipt: Awaited<ReturnType<typeof deps.getReceiptIfAvailable>>;
-          try {
-            receipt = await deps.getReceiptIfAvailable(txHash);
-          } catch (checkErr) {
-            // Couldn't even determine that much -- stay ambiguous, don't
-            // guess either way.
-            const checkMessage = checkErr instanceof Error ? checkErr.message : String(checkErr);
-            attempt = await repo.update(attempt.id, {
-              lastError: `broadcast rejected (${message}); receipt check failed too: ${checkMessage}`,
-            });
-            return ambiguousFailure(`broadcast rejected, receipt check failed, resume required: ${message}`, attempt);
-          }
-          if (receipt) {
-            // It's genuinely ours and already landed -- proceed normally.
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          const classification = classifyBroadcastError(message);
+
+          if (classification.kind === 'ALREADY_KNOWN') {
+            // Our exact payload is already in the mempool -- not a failure.
             attempt = await repo.update(attempt.id, { status: 'SENT' });
-          } else {
+          } else if (classification.kind === 'DEFINITIVE_REJECTED') {
             attempt = await repo.update(attempt.id, {
               status: 'FAILED',
               failureCode: 'BROADCAST_REJECTED',
-              lastError: `broadcast rejected (${message}) and no receipt found for our own tx hash -- this nonce/payload is dead`,
+              lastError: classification.reason,
             });
-            return definitiveFailure(`broadcast rejected: ${message}`, attempt);
+            return definitiveFailure(classification.reason, attempt);
+          } else if (classification.kind === 'POSSIBLY_OURS') {
+            // "nonce too low" / "replacement underpriced" -- could mean an
+            // unrelated tx consumed this nonce (payload permanently dead)
+            // OR our own earlier broadcast of this exact payload already
+            // landed. Never guess: check for a receipt under OUR hash.
+            let receipt: Awaited<ReturnType<typeof deps.getReceiptIfAvailable>>;
+            try {
+              receipt = await deps.getReceiptIfAvailable(lockedTxHash);
+            } catch (checkErr) {
+              // Couldn't even determine that much -- stay ambiguous, don't
+              // guess either way.
+              const checkMessage = checkErr instanceof Error ? checkErr.message : String(checkErr);
+              attempt = await repo.update(attempt.id, {
+                lastError: `broadcast rejected (${message}); receipt check failed too: ${checkMessage}`,
+              });
+              return ambiguousFailure(`broadcast rejected, receipt check failed, resume required: ${message}`, attempt);
+            }
+            if (receipt) {
+              // It's genuinely ours and already landed -- proceed normally.
+              attempt = await repo.update(attempt.id, { status: 'SENT' });
+            } else {
+              attempt = await repo.update(attempt.id, {
+                status: 'FAILED',
+                failureCode: 'BROADCAST_REJECTED',
+                lastError: `broadcast rejected (${message}) and no receipt found for our own tx hash -- this nonce/payload is dead`,
+              });
+              return definitiveFailure(`broadcast rejected: ${message}`, attempt);
+            }
+          } else {
+            // AMBIGUOUS: unrecognized error -- timeout, connection refused,
+            // RPC 5xx, etc. H3 fix: the hash is already known (persisted at
+            // SIGNED) -- cheaply check for a receipt under it before giving
+            // up the tick, exactly like the POSSIBLY_OURS branch above.
+            // Real non-geth "already imported"/transport-flavored messages
+            // that don't match a known pattern land here, and the
+            // transaction may already be mined even though the broadcast
+            // CALL itself errored (e.g. the response was lost after the
+            // node accepted it). Never marked FAILED regardless of outcome
+            // -- an unfound receipt stays exactly as resumable as before.
+            let receipt: Awaited<ReturnType<typeof deps.getReceiptIfAvailable>>;
+            try {
+              receipt = await deps.getReceiptIfAvailable(lockedTxHash);
+            } catch {
+              // Couldn't even determine that much -- stay ambiguous, don't guess either way.
+              attempt = await repo.update(attempt.id, { lastError: `broadcast uncertain: ${message}` });
+              return ambiguousFailure(`broadcast uncertain, resume required: ${message}`, attempt);
+            }
+            if (receipt) {
+              // It's actually mined -- proceed normally, never FAILED.
+              attempt = await repo.update(attempt.id, { status: 'SENT' });
+            } else {
+              attempt = await repo.update(attempt.id, { lastError: `broadcast uncertain: ${message}` });
+              return ambiguousFailure(`broadcast uncertain, resume required: ${message}`, attempt);
+            }
           }
-        } else {
-          // AMBIGUOUS: unrecognized error -- timeout, connection refused,
-          // RPC 5xx, etc. Never marked FAILED; hash/rawTx already
-          // persisted at SIGNED, so resume can retry broadcast safely.
-          attempt = await repo.update(attempt.id, { lastError: `broadcast uncertain: ${message}` });
-          return ambiguousFailure(`broadcast uncertain, resume required: ${message}`, attempt);
         }
       }
+      return null;
+    });
+    if (lockOutcome) return lockOutcome;
+
+    const txHash = attempt.txHash;
+    if (!txHash) {
+      throw new Error('invariant violated: status is past SIGNED but txHash is missing');
     }
 
     if (notYetReached(attempt.status, 'CONFIRMED')) {
@@ -223,7 +321,10 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       });
       return definitiveFailure(verification.reason, attempt);
     }
-    attempt = await repo.update(attempt.id, { status: 'VERIFIED' });
+    // Status and verifyData written together in ONE update call so a
+    // crash between them is impossible -- the whole point of this fix
+    // (see resumeVerified() above for why a status-only write was unsafe).
+    attempt = await repo.update(attempt.id, { status: 'VERIFIED', verifyData: verification.data });
     return { ok: true, data: verification.data, attempt };
   } catch (err) {
     // Any unexpected throw (RPC blip during simulate/estimateGas/wait, a

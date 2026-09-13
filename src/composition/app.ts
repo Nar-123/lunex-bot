@@ -85,17 +85,17 @@ export function startApp(deps: AppDeps, options: StartAppOptions = {}): RunningA
   const stopScreening = scheduleInterval(screening.run, {
     intervalMs: screeningIntervalMs,
     runImmediately: true,
-    onError: (err) => deps.logger.error('screening_cycle_error', { message: err instanceof Error ? err.message : String(err) }),
+    onError: (err) => { deps.logger.error('screening_cycle_error', { message: err instanceof Error ? err.message : String(err) }); },
   });
   const stopMonitoring = scheduleInterval(monitoring.run, {
     intervalMs: monitoringIntervalMs,
     runImmediately: true,
-    onError: (err) => deps.logger.error('monitoring_cycle_error', { message: err instanceof Error ? err.message : String(err) }),
+    onError: (err) => { deps.logger.error('monitoring_cycle_error', { message: err instanceof Error ? err.message : String(err) }); },
   });
   const stopExit = scheduleInterval(exit.run, {
     intervalMs: exitIntervalMs,
     runImmediately: true,
-    onError: (err) => deps.logger.error('exit_cycle_error', { message: err instanceof Error ? err.message : String(err) }),
+    onError: (err) => { deps.logger.error('exit_cycle_error', { message: err instanceof Error ? err.message : String(err) }); },
   });
 
   /**

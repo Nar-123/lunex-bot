@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { runExitCycle } from '../../src/exits/runExitCycle';
+import type { RunExitCycleDeps } from '../../src/exits/runExitCycle';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../../src/monitoring/types';
+import { config } from '../../src/config';
 import { InMemoryPositionRepository } from '../positions/inMemoryPositionRepository';
 import { InMemoryExitStateRepository } from './inMemoryExitStateRepository';
 import { InMemoryTransactionAttemptRepository } from '../execution/inMemoryTransactionAttemptRepository';
@@ -33,7 +35,8 @@ function fakeTxDeps<T>(data: T): TxSafetyDeps<T> {
 }
 
 const fakeSwapExecutor: SwapExecutor = {
-  getQuote: vi.fn(async () => ({ amountInRaw: USDG(0), expectedAmountOutRaw: USDG(0), minOutputAmountRaw: 0n, priceImpactPct: 0.001, allowanceTarget: null })),
+  getQuote: vi.fn(async () => ({ amountInRaw: USDG(0), expectedAmountOutRaw: USDG(0), minOutputAmountRaw: 0n, priceImpactPct: 0.001, slippageBps: 100, providerQuote: { fake: true } })),
+  checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })),
   buildSwapTx: vi.fn(),
 };
 
@@ -51,13 +54,41 @@ async function makeDeps(overrides: { livePositionState?: LivePositionStateProvid
     poolPrice,
     swapExecutor: fakeSwapExecutor,
     settings: new InMemorySettingsRepository(),
-    buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const })),
-    buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: 0n })),
+    buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n })),
+    buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n })),
     readTokenBalance: vi.fn(async () => USDG(100)),
     readAllowance: vi.fn(async () => 0n),
     walletAddress: WALLET,
   };
 }
+
+describe('runExitCycle -- C4 regression: pendingCloseReason is written BEFORE markClosing', () => {
+  it('a crash simulated exactly at markClosing still leaves pendingCloseReason recorded -- CLOSING+null is now unreachable', async () => {
+    const deps = await makeDeps({
+      livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
+      poolPrice: { getPriceState: vi.fn(async () => livePriceState(-7000)) }, // triggers HARD_STOP_LOSS
+    });
+    const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
+    await deps.positions.markActive(created.id, '1', new Date());
+
+    // Simulates a crash landing exactly at the markClosing call -- the
+    // OLD write order (markClosing first, pendingCloseReason second)
+    // would leave this position at CLOSING with pendingCloseReason still
+    // null. The fix reverses the order, so this must NEVER happen.
+    deps.positions.markClosing = vi.fn(async () => {
+      throw new Error('simulated crash at markClosing');
+    });
+
+    const results = await runExitCycle(deps);
+    expect(results[0]?.action).toBe('NONE'); // caught by the per-position try/catch
+
+    const exitState = await deps.exitStates.getOrCreate(created.id);
+    expect(exitState.pendingCloseReason).toBe('HARD_STOP_LOSS'); // persisted BEFORE the crash
+
+    const reloaded = await deps.positions.findById(created.id);
+    expect(reloaded?.status).toBe('ACTIVE'); // never reached CLOSING at all -- CLOSING+null is structurally impossible now
+  });
+});
 
 describe('runExitCycle', () => {
   it('a position at breakeven (no trigger conditions met) is left ACTIVE, untouched', async () => {
@@ -96,10 +127,15 @@ describe('runExitCycle', () => {
   });
 
   it('persists the fresh live-metrics-derived exit state (e.g. a newly-armed Trailing TP peak) even when the tick does not close', async () => {
-    // pnlPct at tick -3000 is a real, non-zero loss (~-6.4%) per the fixture's known values -- not enough to trigger anything, but confirms real metrics flow through into persisted state, not synthetic ones.
+    // pnlPct at tick -2000 is a real, non-zero loss (~-2.93%) per the
+    // fixture's known values -- a genuine reading, not a synthetic one, and
+    // still inside the TIER 3 -6% stop and the -8% Safety Exit arming
+    // threshold, so nothing fires and Trailing TP never arms (never
+    // profitable). Was tick -3000 (~-6.4%) before TIER 3 tightened the stop
+    // from -15% to -6%, which that tick now breaches.
     const deps = await makeDeps({
       livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
-      poolPrice: { getPriceState: vi.fn(async () => livePriceState(-3000)) },
+      poolPrice: { getPriceState: vi.fn(async () => livePriceState(-2000)) },
     });
     const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
     await deps.positions.markActive(created.id, '1', new Date());
@@ -107,7 +143,7 @@ describe('runExitCycle', () => {
     await runExitCycle(deps);
 
     const reloaded = await deps.positions.findById(created.id);
-    expect(reloaded?.status).toBe('ACTIVE'); // not closed -- loss isn't past -15%, and Trailing TP never armed (never profitable)
+    expect(reloaded?.status).toBe('ACTIVE'); // not closed -- loss isn't past -6%, and Trailing TP never armed (never profitable)
   });
 
   it('one position throwing during metrics read does not abort the whole cycle -- other positions still get evaluated', async () => {
@@ -146,6 +182,202 @@ describe('runExitCycle', () => {
     expect(reloadedBad?.status).toBe('ACTIVE');
   });
 
+  describe('H4 regression: a shared RPC outage must never cause a synchronized mass Safety-Exit liquidation', () => {
+    const FIVE_MIN_AGO = new Date(Date.now() - 6 * 60 * 1000); // past MAX_METRICS_FAILURE_MS (5 min)
+
+    it('Scenario A: RPC has been down 6+ minutes for EVERY active position -- none of them Safety-Exit, no mass liquidation', async () => {
+      const positions = new InMemoryPositionRepository();
+      const exitStates = new InMemoryExitStateRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+      const posA = await positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000010' }));
+      await positions.markActive(posA.id, '1', new Date());
+      await exitStates.update(posA.id, { metricsFailureSince: FIVE_MIN_AGO });
+      const posB = await positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000011' }));
+      await positions.markActive(posB.id, '2', new Date());
+      await exitStates.update(posB.id, { metricsFailureSince: FIVE_MIN_AGO });
+
+      const livePositionState: LivePositionStateProvider = { getLiveState: vi.fn(async () => { throw new Error('RPC timeout'); }) };
+
+      const results = await runExitCycle({
+        positions,
+        exitStates,
+        txAttempts,
+        livePositionState,
+        poolPrice: { getPriceState: vi.fn(async () => { throw new Error('RPC timeout'); }) },
+        swapExecutor: fakeSwapExecutor,
+        settings: new InMemorySettingsRepository(),
+      });
+
+      expect(results.every((r) => r.action === 'NONE')).toBe(true);
+      expect((await positions.findById(posA.id))?.status).toBe('ACTIVE');
+      expect((await positions.findById(posB.id))?.status).toBe('ACTIVE');
+      // The failure streak is NOT reset by the suppression -- still counting.
+      expect((await exitStates.getOrCreate(posA.id)).metricsFailureSince).not.toBeNull();
+    });
+
+    it('Scenario B: only ONE position is failing (genuine, isolated anomaly) while its peer reads fine -- it Safety-Exits normally', async () => {
+      const positions = new InMemoryPositionRepository();
+      const exitStates = new InMemoryExitStateRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+      const failing = await positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000012' }));
+      await positions.markActive(failing.id, '1', new Date());
+      await exitStates.update(failing.id, { metricsFailureSince: FIVE_MIN_AGO });
+      const healthy = await positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000013' }));
+      await positions.markActive(healthy.id, '2', new Date());
+
+      const livePositionState: LivePositionStateProvider = {
+        getLiveState: vi.fn(async (position) => {
+          // Promise.all([getLiveState, getPriceState]) rejects as soon as
+          // EITHER throws -- only failing this one call is enough to make
+          // metricsOk false for exactly this position, since both
+          // positions otherwise share the same fixture pool/poolId.
+          if (position.id === failing.id) throw new Error('this pool genuinely cannot be read');
+          return liveState(LIQUIDITY);
+        }),
+      };
+      const poolPrice: PoolPriceProvider = { getPriceState: vi.fn(async () => livePriceState(ENTRY_TICK)) };
+
+      const results = await runExitCycle({
+        positions,
+        exitStates,
+        txAttempts,
+        livePositionState,
+        poolPrice,
+        swapExecutor: fakeSwapExecutor,
+        settings: new InMemorySettingsRepository(),
+      });
+
+      // The isolated anomaly correctly triggers the decision engine to
+      // start an INFRA_SAFETY_EXIT close (proving it is NOT suppressed like
+      // Scenario A) -- the transaction itself can't actually complete in
+      // this test because the same unreadable pool that justified the
+      // Safety Exit also makes building the real remove-liquidity tx
+      // impossible, which is realistic, not a test artifact.
+      expect(results.find((r) => r.positionId === failing.id)?.action).toBe('CLOSE_STARTED');
+      expect((await positions.findById(failing.id))?.status).toBe('CLOSING');
+      const failingExitState = await exitStates.getOrCreate(failing.id);
+      expect(failingExitState.pendingCloseReason).toBe('INFRA_SAFETY_EXIT');
+      expect((await positions.findById(healthy.id))?.status).toBe('ACTIVE'); // untouched
+    });
+
+    it('Scenario C: CLOSING for INFRA_SAFETY_EXIT, remove-liquidity never even attempted, condition clears -- recovered back to ACTIVE', async () => {
+      const positions = new InMemoryPositionRepository();
+      const exitStates = new InMemoryExitStateRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+      const created = await positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000014' }));
+      await positions.markActive(created.id, '1', new Date());
+      await positions.markClosing(created.id, `exit:${created.id}:1`);
+      await exitStates.update(created.id, { pendingCloseReason: 'INFRA_SAFETY_EXIT', metricsFailureSince: FIVE_MIN_AGO });
+      // No TransactionAttempt row created for the removeLiquidity leg at all -- nothing was ever attempted.
+
+      const results = await runExitCycle({
+        positions,
+        exitStates,
+        txAttempts,
+        livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) }, // metrics read fine NOW -- outage resolved
+        poolPrice: { getPriceState: vi.fn(async () => livePriceState(ENTRY_TICK)) },
+        swapExecutor: fakeSwapExecutor,
+        settings: new InMemorySettingsRepository(),
+      });
+
+      expect(results.find((r) => r.positionId === created.id)?.action).toBe('NONE');
+      const reloaded = await positions.findById(created.id);
+      expect(reloaded?.status).toBe('ACTIVE'); // recovered
+      expect(reloaded?.closeIdempotencyKey).toBeNull();
+      const exitState = await exitStates.getOrCreate(created.id);
+      expect(exitState.pendingCloseReason).toBeNull();
+      expect(exitState.metricsFailureSince).toBeNull();
+    });
+
+    it('Scenario D: CLOSING for INFRA_SAFETY_EXIT but remove-liquidity is ALREADY VERIFIED -- NEVER reverted to ACTIVE, regardless of current metrics', async () => {
+      const positions = new InMemoryPositionRepository();
+      const exitStates = new InMemoryExitStateRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+      const created = await positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000015' }));
+      await positions.markActive(created.id, '1', new Date());
+      await positions.markClosing(created.id, `exit:${created.id}:1`);
+      await exitStates.update(created.id, { pendingCloseReason: 'INFRA_SAFETY_EXIT', metricsFailureSince: FIVE_MIN_AGO });
+
+      const removeKey = `exit:${created.id}:1:removeLiquidity`;
+      const removeAttempt = await txAttempts.create(removeKey, 'exit:removeLiquidity');
+      await txAttempts.update(removeAttempt.id, { status: 'VERIFIED', verifyData: { liquidityZero: true, usdgProceedsRaw: 0n } });
+
+      const results = await runExitCycle({
+        positions,
+        exitStates,
+        txAttempts,
+        livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) }, // metrics read fine NOW
+        poolPrice: { getPriceState: vi.fn(async () => livePriceState(ENTRY_TICK)) },
+        swapExecutor: fakeSwapExecutor,
+        settings: new InMemorySettingsRepository(),
+        readTokenBalance: vi.fn(async () => USDG(100)),
+      });
+
+      const reloaded = await positions.findById(created.id);
+      expect(reloaded?.status).not.toBe('ACTIVE'); // NEVER reverted -- the LP is genuinely already gone
+      expect(results.find((r) => r.positionId === created.id)?.action).toBe('RESUMED'); // proceeded through executeExit normally, not recovered
+    });
+  });
+
+  describe('H15 regression: DECIDE and RESUME must never both process the same position in the same tick', () => {
+    it('a position DECIDE just moved ACTIVE -> CLOSING this tick is NOT re-processed by the RESUME pass in the SAME call -- but a later tick DOES resume it normally', async () => {
+      const positions = new InMemoryPositionRepository();
+      const exitStates = new InMemoryExitStateRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+      const created = await positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000020' }));
+      await positions.markActive(created.id, '1', new Date());
+
+      let removeLiquidityCalls = 0;
+      const buildRemoveLiquidityDeps = () => {
+        removeLiquidityCalls++;
+        // Ambiguous every call -- stays CLOSING, never reaches VERIFIED,
+        // so the position remains eligible for the RESUME pass on a
+        // LATER tick (proving H15 only suppresses the SAME-tick case).
+        return {
+          buildTransaction: vi.fn(async () => ({ to: '0x1111111111111111111111111111111111111111' as const, data: '0xabcdef' as const, value: 0n })),
+          simulate: vi.fn(async () => ({ ok: true }) as const),
+          estimateGas: vi.fn(async () => 100_000n),
+          getGasPrice: vi.fn(async () => 1_000_000_000n),
+          checkGasAffordable: vi.fn(async () => ({ ok: true }) as const),
+          getNonce: vi.fn(async () => 1),
+          signTransaction: vi.fn(async () => ({ raw: '0xdeadbeef' as `0x${string}`, hash: `0x${'ab'.repeat(32)}` as `0x${string}` })),
+          broadcastRaw: vi.fn(async () => { throw new Error('ECONNRESET'); }), // ambiguous -- never advances past SIGNED
+          waitForReceipt: vi.fn(async () => ({ status: 'success' as const, blockNumber: 1n })),
+          getReceiptIfAvailable: vi.fn(async () => null),
+          verifyOnChain: vi.fn(async () => ({ ok: true as const, data: { liquidityZero: true as const, usdgProceedsRaw: 0n } })),
+        };
+      };
+
+      const tickDeps: RunExitCycleDeps = {
+        positions,
+        exitStates,
+        txAttempts,
+        livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
+        poolPrice: { getPriceState: vi.fn(async () => livePriceState(-7000)) }, // triggers HARD_STOP_LOSS immediately
+        swapExecutor: fakeSwapExecutor,
+        settings: new InMemorySettingsRepository(),
+        buildRemoveLiquidityDeps,
+      };
+
+      // Tick 1: DECIDE moves ACTIVE -> CLOSING and calls executeExit ONCE.
+      // If H15's fix were absent, the RESUME pass in this SAME call would
+      // find the position via findAllClosing() and call executeExit a
+      // SECOND time, doubling this count within one tick.
+      const tick1 = await runExitCycle(tickDeps);
+      expect(removeLiquidityCalls).toBe(1);
+      expect(tick1.filter((r) => r.positionId === created.id)).toHaveLength(1);
+      expect(tick1.find((r) => r.positionId === created.id)?.action).toBe('CLOSE_STARTED');
+      expect((await positions.findById(created.id))?.status).toBe('CLOSING');
+
+      // Tick 2 (a genuinely later call -- a fresh handledThisTick set):
+      // the RESUME pass legitimately picks the SAME still-CLOSING position
+      // back up and retries the ambiguous remove-liquidity leg again.
+      const tick2 = await runExitCycle(tickDeps);
+      expect(removeLiquidityCalls).toBe(2);
+      expect(tick2.find((r) => r.positionId === created.id)?.action).toBe('RESUMED');
+    });
+  });
+
   describe('resumption pass: positions already CLOSING get executeExit called again', () => {
     it('resumes a CLOSING position independently of the ACTIVE-position decide pass', async () => {
       const deps = await makeDeps();
@@ -165,11 +397,16 @@ describe('runExitCycle', () => {
   });
 
   describe('Module 10 -- live hardStopLossPct, read fresh each cycle', () => {
-    it('a PNL of ~-11% is NOT closed under the frozen -15% default, but IS closed once hardStopLossPct is live-tightened to -8%', async () => {
-      // tick -4000 against this fixture's entry deterministically computes pnlPct ~= -0.1096 (verified via computePositionMetrics directly) -- between -8% and -15%, still in range (so OOR can never interfere).
+    it('a PNL of ~-4.5% is NOT closed under the frozen -6% TIER 3 default, but IS closed once hardStopLossPct is live-tightened to -4%', async () => {
+      // tick -2500 against this fixture's entry deterministically computes
+      // pnlPct ~= -0.0452 (verified via computePositionMetrics directly) --
+      // between -4% and -6%, still in range (so OOR can never interfere)
+      // and well inside the -8% Safety Exit arming threshold. The shape of
+      // the proof is unchanged; only the two thresholds moved with the
+      // TIER 3 stop (-15% -> -6%).
       const deps = await makeDeps({
         livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
-        poolPrice: { getPriceState: vi.fn(async () => livePriceState(-4000)) },
+        poolPrice: { getPriceState: vi.fn(async () => livePriceState(-2500)) },
       });
       const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
       await deps.positions.markActive(created.id, '1', new Date());
@@ -178,7 +415,7 @@ describe('runExitCycle', () => {
       expect(underFrozenDefault[0]?.action).toBe('NONE');
       expect((await deps.positions.findById(created.id))?.status).toBe('ACTIVE');
 
-      await deps.settings.update({ hardStopLossPct: -0.08 }); // tightened live, still >= the frozen PNL Protection boundary (-8%, the strictest allowed value)
+      await deps.settings.update({ hardStopLossPct: -0.04 }); // tightened live -- TIER 3 removed the old cross-field floor, so any in-bounds value is settable
       const underLiveSetting = await runExitCycle(deps);
 
       expect(underLiveSetting[0]?.action).toBe('CLOSE_STARTED');
@@ -186,6 +423,66 @@ describe('runExitCycle', () => {
       const reloaded = await deps.positions.findById(created.id);
       expect(reloaded?.status).toBe('CLOSED');
       expect(reloaded?.closeReason).toBe('HARD_STOP_LOSS');
+    });
+  });
+
+  describe('LOW_YIELD validation-phase resolution -- the shipped default is DISABLED, and the wiring never fires it on its own', () => {
+    /**
+     * Meridian's metric is pool-level 24h fees/TVL; Lunex cannot reproduce
+     * it (no pool-level fee or TVL data source exists -- see
+     * EXITS.LOW_YIELD's doc comment), so the rule ships disabled. These
+     * tests pin that end to end at the ORCHESTRATOR level, not just the
+     * pure-decision level: the exact position that WOULD have closed for
+     * LOW_YIELD under the pre-validation default (old, in range, in
+     * moderate loss, zero fees earned) must stay ACTIVE under the frozen
+     * shipped config -- no substitute metric, no fabricated yield, no
+     * silent policy change -- while the underlying rule logic is proven
+     * intact via an explicitly-enabled rules override.
+     */
+    const OLD = new Date(Date.now() - 60 * 60 * 1000); // 60 minutes -- past the 30-min age floor
+
+    function lowYieldDeps() {
+      return makeDeps({
+        livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
+        // ENTRY_TICK: in range (so OOR can never interfere), and ~-2.93%
+        // PnL -- a real loss that fires nothing above LOW_YIELD's priority.
+        poolPrice: { getPriceState: vi.fn(async () => livePriceState(-2000)) },
+      });
+    }
+
+    it('a 60-minute-old, zero-fee, in-range, ~-2.9% position stays ACTIVE under the SHIPPED config', async () => {
+      const deps = await lowYieldDeps();
+      const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
+      await deps.positions.markActive(created.id, '1', OLD);
+
+      const results = await runExitCycle(deps);
+
+      expect(results).toEqual([{ positionId: created.id, action: 'NONE' }]);
+      expect((await deps.positions.findById(created.id))?.status).toBe('ACTIVE');
+    });
+
+    it('the same position DOES close for LOW_YIELD when the rule is enabled -- the rule logic is intact, only the default flipped', async () => {
+      // 60 minutes old + zero fees (liveState's tokensOwed are 0n) + a
+      // genuine ~-2.9% reading: every LOW_YIELD precondition holds, so
+      // enabling the rule must produce a LOW_YIELD close on the next tick.
+      // This proves the disabled default is a policy choice, not a broken
+      // rule that silently fails for another reason.
+      const deps = await lowYieldDeps();
+      const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
+      await deps.positions.markActive(created.id, '1', OLD);
+
+      const results = await runExitCycle({
+        ...deps,
+        exitRulesOverride: {
+          ...config.rules.exits,
+          LOW_YIELD: { ...config.rules.exits.LOW_YIELD, ENABLED: true },
+        },
+      });
+
+      expect(results[0]?.action).toBe('CLOSE_STARTED');
+      const reloaded = await deps.positions.findById(created.id);
+      expect(reloaded?.status).toBe('CLOSED');
+      expect(reloaded?.closeReason).toBe('LOW_YIELD');
     });
   });
 });

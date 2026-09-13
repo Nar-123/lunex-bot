@@ -2914,3 +2914,302 @@ top of the trading engine (Modules 1-9). Two flagged, open items remain
 before any of this should touch real funds: the realized-PNL/fee-earned
 gap (Module 11/12, `Position.realizedUsdgRaw` never persisted) and
 `swap/tradingApiClient.ts`'s unverified real endpoint/JSON shape (Module 8).
+
+## Validation phase — LOW_YIELD metric resolution
+
+Tier 3 shipped LOW_YIELD enabled with a flagged metric mismatch: Meridian's
+rule gates on **pool-level `fee_24h / TVL`** (Meteora API), while the Lunex
+wiring fed it `computePositionMetrics`'s `yieldPct` — this position's own
+cumulative uncollected fees ÷ its entry capital. Same 0.0005 threshold
+applied to a different quantity over a different window; the direction of
+the error depends on position age (young positions under-read against the
+floor, old ones over-read), so no threshold value makes the numbers
+equivalent.
+
+**Data-source audit** (why the Meridian metric cannot be reproduced here):
+
+| Meridian needs | Lunex has |
+|---|---|
+| Pool TVL | Nothing. `StateViewPoolStateProvider.getLiquidity` returns raw `uint128` liquidity units — not a USD value; no whole-pool position-set reconstruction exists anywhere in the codebase. |
+| Pool fees (24h window) | Nothing at pool level. Only per-position uncollected fees via v4 fee-growth accounting (`positionStateReader.ts` → `feesFromGrowth`). |
+| 24h fee data | Nothing. `SwapLogPoolVolumeProvider` derives 6h **volume** (not fees) from `PoolManager.Swap` logs, and its own doc comment flags it best-effort and recommends an indexer/subgraph for production. GMGN's `gas_fee` is token-level, all-time, native-currency — a different quantity on every axis. |
+| Position fees / age | Real and exact (v4 fee-growth math; `Position.openedAt`). |
+
+**Resolution** (per the validation brief's decision rule — no invented
+conversion, no substitute metric kept alive under the rule's name):
+
+- `EXITS.LOW_YIELD.ENABLED` is now `false`. The rule's logic, its
+  `LOW_YIELD` reason string, its priority-7 ladder position, and both
+  Meridian parameter values (`MIN_AGE_MS: 30min`, `MIN_FEE_YIELD_PCT:
+  0.0005`) are unchanged — disabling a rule is a policy default, not a
+  removal. The reason remains in `EXIT_TRIGGER_REASONS` and flows through
+  every reporting surface (the reporting test drives off that list).
+- `resolveExitDecision`'s missing-data guards are untouched: null yield
+  or unknown age still never fires the rule.
+- Regression tests pin three facts: the config default is disabled;
+  an orchestrator-level run under the shipped config leaves a
+  would-have-closed position (60min old, zero fees, in range, ~-2.9%
+  PnL) ACTIVE; and the same position closes for LOW_YIELD when the rule
+  is enabled via `RunExitCycleDeps.exitRulesOverride` (a test-only
+  injection point added alongside the existing `priceHistory` pattern),
+  proving the default flip is policy, not breakage.
+- **Re-enabling** requires wiring a real pool-level fee/TVL feed with a
+  24h window into `ExitMetricsSnapshot.yieldPct` first, then validating
+  it against an external reference. `computePositionMetrics`'s
+  position-level `yieldPct` (still computed and reported — it is a real,
+  correct number for what it measures) must not be reused for this rule.
+
+What Lunex computes today, stated precisely: **position-level yield-to-date
+= uncollected fees (USDG-converted at the current pool price) ÷ entry
+capital, cumulative since entry, not annualized**. That metric is reported
+per position (`GET /positions`, `/status` Telegram, UI) and is fit for
+that purpose; it is not `fee_24h / TVL` and must not gate LOW_YIELD.
+
+## Validation phase — realized-PnL persistence
+
+Module 11/12's oldest flagged gap ("no realized PnL is persisted —
+`Position.realizedUsdgRaw` never existed") is resolved. The exit flow now
+measures and persists what each exit actually returned, and reporting
+shows it.
+
+**How it is measured** (the design constraint that shaped everything
+else): the wallet runs up to 3 concurrent positions, so a
+balance-before/after delta around either exit leg can be corrupted by
+another cycle's mint/exit landing in the same wallet between the two
+reads. Each leg's proceeds are therefore decoded from **that leg's own
+confirmed transaction receipt** — every ERC20 `Transfer(... -> wallet)`
+of USDG in the remove-liquidity receipt and the swap receipt, summed per
+transaction (`blockchain/erc20.ts`'s `readErc20TransfersTo`). A specific
+transaction's log list is scoped to exactly that transaction's effects;
+concurrent wallet activity cannot enter it by construction, and the
+number is exact down to the last raw unit.
+
+**Where it lives:**
+- Each leg's measured proceeds ride the SAME crash-safe `verifyData`
+  persistence every other post-verification payload uses
+  (`RemoveLiquidityVerifyData.usdgProceedsRaw`,
+  `SwapVerifyData.usdgProceedsRaw`) — a crash between verify and close
+  replays the decoder against the same confirmed hash on resume.
+- `finalizeClose` sums the two legs from the VERIFIED attempts and
+  persists `Position.realizedUsdgRaw` in the SAME atomic update as the
+  CLOSED transition — proceeds and state can never disagree.
+  Realized PnL is computed at read time (`realizedUsdgRaw −
+  entryUsdgRaw`), never stored as a third denormalized number.
+- Migration `20260912100000_add_position_realized_usdg` — one
+  non-destructive ADD COLUMN; legacy CLOSED rows keep NULL.
+
+**Honest-unavailable semantics, unchanged in spirit from Module 11:** a
+leg whose verifyData predates the proceeds fields (a crash mid-close
+under the old build, or any legacy row) yields `realizedUsdgRaw: NULL` —
+never a silently under-counted sum, and never a fabricated 0. The close
+itself is never blocked by an unmeasurable accounting read. Reporting
+(`GET /positions?status=closed`, Telegram `/report`, UI history) shows
+the number when measured, `n/a` / `-` when not.
+
+**Safety-rule compliance:** the proceeds measurement is strictly additive
+to the existing verification logic — the swap leg's balance-delta check
+and the remove-liquidity leg's liquidity-zero check are untouched and
+still decide VERIFIED on their own; a proceeds-decode RPC failure inside
+`verifyOnChain` returns a RESUMABLE `ok: false` (the leg is never marked
+definitively failed over a side-measurement — "prefer a resumable state
+over a false definitive failure").
+
+**Verification:** unit tests prove the exact sum (480 + 490 = 970
+persisted), the legacy-shape honest-null, the proceeds-read-failure
+resumable path, and the API/UI rendering of measured vs unmeasured
+rows; the real-SQLite integration test proves the migration applies and
+the column round-trips an extreme 18-decimal value with strict equality.
+
+## LIVE VALIDATION CHECKLIST (Phase 5)
+
+Phase 5's goal was to prepare for controlled live validation WITHOUT
+executing any trade. This section is the operator's runbook: exact
+commands, required environment, expected output, and the safety
+guarantees of each step. **No transaction is broadcast by anything in
+this checklist.**
+
+### Environment audit — every required variable
+
+Sources: `RPC_URL` from your Robinhood Chain RPC provider; `PRIVATE_KEY`
+from your KMS/vault (development: a dedicated throwaway key with ONLY the
+validation funds you can afford to lose); Trading API values from
+<https://trade-api.gateway.uniswap.org>; protocol addresses confirmed
+against the Trading API's own address book (`GET /v1/supported_chains?chainIds=4663`,
+public, no auth).
+
+| Variable | Required | Safe default? | Behaviour when missing/wrong |
+|---|---|---|---|
+| `RPC_URL` | YES | `.env.example` ships a placeholder — must be replaced | Process refuses to start (zod `z.url()` validation) |
+| `CHAIN_ID` | YES | `0` in `.env.example` — must be `4663` | Refuses to start (positive-int check); `validate-live rpc` independently cross-checks the RPC's reported chain id |
+| `PRIVATE_KEY` | YES | none — must be provided | Refuses to start (0x + 64-hex check) |
+| `USDG_TOKEN_ADDRESS` | YES | none | Refuses to start |
+| `USDG_DECIMALS` | 18 default | safe (USDG is 18-decimal) | — |
+| `UNISWAP_V4_POOL_MANAGER_ADDRESS` | YES | `0x8366…0951` — **confirmed** vs Trading API address book | StateView binding self-check fails loudly at first read if mismatched |
+| `UNISWAP_V4_POSITION_MANAGER_ADDRESS` | YES | `0x58da…4fA7` — **confirmed** | PositionManager binding self-check fails loudly |
+| `UNISWAP_V4_STATE_VIEW_ADDRESS` | YES | `0xF333…673b` — **confirmed** | Same binding self-check |
+| `UNISWAP_V4_POOL_MANAGER_DEPLOY_BLOCK` | needed for pool discovery | `0` — **NOT safe**: discovery would scan from genesis | `validate-live rpc` FAILS the deploy-block check until set (find it via the block explorer) |
+| `UNISWAP_ALLOWED_SWAP_ROUTER_ADDRESS` | YES for any swap | now ships `0x8876…0904` — **confirmed** (Universal Router on 4663, Trading API address book) | **Fails closed**: `validateSwapQuote` rejects every swap while empty |
+| `UNISWAP_API_KEY` | YES | none | Refuses to start (mandatory exit-flow dependency) |
+| `UNISWAP_TRADING_API_BASE_URL` | optional | `https://trade-api.gateway.uniswap.org` — confirmed vs live OpenAPI | — |
+| `DATABASE_URL` | YES | `file:./data/lunex.db` | Refuses to start |
+| `AUTH_ADMIN_USERNAME` / `AUTH_ADMIN_PASSWORD_HASH` / `JWT_SECRET` | YES | none | Refuses to start |
+| `GMGN_CLI_PATH` / `GMGN_API_KEY` | needed for discovery | `gmgn-cli` default path | Discovery fails loudly per candidate, never silently |
+| `EXIT_IMPACT_CHECK_ENABLED` | optional | `true` (Tier 3, Meridian 0.5% gate) | safe |
+| `EXIT_MIN_RECEIVED_PROTECTION_ENABLED` | optional | `false` (post-hoc defence-in-depth) | safe |
+| `API_PORT`/`API_HOST`/TLS vars | optional | `8443`/`0.0.0.0`/empty | API server startup depends on them; not part of quote-only validation |
+
+### Step 0 — gates (no network)
+
+```bash
+npm test            # 800 passed expected
+npm run typecheck   # clean
+npm run lint        # clean (eslint.config.js added in Phase 5)
+npm run build       # clean
+```
+
+### Step 1 — read-only RPC validation
+
+```bash
+node dist/validate-live.js rpc --i-understand-this-is-live-validation
+```
+
+Exercises, against the real RPC: latest block, chain-id cross-check,
+executor native + USDG balances (address only — the private key is never
+used to sign), the StateView↔PoolManager binding self-check, the
+deploy-block sanity check, PoolManager event logs, PositionManager code
+presence, receipt lookup, and the NFT `ownerOf` path. Expected output:
+9 `[PASS]` lines and exit code 0. **Never sends a transaction.**
+
+### Step 2 — quote-only Trading API validation
+
+```bash
+node dist/validate-live.js quote <TOKEN_ADDRESS> <AMOUNT_IN_RAW> \
+  --i-understand-this-is-live-validation
+```
+
+e.g. `AMOUNT_IN_RAW=100000000000000` (0.0001 of an 18-decimal token —
+deliberately tiny). Fetches a real quote once per slippage tier
+(100/200/300 bps → `slippageTolerance` 1/2/3 percent), printing: input
+amount, expected output, the API's `priceImpact`, our derived
+`minOutputAmountRaw`, the API's own `minimumAmount` and `slippage` echo,
+the approval spender, and the fail-closed router allow-list result.
+**Never signs, never calls `/v1/swap`, never broadcasts.**
+
+Both subcommands refuse to run (exit 2) without the explicit
+`--i-understand-this-is-live-validation` flag — checked before any
+config-reading module is even imported.
+
+### Phase 5 contract verification results (recorded)
+
+Against the live OpenAPI spec (`/v1/api.json`, fetched directly):
+
+- **FIXED — real bug**: the quote request field is `slippageTolerance`,
+  not `slippage` (that is the *response* field's name). The old code sent
+  the ladder tier under the wrong name; the API silently ignored it and
+  quoted at its own default tolerance. Every real exit swap would have
+  been unbounded relative to the intended tier.
+- Confirmed correct: `x-api-key` header auth; `x-permit2-disabled`
+  header (now spec-verified, no longer a flagged guess);
+  `ClassicQuote.priceImpact` is 0-100 → /100 to a fraction; `/v1/swap`
+  request `{ quote }` shape; `swap.to/data/value/chainId`; `check_approval`
+  `approval: null | {to, data}` shape.
+- Routing reject list extended with the live enum's `DUTCH_LIMIT` and
+  `LIMIT_ORDER` (off-chain order flows this pipeline cannot execute).
+- The zod deprecation findings from lint (`z.url()`, `.loose()`) were
+  migrated in the same pass.
+
+### Lint (Phase 5)
+
+`eslint.config.js` — the smallest config matching existing conventions:
+typescript-eslint `flat/recommended-type-checked` + `flat/strict-type-checked`,
+no formatting rules. 139 findings → 0: the genuine code issues were fixed
+(dead post-narrowing guards, redundant `BigInt()`/`Number()`/`Number()`
+conversions, unsafe `any` from `res.json()`, non-Error promise
+rejections, no-op `async`, catch-variable `unknown` typing), and two
+documented exceptions remain in the config:
+`restrict-template-expressions` reverted to the recommended preset's
+default options (`allowNumber`/`allowNullish: true` — the codebase's
+raw-unit `${number}`/`${bigint}` logging idiom is what the rule's own
+default permits; only the strict preset tightens it), and
+`no-unused-vars` `args: 'none'` (test doubles inject-and-ignore by
+design). One inline `eslint-disable` exists, at
+`src/positions/openPosition.ts` — a documented defense-in-depth runtime
+guard the type system considers unreachable; the comment there explains
+why it stays.
+
+### Safety warnings
+
+- The quote harness talks to REAL services with your REAL `.env`. It
+  reveals nothing secret (the wallet address only), but quotes are
+  observable by the API provider as activity.
+- `UNISWAP_V4_POOL_MANAGER_DEPLOY_BLOCK` still ships as `0`; do not run
+  the full bot until it is set, or pool discovery will attempt a
+  genesis-to-latest log scan.
+- Nothing in this phase validates a real fill. Price-impact accuracy,
+  the derived Bollinger series, and Trading-API slippage behaviour
+  against a real swap remain unmeasured until a deliberate, tiny,
+  separately-approved real transaction is made (Phase 6's decision, not
+  this phase's).
+
+## PUBLIC CONFIGURATION — VERIFIED VALUES (Phase 5 completion)
+
+Every value below was discovered from a primary public source and
+independently cross-checked. The full evidence trail is recorded so a
+future operator can re-verify each one.
+
+### Address book (chain 4663, Robinhood Chain)
+
+| Contract | Address | Sources (all agree exactly) |
+|---|---|---|
+| PoolManager | `0x8366a39cc670b4001a1121b8f6a443a643e40951` | 1) Uniswap Trading API `GET /v1/supported_chains?chainIds=4663`; 2) official Uniswap v4 deployments docs (developers.uniswap.org/contracts/v4/deployments); 3) on-chain: code present, and `StateView.poolManager()` returns exactly this address (live `eth_call`); 4) robinscan verified-source page shows `lib/v4-core/src/PoolManager.sol` at this address |
+| PositionManager | `0x58daec3116aae6d93017baaea7749052e8a04fa7` | 1) + 2) as above; 3) on-chain code present; 4) robinscan label "Uniswap V4: Position Manager"; 5) HoodScan project registry |
+| StateView | `0xf3334192d15450cdd385c8b70e03f9a6bd9e673b` | 1) + 2) as above; 3) on-chain code present + its `poolManager()` binding returns the PoolManager address; 4) robinscan label "Uniswap V4: State View" |
+| Universal Router | `0x8876789976decbfcbbbe364623c63652db8c0904` | 1) + 2) as above; 3) on-chain code present; 4) HoodScan registry ("UniversalRouter", kind: router) |
+
+### Deploy blocks (creation transactions, verified)
+
+All four were deployed through the well-known deterministic CREATE2 proxy
+(`0x4e59b44847b379578588920ca78fbf26c0b4956c`) by the same deployer
+(`0x9701fb0a…3a52`) — consistent with Uniswap's deterministic-deployment
+practice. For each: the creation tx was found via robinscan's
+`/api/addresses/<addr>/contract-context`, its block confirmed against a
+live node's `eth_getTransactionByHash` (both agree), and the internal
+`create2` record's `createdContract` matches the address exactly.
+
+| Contract | Creation tx | Block | Cross-checked |
+|---|---|---|---|
+| PoolManager | `0x4fb28d4935866f462582c6c931c6f2705e55f5be5eb178c7d8d9329a95c44c41` | **9070** (2026-05-22T18:04:55Z) | robinscan block record + live `eth_getTransactionByHash` + internal create2 createdContract match |
+| PositionManager | `0x228c18ada6cb46b4fbcc18f4ec1519953415393e256fa8349aafbd5a2db037c8` | **9073** (2026-05-22T18:04:55Z) | same three-way check |
+| StateView | `0x3d61e2c9eeb482385b1aa436b9e8f812167ea579cc390e4f93bc5abde00582f4` | **9075** (2026-05-22T18:04:56Z) | same (block from live RPC) |
+| Universal Router | `0x422569c99e80a452d45680fbf16cf04cd4ae79cd2b0d7a6a89cf6603009ed1fa` | **18127** (2026-05-26T22:22:22Z) | same (block from live RPC) |
+
+### RPC endpoints
+
+| Endpoint | Status |
+|---|---|
+| `https://rpc.mainnet.chain.robinhood.com` | Official (Robinhood-operated), from the canonical `ethereum-lists/chains` registry `eip155-4663.json`. NOT reachable from this development network — the operator must verify reachability from THEIR network before relying on it. |
+| `https://robinhood-rpc.publicnode.com` | Community (PublicNode). Live: `eth_chainId` = 0x1237 = 4663. Free tier serves latest-state reads and receipts but gates `eth_getLogs` and historical state behind a paid archive token. |
+| `https://rpc.ordofi.network` | Community. Live: chainId 4663 confirmed; serves recent-window `eth_getLogs`; deep historical state (`eth_getCode` at old blocks) unavailable. |
+
+**Operator guidance**: the bot's pool discovery scans logs from the
+PoolManager deploy block (9070) to latest — that works on an endpoint
+that serves `eth_getLogs` over a bounded recent window per request, but
+reconciliation and any deep lookback need archive access. Use the
+official endpoint (verify reachability) or a paid archive RPC for
+production; the free community endpoints are for validation only.
+
+### Live harness results (this phase, read-only)
+
+Against `https://rpc.ordofi.network` with a throwaway key:
+**8/9 PASS** — latest block, chainId match, StateView↔PoolManager
+binding, deploy block, PoolManager logs, PositionManager code, receipt
+lookup, NFT ownerOf. The single FAIL is the USDG `balanceOf` read against
+a PLACEHOLDER token address — the real `USDG_TOKEN_ADDRESS` is an
+operator value this repository has no independent verification for and
+deliberately does not guess.
+
+Quote harness with a placeholder API key: all three tiers fail cleanly
+with the API's own `401 Unauthorized` error shape (correct fail-loud
+behaviour), and the router allow-list check PASSES against the verified
+Universal Router address. `/v1/swap` was never called; nothing was
+signed. A real quote requires the operator's real API key.

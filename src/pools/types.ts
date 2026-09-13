@@ -8,6 +8,23 @@ export interface V4PoolKey {
   hooks: Address;
 }
 
+/**
+ * Uniswap v4's dynamic-fee sentinel (`LPFeeLibrary.DYNAMIC_FEE_FLAG` in
+ * the core contracts, `0x800000`). A `PoolKey.fee` of exactly this value
+ * means the pool's actual per-swap fee is decided live by a hook, not a
+ * static number baked into the key. C8 fix: the v4 SDK's local swap
+ * simulation (`priceImpact.ts`'s `estimateExitPriceImpact`) assumes a
+ * static fee strictly less than 1,000,000 and silently produces
+ * nonsensical (negative) simulated output for this sentinel -- verified
+ * by direct reproduction: a dynamic-fee pool passed the exit-impact filter
+ * with a simulated impact of roughly -639%. Since it's `> 0`, it was not
+ * caught by the pre-existing `fee <= MIN_FEE` guard. `selectPool.ts`
+ * rejects any pool with this exact fee outright (it cannot be locally
+ * simulated at all); `priceImpact.ts` additionally rejects any negative
+ * computed impact as a second, independent layer of defense.
+ */
+export const DYNAMIC_FEE_FLAG = 0x800000;
+
 export interface V4PoolRef {
   poolId: `0x${string}`;
   key: V4PoolKey;

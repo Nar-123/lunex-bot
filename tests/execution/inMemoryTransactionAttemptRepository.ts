@@ -22,6 +22,7 @@ export class InMemoryTransactionAttemptRepository implements TransactionAttemptR
       rawTx: null,
       txHash: null,
       lastError: null,
+      verifyData: null,
       failureCode: null,
       attemptCount: 0,
       firstAttemptedAt: null,

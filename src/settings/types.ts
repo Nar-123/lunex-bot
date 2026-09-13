@@ -20,9 +20,9 @@ export interface SettingsFields {
   positionSizePct: number;
   /** Replaces `CAPITAL.MAX_ACTIVE_POSITIONS`. */
   maxActivePositions: number;
-  /** Fraction, always negative (e.g. -0.15 = -15%) -- replaces `EXITS.HARD_STOP_LOSS_PCT`. Cross-validated against the frozen `EXITS.PNL_PROTECTION.TRIGGER_PNL_PCT` at write time -- see `validateSettingsPatch.ts`. */
+  /** Fraction, always negative (TIER 3 default -0.06 = -6%, Meridian's measured stop) -- replaces `EXITS.HARD_STOP_LOSS_PCT`. No longer cross-validated against the Safety Exit trigger: the Meridian ladder puts the stop deliberately TIGHTER than the -8% arming point. */
   hardStopLossPct: number;
-  /** Fraction, always positive (e.g. 0.05 = +5%) -- replaces `EXITS.TRAILING_TP.TRIGGER_PEAK_PNL_PCT`. Only takes effect while PNL Protection has NOT activated for a given position -- see `resolveExitDecision.ts`. */
+  /** Fraction, always positive (TIER 3 default 0.06 = +6%, Meridian's measured trailing arm) -- replaces `EXITS.TRAILING_TP.TRIGGER_PEAK_PNL_PCT`. */
   trailingTpTriggerPct: number;
 }
 
@@ -47,6 +47,6 @@ export const DEFAULT_SETTINGS: SettingsFields = {
   paused: false,
   positionSizePct: 0.35,
   maxActivePositions: 3,
-  hardStopLossPct: -0.15,
-  trailingTpTriggerPct: 0.05,
+  hardStopLossPct: -0.06, // TIER 3: Meridian's measured stop (was -0.15)
+  trailingTpTriggerPct: 0.06, // TIER 3: Meridian's measured trailing arm (was 0.05)
 };

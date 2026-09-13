@@ -59,6 +59,15 @@ export interface TransactionAttemptRecord {
   rawTx: `0x${string}` | null;
   txHash: `0x${string}` | null;
   lastError: string | null;
+  /**
+   * The verification payload persisted atomically with status VERIFIED --
+   * `unknown` at this layer since the repository is generic across every
+   * `TVerifyData` shape (mint's `{positionTokenId, liquidity}`, approve's
+   * `{allowanceRaw}`, etc.); `executeCriticalTransaction` is what narrows
+   * it back to a caller's concrete `TVerifyData`. Null for legacy rows
+   * (VERIFIED before this column existed) or attempts with no verify data.
+   */
+  verifyData: unknown;
   failureCode: TxFailureCode | null;
   /** How many non-short-circuited calls to `executeCriticalTransaction` this attempt has been through. */
   attemptCount: number;

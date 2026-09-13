@@ -101,9 +101,36 @@ describe('computeLpRange -- lower price ~= 0.5x entry, upper price ~= entry, for
       const lower = Number(result.diagnostics.lowerPriceUsdgPerToken);
       const upper = Number(result.diagnostics.upperPriceUsdgPerToken);
       expect(lower).toBeLessThan(upper);
-      expect(lower / entry).toBeCloseTo(0.5, 1);
+      // H18/M1 fix: tightened from toBeCloseTo(0.5, 1) (accepts anything in
+      // [0.45, 0.55] -- loose enough to have passed even the PROVEN bug of
+      // 0.548828x at coarse tickSpacing) to a real, meaningful bound: the
+      // strategy's actual guarantee is "AT LEAST 50% below entry" (more
+      // downside room is fine, less is not), so lower/entry must be <= 0.5
+      // (never above -- that would be the bug) and, at this fine
+      // tickSpacing=10, close enough to 0.5 that rounding error is negligible.
+      expect(lower / entry).toBeLessThanOrEqual(0.5);
+      expect(lower / entry).toBeGreaterThan(0.49);
       expect(upper / entry).toBeLessThan(1); // strictly below entry, per spec
       expect(upper / entry).toBeGreaterThan(0.95); // but close to it (fine spacing here)
+    }
+  });
+});
+
+describe('computeLpRange -- H18/M1 regression: the 50%-below-entry guarantee holds even at COARSE tickSpacing', () => {
+  it.each([
+    { label: 'USDG=currency1', currency0: TOKEN_LOW, currency1: USDG },
+    { label: 'USDG=currency0', currency0: USDG, currency1: TOKEN_HIGH },
+  ])('$label: lower/entry is NEVER above 0.5, even at tickSpacing=2000 where nearestUsableTick used to overshoot to ~0.548828', ({ currency0, currency1 }) => {
+    const result = computeLpRange(baseInput({ currency0, currency1, tickCurrent: 0, tickSpacing: 2000 }));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const entry = Number(result.diagnostics.entryPriceUsdgPerToken);
+      const lower = Number(result.diagnostics.lowerPriceUsdgPerToken);
+      // The real, proven bug: nearestUsableTick rounded to 0.548828x here
+      // (MORE than 50%, i.e. LESS downside room than promised). The fix
+      // must never exceed 0.5 -- it may be conservatively below it
+      // (more room is safe), but never above.
+      expect(lower / entry).toBeLessThanOrEqual(0.5);
     }
   });
 });

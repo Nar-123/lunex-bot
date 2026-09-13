@@ -62,9 +62,20 @@ interface ClosedPosition {
   entryUsdgRaw: string;
   closedAt: string | null;
   closeReason: string | null;
+  realizedPnlAvailable: boolean;
+  realizedPnlUsdgRaw?: string;
 }
 interface ClosedPositionsResponse {
   positions: ClosedPosition[];
+}
+
+/** Whole-number USDG from an 18-decimal raw string, for a compact Telegram line -- display formatting only, never arithmetic. */
+function usdgWholeFromRaw(raw: string): string {
+  try {
+    return (BigInt(raw) / 10n ** 18n).toString();
+  } catch {
+    return raw;
+  }
 }
 
 export async function handleReport(apiClient: TelegramApiClient, ctx: Context): Promise<void> {
@@ -73,8 +84,18 @@ export async function handleReport(apiClient: TelegramApiClient, ctx: Context): 
     if (r.positions.length === 0) return 'Belum ada posisi yang closed.';
     const lines = r.positions
       .slice(0, 20)
-      .map((p) => `${p.tokenSymbol}: closed (${p.closeReason ?? 'unknown'}) at ${p.closedAt ?? '?'}, entry ${p.entryUsdgRaw}`);
-    return ['PNL/fee realized belum tersedia -- lihat catatan Module 11.', ...lines].join('\n');
+      .map((p) => {
+        const pnl =
+          p.realizedPnlAvailable && p.realizedPnlUsdgRaw !== undefined
+            ? `, realized PnL ${usdgWholeFromRaw(p.realizedPnlUsdgRaw)} USDG`
+            : ', realized PnL n/a';
+        return `${p.tokenSymbol}: closed (${p.closeReason ?? 'unknown'}) at ${p.closedAt ?? '?'}, entry ${p.entryUsdgRaw}${pnl}`;
+      });
+    const measured = r.positions.some((p) => p.realizedPnlAvailable);
+    const header = measured
+      ? 'Realized PnL = exit proceeds (receipt terkonfirmasi) - entry; "n/a" = tidak terukur.'
+      : 'PNL/fee realized belum tersedia -- lihat catatan Module 11.';
+    return [header, ...lines].join('\n');
   });
 }
 

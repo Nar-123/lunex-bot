@@ -7,6 +7,7 @@ const NON_CLOSED = new Set(['OPENING', 'ACTIVE', 'CLOSING']);
 /** In-memory test double, same role as the other modules' in-memory repos: fast, no DB, for testing logic built ON TOP of the repository interface. */
 export class InMemoryPositionRepository implements PositionRepository {
   private byId = new Map<string, PositionRecord>();
+  private claimedAt = new Map<string, number>();
   private nextId = 1;
 
   async create(input: CreatePositionInput): Promise<PositionRecord> {
@@ -28,6 +29,7 @@ export class InMemoryPositionRepository implements PositionRepository {
       openedAt: null,
       closedAt: null,
       closeReason: null,
+      realizedUsdgRaw: null,
     };
     this.byId.set(record.id, record);
     return record;
@@ -88,11 +90,12 @@ export class InMemoryPositionRepository implements PositionRepository {
     return record;
   }
 
-  async markClosed(id: string, closedAt: Date, closeReason: string): Promise<PositionRecord> {
+  async markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null): Promise<PositionRecord> {
     const record = this.get(id);
     record.status = 'CLOSED';
     record.closedAt = closedAt;
     record.closeReason = closeReason;
+    record.realizedUsdgRaw = realizedUsdgRaw !== undefined ? realizedUsdgRaw : null;
     return record;
   }
 
@@ -107,6 +110,20 @@ export class InMemoryPositionRepository implements PositionRepository {
     record.status = 'ACTIVE';
     record.closeIdempotencyKey = null;
     return record;
+  }
+
+  async claimForResume(id: string, expectedStatus: 'OPENING' | 'CLOSING', freshnessMs: number): Promise<boolean> {
+    const record = this.byId.get(id);
+    if (!record || record.status !== expectedStatus) return false;
+    const now = Date.now();
+    const lastClaim = this.claimedAt.get(id);
+    if (lastClaim !== undefined && now - lastClaim < freshnessMs) return false;
+    this.claimedAt.set(id, now);
+    return true;
+  }
+
+  async releaseResumeClaim(id: string): Promise<void> {
+    this.claimedAt.delete(id);
   }
 
   private get(id: string): PositionRecord {

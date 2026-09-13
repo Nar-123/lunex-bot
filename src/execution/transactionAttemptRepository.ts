@@ -20,6 +20,7 @@ interface PrismaRow {
   rawTx: string | null;
   txHash: string | null;
   lastError: string | null;
+  verifyData: string | null;
   failureCode: string | null;
   attemptCount: number;
   firstAttemptedAt: Date | null;
@@ -38,6 +39,7 @@ function toRecord(row: PrismaRow): TransactionAttemptRecord {
     rawTx: (row.rawTx as `0x${string}` | null) ?? null,
     txHash: (row.txHash as `0x${string}` | null) ?? null,
     lastError: row.lastError,
+    verifyData: row.verifyData !== null ? (JSON.parse(row.verifyData, jsonReviver) as unknown) : null,
     failureCode: row.failureCode as TxFailureCode | null,
     attemptCount: row.attemptCount,
     firstAttemptedAt: row.firstAttemptedAt,
@@ -90,6 +92,9 @@ export class PrismaTransactionAttemptRepository implements TransactionAttemptRep
         ...(patch.rawTx !== undefined && { rawTx: patch.rawTx }),
         ...(patch.txHash !== undefined && { txHash: patch.txHash }),
         ...(patch.lastError !== undefined && { lastError: patch.lastError }),
+        ...(patch.verifyData !== undefined && {
+          verifyData: patch.verifyData === null ? null : JSON.stringify(patch.verifyData, jsonReplacer),
+        }),
         ...(patch.failureCode !== undefined && { failureCode: patch.failureCode }),
         ...(patch.attemptCount !== undefined && { attemptCount: patch.attemptCount }),
         ...(patch.firstAttemptedAt !== undefined && { firstAttemptedAt: patch.firstAttemptedAt }),

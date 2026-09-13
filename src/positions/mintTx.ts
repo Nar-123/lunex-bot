@@ -2,7 +2,7 @@ import { getAddress } from 'viem';
 import type { Address } from 'viem';
 import { Percent, Token } from '@uniswap/sdk-core';
 import { v4Sdk } from '../blockchain/uniswapSdk';
-import { discoverMintedTokenId } from '../blockchain/erc721';
+import { discoverMintedTokenId, MintedTokenIdNotFoundError } from '../blockchain/erc721';
 import { getExecutorAddress } from '../blockchain/walletClient';
 import { config } from '../config';
 import type { TxSafetyDeps } from '../execution/types';
@@ -139,7 +139,23 @@ export function buildMintDeps(
       try {
         tokenId = await discoverTokenId(confirmedTxHash, positionManagerAddress, wallet);
       } catch (err) {
-        return { ok: false, reason: `could not discover minted tokenId: ${err instanceof Error ? err.message : String(err)}` };
+        // C2 fix: this runs AFTER waitForReceipt already confirmed the mint
+        // mined successfully -- by construction, funds may already be
+        // on-chain. Only a `MintedTokenIdNotFoundError` is a DEFINITIVE
+        // fact (the mint's own confirmed receipt genuinely has no
+        // Transfer(0x0->recipient) log for our contract -- the mint
+        // provably did not mint anything). Every other error (RPC
+        // timeout/429/500/connection reset/CALL_EXCEPTION/stale read/etc.)
+        // is a transport failure, NOT proof the mint failed -- it must
+        // propagate so executeCriticalTransaction's outer catch treats it
+        // as ambiguous/resumable, never VERIFICATION_FAILED. Converting a
+        // transient RPC error into a definitive failure here would make
+        // openPosition.ts call markFailed + release capital for a mint
+        // that actually succeeded and is sitting unmonitored on-chain.
+        if (err instanceof MintedTokenIdNotFoundError) {
+          return { ok: false, reason: `could not discover minted tokenId: ${err.message}` };
+        }
+        throw err;
       }
       const positionTokenId = tokenId.toString();
 
@@ -162,6 +178,7 @@ export function buildMintDeps(
         openedAt: null,
         closedAt: null,
         closeReason: null,
+        realizedUsdgRaw: null,
       };
       const live = await livePositionState.getLiveState(probe);
       if (live.liquidity <= 0n) {

@@ -12,6 +12,38 @@ const ERC721_TRANSFER_EVENT = {
   ],
 } as const;
 
+const ERC721_OWNER_OF_ABI = [
+  { type: 'function', name: 'ownerOf', stateMutability: 'view', inputs: [{ name: 'tokenId', type: 'uint256' }], outputs: [{ name: '', type: 'address' }] },
+] as const;
+
+/** Exported so `reconciliation/` can build its own Transfer-log scans against an arbitrary ERC721 contract (the v4 PositionManager) without duplicating the event ABI. */
+export { ERC721_TRANSFER_EVENT };
+
+/**
+ * H5 (reconciliation): reads an ERC721 token's current owner, distinguishing
+ * a genuine "this token does not exist / has been burned" fact (a real
+ * ERC721 revert -- standard `ownerOf` behavior for a nonexistent tokenId)
+ * from a transient RPC/network failure. Returns `null` ONLY for the
+ * former; the latter is rethrown so callers never mistake "couldn't check"
+ * for "confirmed gone."
+ */
+export async function ownerOfNft(contractAddress: Address, tokenId: bigint): Promise<Address | null> {
+  const client = getPublicClient();
+  try {
+    return await client.readContract({ address: contractAddress, abi: ERC721_OWNER_OF_ABI, functionName: 'ownerOf', args: [tokenId] });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // viem wraps a contract revert in ContractFunctionExecutionError/
+    // ContractFunctionRevertedError -- "revert"/"nonexistent token" is the
+    // reliable substring signal, same conservative philosophy as
+    // execution/viemTxSteps.ts's isDefinitiveSimulationRevert (H2).
+    if (message.toLowerCase().includes('revert')) {
+      return null;
+    }
+    throw err;
+  }
+}
+
 export class MintedTokenIdNotFoundError extends Error {
   constructor(txHash: `0x${string}`, contractAddress: Address, recipient: Address) {
     super(`No ERC721 Transfer(from=0x0, to=${recipient}) event found in receipt logs for tx ${txHash} at contract ${contractAddress}`);

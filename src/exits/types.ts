@@ -1,13 +1,54 @@
 /**
- * The four triggers that can actually CLOSE a position (spec section 8,
- * minus LOW_YIELD -- explicitly OFF/not implemented). PNL_PROTECTION is
- * deliberately NOT a member of this type: it never independently closes a
- * position, it only retargets TRAILING_TP's arm threshold (see
- * `resolveExitDecision.ts`'s doc comment for the full reasoning) -- so
- * there is no `ExitTriggerReason` value for it, matching that it can never
- * appear as a `closeReason`.
+ * TIER 3 — every trigger that can CLOSE a position, aligned to Meridian's
+ * exit ladder. Listed in evaluation-priority order (see
+ * `resolveExitDecision.ts`, where that order IS the policy):
+ *
+ *  1. HARD_STOP_LOSS     PnL <= -6%
+ *  2. SAFETY_EXIT        armed at max-drawdown <= -8%, closes on recovery to >= 0%
+ *  3. OVEREXTENDED       Bollinger %B >= 1.0 AND PnL > 0
+ *  4. TRAILING_TP        arm +6%, close -3pp from peak after 15s confirm
+ *  5. HARD_TP            PnL >= +25%
+ *  6. OOR_PROFIT         out of range AND PnL >= +2%
+ *  7. LOW_YIELD          age >= 30min AND fee yield below floor
+ *  8. OOR_TIMEOUT        out of range past the 30-minute grace window
+ *  8. INFRA_SAFETY_EXIT  infrastructure fault (unreadable metrics / impossible price)
+ *
+ * Two renames from the pre-Tier-3 set, both deliberate:
+ *  - `OOR` -> `OOR_TIMEOUT`, to distinguish the unprofitable grace-window
+ *    exit from the new profitable `OOR_PROFIT` one.
+ *  - `SAFETY_EXIT` now means Meridian's DRAWDOWN-RECOVERY rule; Lunex's
+ *    original infrastructure-fault exit is `INFRA_SAFETY_EXIT`. They are
+ *    genuinely different things (a trading rule vs. a data-integrity
+ *    guard) and collapsing them would make an operator unable to tell a
+ *    banked recovery from an RPC outage in the close history.
+ *
+ * `PNL_PROTECTION` is gone entirely: it was the same -8%/0% numbers
+ * expressed only as a retarget of Trailing TP's arm threshold, and is
+ * fully superseded by `SAFETY_EXIT`, which closes outright.
  */
-export type ExitTriggerReason = 'SAFETY_EXIT' | 'HARD_STOP_LOSS' | 'TRAILING_TP' | 'OOR';
+export type ExitTriggerReason =
+  | 'HARD_STOP_LOSS'
+  | 'SAFETY_EXIT'
+  | 'OVEREXTENDED'
+  | 'TRAILING_TP'
+  | 'HARD_TP'
+  | 'OOR_PROFIT'
+  | 'LOW_YIELD'
+  | 'OOR_TIMEOUT'
+  | 'INFRA_SAFETY_EXIT';
+
+/** Every reason, in evaluation order -- exported so reporting surfaces (API/Telegram/UI) can render a complete, ordered legend without re-declaring the list. */
+export const EXIT_TRIGGER_REASONS: readonly ExitTriggerReason[] = [
+  'HARD_STOP_LOSS',
+  'SAFETY_EXIT',
+  'OVEREXTENDED',
+  'TRAILING_TP',
+  'HARD_TP',
+  'OOR_PROFIT',
+  'LOW_YIELD',
+  'OOR_TIMEOUT',
+  'INFRA_SAFETY_EXIT',
+];
 
 export type ExitDecision = { shouldClose: false } | { shouldClose: true; reason: ExitTriggerReason };
 
@@ -29,9 +70,39 @@ export type ExitDecision = { shouldClose: false } | { shouldClose: true; reason:
  */
 export interface ExitRules {
   HARD_STOP_LOSS_PCT: number;
-  PNL_PROTECTION: { TRIGGER_PNL_PCT: number; NEW_TP_TARGET_PCT: number };
-  TRAILING_TP: { TRIGGER_PEAK_PNL_PCT: number; DRAWDOWN_FROM_PEAK_PCT: number; CONFIRM_WINDOW_MS: number };
+  SAFETY_EXIT: { ENABLED: boolean; TRIGGER_PCT: number; TARGET_PCT: number };
+  OVEREXTENDED: { ENABLED: boolean; BB_PERCENT_B: number };
+  TRAILING_TP: { ENABLED: boolean; TRIGGER_PEAK_PNL_PCT: number; DRAWDOWN_FROM_PEAK_PCT: number; CONFIRM_WINDOW_MS: number };
+  HARD_TAKE_PROFIT_PCT: number;
+  OOR_PROFIT: { ENABLED: boolean; MIN_PNL_PCT: number };
+  LOW_YIELD: { ENABLED: boolean; MIN_AGE_MS: number; MIN_FEE_YIELD_PCT: number };
   OOR: { GRACE_WINDOW_MS: number };
+}
+
+/**
+ * TIER 3 — the live readings one position's exit decision is made from.
+ * EVERY field is nullable on purpose: "infrastructure failure is not a
+ * trading signal" is enforced by type, not by convention. A rule whose
+ * inputs are null simply does not fire; nothing is ever defaulted to a
+ * placeholder number that could be mistaken for a real reading.
+ *
+ * (Pre-Tier-3 this was two bare `pnlPct: number` / `inRange: boolean`
+ * parameters with `?? 0` / `?? true` placeholders supplied by the
+ * orchestrator -- safe only because of a subtle argument about which
+ * branch could be reached, and actively wrong for the OOR timer, which
+ * the `?? true` placeholder silently RESET on every failed metrics read.)
+ */
+export interface ExitMetricsSnapshot {
+  /** Position value PnL as a fraction (0.06 = +6%). null = this tick's metrics read failed. */
+  pnlPct: number | null;
+  /** null = unknown this tick; the OOR timer is then left exactly as it was, never advanced or cleared. */
+  inRange: boolean | null;
+  /** Cumulative realised fee yield (fees / entry value) as a fraction. null = unknown. */
+  yieldPct: number | null;
+  /** Bollinger %B of the pool price, 20 x 5-minute closes, SMA +/- 2 sigma. null = not enough history yet, or unavailable. */
+  bbPercentB: number | null;
+  /** Milliseconds since the position was opened. null = `openedAt` unknown (never for a genuinely ACTIVE position). */
+  positionAgeMs: number | null;
 }
 
 /**
@@ -43,14 +114,29 @@ export interface ExitRules {
  * reading it from and writing it back to real storage.
  */
 export interface ExitStateFields {
-  /** Highest PNL % ever observed since Trailing TP armed; null = not yet armed. */
+  /** Highest PNL % ever observed since Trailing TP armed; null = not yet armed. Only ever moves UP. */
   trailingPeakPnlPct: number | null;
-  /** When the current drawdown-from-peak breach was first observed; null = no breach in progress. */
+  /** When the current drawdown-from-peak breach was first observed; null = no breach in progress (pending trailing exit cancelled). */
   drawdownConfirmStartedAt: Date | null;
   /** When the position first went out of range; null = currently in range (or never left). */
   oorStartedAt: Date | null;
-  /** When PNL first hit <= PNL_PROTECTION.TRIGGER_PNL_PCT; null = never (sticky once set -- never cleared by recovery). */
-  pnlProtectionActivatedAt: Date | null;
+  /**
+   * TIER 3 — when Meridian's Safety Exit ARMED, i.e. when this position's
+   * maximum drawdown first reached `SAFETY_EXIT.TRIGGER_PCT` (-8%). Sticky:
+   * never cleared, so a later dip back below 0% cannot disarm it, and a
+   * restart cannot forget it. (Renamed from `pnlProtectionActivatedAt`;
+   * the arming condition is materially identical, so existing rows carry
+   * over unchanged -- see the migration.)
+   */
+  safetyExitArmedAt: Date | null;
+  /**
+   * TIER 3 — the most NEGATIVE PnL ever observed for this position
+   * (maximum drawdown), as a fraction. null = no PnL reading yet. Only
+   * ever moves down. This is what Safety Exit arms against, so that a
+   * position which dipped to -9% and bounced back to -1% between two
+   * polls still arms rather than silently missing the trigger.
+   */
+  maxDrawdownPnlPct: number | null;
   /** When this position's live metrics first failed to read; null = currently reading fine (or never failed). */
   metricsFailureSince: Date | null;
   /** How many times the exit SWAP sub-transaction (not remove-liquidity) has been found FAILED -- drives the swap's idempotencyKey suffix. */
@@ -79,7 +165,8 @@ export const EMPTY_EXIT_STATE: ExitStateFields = {
   trailingPeakPnlPct: null,
   drawdownConfirmStartedAt: null,
   oorStartedAt: null,
-  pnlProtectionActivatedAt: null,
+  safetyExitArmedAt: null,
+  maxDrawdownPnlPct: null,
   metricsFailureSince: null,
   swapAttemptCount: 0,
   swapUsdgBalanceBeforeRaw: null,

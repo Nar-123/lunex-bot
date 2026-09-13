@@ -1,6 +1,6 @@
 import type { Address } from 'viem';
 import { config } from '../config';
-import { readErc20Balance } from '../blockchain/erc20';
+import { readErc20Balance, readErc20TransfersTo } from '../blockchain/erc20';
 import { getExecutorAddress } from '../blockchain/walletClient';
 import type { TxSafetyDeps } from '../execution/types';
 import * as txSteps from '../execution/viemTxSteps';
@@ -9,6 +9,8 @@ import type { ExitStateRepository } from './types';
 
 export interface SwapVerifyData {
   usdgIncreaseRaw: bigint;
+  /** VALIDATION PHASE: USDG the swap's own confirmed receipt paid the wallet (realized-PnL measurement -- exact, immune to concurrent wallet activity, unlike the balance delta above which stays as the safety check). */
+  usdgProceedsRaw: bigint;
 }
 
 /**
@@ -20,8 +22,17 @@ export interface SwapVerifyData {
  * the caller regardless of this function's result -- this only decides
  * whether it's allowed to BLOCK the swap.
  */
-export function shouldBlockForPriceImpact(priceImpactPct: number, enabled: boolean, maxExitImpactPct: number): boolean {
-  return enabled && priceImpactPct > maxExitImpactPct;
+export function shouldBlockForPriceImpact(priceImpactPct: number | null, enabled: boolean, maxExitImpactPct: number): boolean {
+  if (!enabled) return false;
+  // TIER 3: an UNVERIFIABLE impact (provider omitted the field, or it
+  // arrived non-finite) blocks. When the gate is on, "we could not measure
+  // the cost of leaving" must never resolve to "the cost of leaving is
+  // fine" -- that is the one direction this check exists to prevent. The
+  // caller treats a block as a deferral (PENDING, resumable), not a
+  // definitive failure, so an intermittently-quiet provider costs a tick,
+  // never the position.
+  if (priceImpactPct === null) return true;
+  return priceImpactPct > maxExitImpactPct;
 }
 
 /**
@@ -60,6 +71,8 @@ export function shouldBlockForPriceImpact(priceImpactPct: number, enabled: boole
 export interface BuildSwapDepsOptions {
   /** Injectable for tests -- defaults to the real on-chain ERC20 read (same reasoning as `capitalSnapshotProvider.ts`'s `readBalance` default). */
   readBalance?: (tokenAddress: Address, walletAddress: Address) => Promise<bigint>;
+  /** Injectable for tests -- defaults to the real receipt-log decoder (`blockchain/erc20.ts`'s `readErc20TransfersTo`). */
+  readUsdgTransfersTo?: (txHash: `0x${string}`, tokenAddress: Address, walletAddress: Address) => Promise<bigint>;
   /** Injectable for tests -- defaults to the real configured executor wallet. */
   walletAddress?: Address;
 }
@@ -73,6 +86,7 @@ export function buildSwapDeps(
   options: BuildSwapDepsOptions = {},
 ): TxSafetyDeps<SwapVerifyData> {
   const readBalance = options.readBalance ?? readErc20Balance;
+  const readUsdgTransfersTo = options.readUsdgTransfersTo ?? readErc20TransfersTo;
   const usdgAddress = config.quoteAsset.ADDRESS as Address;
   const wallet = options.walletAddress ?? getExecutorAddress();
 
@@ -95,7 +109,7 @@ export function buildSwapDeps(
     broadcastRaw: txSteps.broadcastRawTx,
     waitForReceipt: txSteps.waitForTxReceipt,
     getReceiptIfAvailable: txSteps.getReceiptIfAvailable,
-    verifyOnChain: async () => {
+    verifyOnChain: async (confirmedTxHash) => {
       const exitState = await exitStates.getOrCreate(positionId);
       if (exitState.swapUsdgBalanceBeforeRaw === null) {
         return { ok: false, reason: 'no swapUsdgBalanceBeforeRaw baseline recorded -- cannot verify (invariant violated: buildTransaction should have set this)' };
@@ -114,13 +128,27 @@ export function buildSwapDeps(
           reason: `USDG balance increased by only ${usdgIncreaseRaw} (required > 0${minIncrease > 0n ? ` and >= ${minIncrease}` : ''})`,
         };
       }
-      return { ok: true, data: { usdgIncreaseRaw } };
+      // VALIDATION PHASE: realized proceeds from THIS swap's own confirmed
+      // receipt. Same resumable-on-read-failure discipline as the
+      // remove-liquidity leg: the swap is already proven by the balance
+      // check above; a measurement read failure must never convert that
+      // into a definitive failure. `resumeVerified` replays the decoder
+      // against the same hash on resume.
+      let usdgProceedsRaw: bigint;
+      try {
+        usdgProceedsRaw = await readUsdgTransfersTo(confirmedTxHash, usdgAddress, wallet);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { ok: false, reason: `swap verified but proceeds could not be measured (resumable): ${message}` };
+      }
+      return { ok: true, data: { usdgIncreaseRaw, usdgProceedsRaw } };
     },
   };
 }
 
 /** Used by `executeExit.ts` (which now owns the price-impact log/block decision, made before this file's `buildTransaction` ever runs). */
-export function defaultLogImpact(positionId: string, priceImpactPct: number): void {
+export function defaultLogImpact(positionId: string, priceImpactPct: number | null): void {
   // Temporary: replaced by the shared logger once a logging module exists (same caveat as every other not-yet-centralized log call in this project).
-  console.info(`[exits] position ${positionId} exit swap price impact: ${(priceImpactPct * 100).toFixed(3)}%`);
+  const impactText = priceImpactPct === null ? 'UNAVAILABLE (provider did not report it)' : `${(priceImpactPct * 100).toFixed(3)}%`;
+  console.info(`[exits] position ${positionId} exit swap price impact: ${impactText}`);
 }

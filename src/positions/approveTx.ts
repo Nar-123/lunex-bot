@@ -42,9 +42,9 @@ export function buildApproveDeps(amountInRaw: bigint, options: BuildApproveDepsO
   const positionManagerAddress = config.uniswap.v4.positionManager as Address;
 
   return {
-    buildTransaction: async () => {
+    buildTransaction: () => {
       const { to, data } = encodeErc20Approve(usdgAddress, positionManagerAddress, amountInRaw);
-      return { to, data, value: 0n };
+      return Promise.resolve({ to, data, value: 0n });
     },
     simulate: txSteps.simulateTx,
     estimateGas: txSteps.estimateGasForTx,

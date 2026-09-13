@@ -27,6 +27,8 @@ const BASE_VALID_ENV: Record<string, string> = {
   AUTH_ADMIN_USERNAME: 'test-admin',
   AUTH_ADMIN_PASSWORD_HASH: '$2b$12$' + 'a'.repeat(53),
   JWT_SECRET: 'test-jwt-secret-not-for-real-use',
+  // C5 fix: UNISWAP_API_KEY is now required (env.ts).
+  UNISWAP_API_KEY: 'test-uniswap-trading-api-key-not-for-real-use',
 };
 
 function discoverBooleanFields(): string[] {

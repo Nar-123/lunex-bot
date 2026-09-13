@@ -138,6 +138,25 @@ describe('executeCriticalTransaction -- ambiguous failures never declare FAILED,
     const record = await repo.find('k7');
     expect(record?.status).toBe('SENT');
   });
+
+  it('C2 regression: a throw from verifyOnChain (e.g. mintTx.ts propagating an RPC error) leaves status at CONFIRMED, resumable, NEVER FAILED', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    const deps = makeDeps({ verifyOnChain: vi.fn(async () => { throw new Error('RPC timeout'); }) });
+    const result = await executeCriticalTransaction('k12', 'p', deps, repo);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.resumable).toBe(true);
+      expect(result.attempt.status).toBe('CONFIRMED'); // the receipt already confirmed on-chain success -- never downgraded to FAILED
+      expect(result.attempt.failureCode).toBeNull(); // no VERIFICATION_FAILED classification for a transport error
+    }
+
+    // Resuming with a healthy verifyOnChain must succeed without re-broadcasting.
+    const healthyDeps = makeDeps();
+    const resumed = await executeCriticalTransaction('k12', 'p', healthyDeps, repo);
+    expect(resumed.ok).toBe(true);
+    expect(healthyDeps.broadcastRaw).not.toHaveBeenCalled();
+  });
 });
 
 describe('executeCriticalTransaction -- idempotency and resume', () => {
@@ -345,6 +364,63 @@ describe('executeCriticalTransaction -- broadcast-time classification (determini
       expect(result.attempt.status).toBe('SIGNED');
     }
   });
+
+  describe('H3 regression: an AMBIGUOUS broadcast error checks for a receipt before giving up the tick', () => {
+    it('broadcast throws an unrecognized error but a receipt IS found under our own hash -- recognized as mined, proceeds to VERIFIED', async () => {
+      const repo = new InMemoryTransactionAttemptRepository();
+      const deps = makeDeps({
+        broadcastRaw: vi.fn(async () => {
+          throw new Error('502 Bad Gateway');
+        }),
+        getReceiptIfAvailable: vi.fn(async () => ({ status: 'success' as const, blockNumber: 99n })),
+      });
+
+      const result = await executeCriticalTransaction('h3-1', 'p', deps, repo);
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.attempt.status).toBe('VERIFIED');
+      expect(deps.getReceiptIfAvailable).toHaveBeenCalledTimes(1);
+    });
+
+    it('broadcast throws an unrecognized error and NO receipt is found -- stays resumable, never FAILED', async () => {
+      const repo = new InMemoryTransactionAttemptRepository();
+      const deps = makeDeps({
+        broadcastRaw: vi.fn(async () => {
+          throw new Error('502 Bad Gateway');
+        }),
+        getReceiptIfAvailable: vi.fn(async () => null),
+      });
+
+      const result = await executeCriticalTransaction('h3-2', 'p', deps, repo);
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.resumable).toBe(true);
+        expect(result.attempt.status).toBe('SIGNED');
+        expect(result.attempt.status).not.toBe('FAILED');
+      }
+    });
+
+    it('if the receipt check itself throws, stays ambiguous/resumable -- never guesses', async () => {
+      const repo = new InMemoryTransactionAttemptRepository();
+      const deps = makeDeps({
+        broadcastRaw: vi.fn(async () => {
+          throw new Error('502 Bad Gateway');
+        }),
+        getReceiptIfAvailable: vi.fn(async () => {
+          throw new Error('RPC unavailable');
+        }),
+      });
+
+      const result = await executeCriticalTransaction('h3-3', 'p', deps, repo);
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.resumable).toBe(true);
+        expect(result.attempt.status).not.toBe('FAILED');
+      }
+    });
+  });
 });
 
 describe('executeCriticalTransaction -- failureCode is set correctly for every definitive failure', () => {
@@ -442,5 +518,151 @@ describe('executeCriticalTransaction -- stuck-attempt tracking', () => {
 
     expect(third.ok).toBe(true);
     expect(third.attempt.attemptCount).toBe(1); // only the first call actually did work
+  });
+});
+
+describe('executeCriticalTransaction -- C7 regression: executor wallet concurrency', () => {
+  it('two different idempotencyKeys racing concurrently NEVER receive the same nonce', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    let nextNonce = 0;
+    // Simulates a real chain's `eth_getTransactionCount(pending)`: if two
+    // calls were allowed to race unserialized, both could read the SAME
+    // value before either increments it. The executor mutex must prevent
+    // that by serializing the nonce-assignment -> sign -> broadcast span.
+    const sharedGetNonce = vi.fn(async () => {
+      const n = nextNonce;
+      await new Promise((resolve) => setTimeout(resolve, 5)); // widen the race window
+      nextNonce = n + 1;
+      return n;
+    });
+
+    const depsA = makeDeps({ getNonce: sharedGetNonce });
+    const depsB = makeDeps({ getNonce: sharedGetNonce });
+
+    const [resultA, resultB] = await Promise.all([
+      executeCriticalTransaction('nonce-race-A', 'p', depsA, repo),
+      executeCriticalTransaction('nonce-race-B', 'p', depsB, repo),
+    ]);
+
+    expect(resultA.ok).toBe(true);
+    expect(resultB.ok).toBe(true);
+    const attemptA = await repo.find('nonce-race-A');
+    const attemptB = await repo.find('nonce-race-B');
+    expect(attemptA?.nonce).not.toBe(attemptB?.nonce);
+    expect(new Set([attemptA?.nonce, attemptB?.nonce]).size).toBe(2);
+  });
+
+  it('serializes broadcast calls process-wide -- never two broadcasts in flight at once', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    let inFlight = 0;
+    let maxConcurrentInFlight = 0;
+    const trackedBroadcast = vi.fn(async () => {
+      inFlight++;
+      maxConcurrentInFlight = Math.max(maxConcurrentInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+    });
+
+    const depsA = makeDeps({ broadcastRaw: trackedBroadcast });
+    const depsB = makeDeps({ broadcastRaw: trackedBroadcast });
+    const depsC = makeDeps({ broadcastRaw: trackedBroadcast });
+
+    await Promise.all([
+      executeCriticalTransaction('bcast-race-A', 'p', depsA, repo),
+      executeCriticalTransaction('bcast-race-B', 'p', depsB, repo),
+      executeCriticalTransaction('bcast-race-C', 'p', depsC, repo),
+    ]);
+
+    expect(maxConcurrentInFlight).toBe(1); // never more than one holder of the lock at a time
+  });
+});
+
+describe('executeCriticalTransaction -- C1 regression: VERIFIED short-circuit must never return fabricated/undefined data', () => {
+  it('persists verifyData atomically with status VERIFIED on the fresh-verify path', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    const deps = makeDeps();
+    await executeCriticalTransaction('c1-1', 'p', deps, repo);
+
+    const record = await repo.find('c1-1');
+    expect(record?.status).toBe('VERIFIED');
+    expect(record?.verifyData).toEqual({ verified: true });
+  });
+
+  it('CRASH-RECOVERY: process 1 verifies and crashes before markActive; process 2 resumes and gets the REAL data, not undefined', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    const deps = makeDeps();
+
+    // "Process 1": runs the full pipeline through VERIFIED.
+    const first = await executeCriticalTransaction('c1-2', 'deploy:mint', deps, repo);
+    expect(first.ok).toBe(true);
+
+    // "Process 2" (simulated restart): a brand-new call with the SAME key,
+    // same deps, but verifyOnChain must NOT be invoked again -- the cached
+    // verifyData must be returned directly.
+    const verifyOnChainCallsBefore = (deps.verifyOnChain as ReturnType<typeof vi.fn>).mock.calls.length;
+    const resumed = await executeCriticalTransaction('c1-2', 'deploy:mint', deps, repo);
+
+    expect(resumed.ok).toBe(true);
+    if (resumed.ok) {
+      expect(resumed.data).toEqual({ verified: true }); // the historical bug returned `undefined` here
+    }
+    expect((deps.verifyOnChain as ReturnType<typeof vi.fn>).mock.calls.length).toBe(verifyOnChainCallsBefore);
+  });
+
+  it('a VERIFIED attempt with missing verifyData (legacy row) is safely reconstructed via verifyOnChain, never FAILED', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    const deps = makeDeps();
+
+    await executeCriticalTransaction('c1-3', 'p', deps, repo);
+    const attempt = await repo.find('c1-3');
+    if (!attempt) throw new Error('unreachable');
+    // Simulate a pre-migration row: VERIFIED but verifyData was never persisted.
+    await repo.update(attempt.id, { verifyData: null });
+
+    const resumed = await executeCriticalTransaction('c1-3', 'p', deps, repo);
+    expect(resumed.ok).toBe(true);
+    if (resumed.ok) {
+      expect(resumed.data).toEqual({ verified: true }); // reconstructed via a fresh verifyOnChain call
+      expect(resumed.attempt.status).toBe('VERIFIED');
+    }
+    // verifyData is backfilled so subsequent resumes don't need to reconstruct again.
+    const backfilled = await repo.find('c1-3');
+    expect(backfilled?.verifyData).toEqual({ verified: true });
+  });
+
+  it('a VERIFIED attempt with missing verifyData AND a failing reconstruction stays resumable, NEVER FAILED (funds already on-chain)', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    const deps = makeDeps();
+
+    await executeCriticalTransaction('c1-4', 'p', deps, repo);
+    const attempt = await repo.find('c1-4');
+    if (!attempt) throw new Error('unreachable');
+    await repo.update(attempt.id, { verifyData: null });
+
+    const flakyDeps = makeDeps({ verifyOnChain: vi.fn(async () => { throw new Error('RPC timeout'); }) });
+    const resumed = await executeCriticalTransaction('c1-4', 'p', flakyDeps, repo);
+
+    expect(resumed.ok).toBe(false);
+    if (!resumed.ok) {
+      expect(resumed.resumable).toBe(true);
+      expect(resumed.attempt.status).toBe('VERIFIED'); // status is NEVER downgraded -- the op already succeeded on-chain
+    }
+  });
+
+  it('a VERIFIED attempt with neither verifyData nor txHash stays resumable, never crashes, never FAILED', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    const deps = makeDeps();
+
+    await executeCriticalTransaction('c1-5', 'p', deps, repo);
+    const attempt = await repo.find('c1-5');
+    if (!attempt) throw new Error('unreachable');
+    await repo.update(attempt.id, { verifyData: null, txHash: null });
+
+    const resumed = await executeCriticalTransaction('c1-5', 'p', deps, repo);
+    expect(resumed.ok).toBe(false);
+    if (!resumed.ok) {
+      expect(resumed.resumable).toBe(true);
+      expect(resumed.attempt.status).toBe('VERIFIED');
+    }
   });
 });

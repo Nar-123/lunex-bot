@@ -16,13 +16,41 @@ import type { StepResult, TxRequest } from './types';
  * has been handled.
  */
 
+/**
+ * H2 fix: distinguishes a genuine on-chain simulation revert (a
+ * DEFINITIVE fact about this exact transaction, safe to mark
+ * SIMULATION_REJECTED/FAILED) from a transient/ambiguous RPC or transport
+ * failure (timeout, 429, 500, connection reset, provider unavailable, or
+ * literally anything else) -- which must NEVER be treated as a definitive
+ * rejection, only ever resumable. Conservative by design, mirroring
+ * `classifyBroadcastError.ts`'s philosophy exactly: only an unambiguous
+ * on-chain fact is classified as DEFINITIVE, and the single positive
+ * signal used here is the substring "revert" -- the word viem/EVM nodes
+ * use specifically and only for genuine execution reverts ("execution
+ * reverted", "reverted with reason string ...", "reverted with custom
+ * error ..."), never for a network/transport failure. Every other
+ * message, including one this function has never seen before, defaults
+ * to TRANSIENT -- never the other way around.
+ */
+export function isDefinitiveSimulationRevert(message: string): boolean {
+  return message.toLowerCase().includes('revert');
+}
+
 export async function simulateTx(tx: TxRequest): Promise<StepResult> {
   const client = getPublicClient();
   try {
     await client.call({ account: getExecutorAddress(), to: tx.to, data: tx.data, value: tx.value });
     return { ok: true };
   } catch (err) {
-    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    const message = err instanceof Error ? err.message : String(err);
+    if (isDefinitiveSimulationRevert(message)) {
+      return { ok: false, reason: message };
+    }
+    // Transient/ambiguous (RPC timeout, 429, 500, connection reset,
+    // provider unavailable, or anything unrecognized) -- rethrow so
+    // executeCriticalTransaction's outer catch treats this as resumable,
+    // never a definitive SIMULATION_REJECTED.
+    throw err instanceof Error ? err : new Error(message);
   }
 }
 

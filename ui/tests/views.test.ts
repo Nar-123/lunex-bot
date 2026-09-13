@@ -117,33 +117,74 @@ describe('renderHistory', () => {
     expect(renderHistory({ positions: [] })).toMatch(/belum ada posisi/i);
   });
 
-  it('shows token/entry/close info but NEVER a PNL/fee number -- Decision 3, Module 11/12', () => {
+  it('shows an honest dash and the explicit disclosure when the realized PnL was never measured -- Module 11 behaviour unchanged', () => {
     const html = renderHistory({
       positions: [{ id: 'p1', tokenAddress: '0xabc', tokenSymbol: 'MEME', entryUsdgRaw: '1000000000000000000000', closedAt: '2026-01-01T00:00:00Z', closeReason: 'HARD_STOP_LOSS', realizedPnlAvailable: false }],
     });
     expect(html).toContain('MEME');
     expect(html).toContain('HARD_STOP_LOSS');
     expect(html.toLowerCase()).toContain('belum tersedia'); // explicit disclosure
-    expect(html).not.toMatch(/pnl.*[-+]?\d+(\.\d+)?%/i); // no PNL percentage anywhere
+    // the PnL cell renders the honest dash, never a fabricated number
+    expect(html).toContain('<td>-</td>');
+    expect(html).not.toContain('realizedPnlUsdgRaw'); // never leaks raw internals
+  });
+
+  it('VALIDATION PHASE: renders the MEASURED realized PnL with its sign when the server reports it', () => {
+    const loss = renderHistory({
+      positions: [{ id: 'p1', tokenAddress: '0xabc', tokenSymbol: 'MEME', entryUsdgRaw: '1000000000000000000000', closedAt: '2026-01-01T00:00:00Z', closeReason: 'HARD_STOP_LOSS', realizedPnlAvailable: true, realizedPnlUsdgRaw: '-900000000000000000000' }],
+    });
+    expect(loss).toContain('-900.00 USDG');
+    expect(loss).toContain('receipt terkonfirmasi');
+
+    const profit = renderHistory({
+      positions: [{ id: 'p2', tokenAddress: '0xdef', tokenSymbol: 'PEPE', entryUsdgRaw: '100000000000000000000', closedAt: '2026-01-02T00:00:00Z', closeReason: 'HARD_TP', realizedPnlAvailable: true, realizedPnlUsdgRaw: '25000000000000000000' }],
+    });
+    expect(profit).toContain('+25.00 USDG');
+  });
+
+  it('mixed listing: measured rows show numbers, unmeasured rows show dashes -- never the wrong one for the other', () => {
+    const html = renderHistory({
+      positions: [
+        { id: 'p1', tokenAddress: '0xabc', tokenSymbol: 'MEME', entryUsdgRaw: '1000000000000000000000', closedAt: '2026-01-01T00:00:00Z', closeReason: 'LOW_YIELD', realizedPnlAvailable: false },
+        { id: 'p2', tokenAddress: '0xdef', tokenSymbol: 'PEPE', entryUsdgRaw: '100000000000000000000', closedAt: '2026-01-02T00:00:00Z', closeReason: 'HARD_TP', realizedPnlAvailable: true, realizedPnlUsdgRaw: '12340000000000000000' },
+      ],
+    });
+    expect(html).toContain('+12.34 USDG');
+    expect(html).toContain('<td>-</td>');
   });
 });
 
 describe('renderSettingsForm', () => {
-  it('pre-fills all four editable fields with current values and embeds the frozen pnlProtectionTriggerPct as a data attribute', () => {
+  it('pre-fills all four editable fields with the current values and shows the frozen safetyExitTriggerPct read-only', () => {
     const html = renderSettingsForm({
       paused: false,
       positionSizePct: 35,
       maxActivePositions: 3,
-      hardStopLossPct: -15,
-      trailingTpTriggerPct: 5,
-      pnlProtectionTriggerPct: -8,
+      hardStopLossPct: -6,
+      trailingTpTriggerPct: 6,
+      safetyExitTriggerPct: -8,
       updatedAt: '2026-01-01T00:00:00Z',
     });
     expect(html).toContain('value="35"');
     expect(html).toContain('value="3"');
-    expect(html).toContain('value="-15"');
-    expect(html).toContain('value="5"');
-    expect(html).toContain('data-pnl-protection-trigger-pct="-8"');
+    expect(html).toContain('value="-6"'); // TIER 3 default, was -15
+    expect(html).toContain('value="6"'); // TIER 3 default, was 5
+    expect(html).toContain('Safety Exit'); // displayed for context...
+    expect(html).toContain('-8%');
+  });
+
+  it('TIER 3: no longer embeds the threshold as a data attribute -- it feeds no client-side validation any more', () => {
+    const html = renderSettingsForm({
+      paused: false,
+      positionSizePct: 35,
+      maxActivePositions: 3,
+      hardStopLossPct: -6,
+      trailingTpTriggerPct: 6,
+      safetyExitTriggerPct: -8,
+      updatedAt: '2026-01-01T00:00:00Z',
+    });
+    expect(html).not.toContain('data-pnl-protection-trigger-pct');
+    expect(html).not.toContain('data-safety-exit-trigger-pct');
   });
 });
 

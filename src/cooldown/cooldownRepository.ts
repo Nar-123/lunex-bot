@@ -8,6 +8,13 @@ function normalizeAddress(address: string): string {
   return getAddress(address).toLowerCase();
 }
 
+/** Nullable-safe "later of two dates" -- either argument may be absent. */
+function laterOf(a: Date | null, b: Date | null): Date | null {
+  if (!a) return b;
+  if (!b) return a;
+  return a.getTime() >= b.getTime() ? a : b;
+}
+
 /**
  * Real, persistent (never in-memory-only, per the project's storage
  * principles) per-token cooldown tracking. Implements `CooldownChecker`
@@ -28,10 +35,36 @@ export class PrismaCooldownRepository implements CooldownChecker {
     });
   }
 
+  /**
+   * H17 fix: `TokenCooldown`'s own row is written by a SEPARATE call
+   * (`recordExit`, from `composition/exitCycle.ts`) AFTER
+   * `Position.markClosed` already committed -- a crash between the two
+   * (or the position row itself catching up, or a currently-executing
+   * `recordExit` that hasn't landed yet) leaves this row missing/stale
+   * while the position is nonetheless genuinely CLOSED. Introducing a
+   * cross-repository `$transaction` here would mean `exits/` (which
+   * currently has no dependency on `cooldown/` at all -- confirmed by
+   * grep, `recordExit` is only ever called from the composition root)
+   * taking on that dependency, a materially bigger architectural change
+   * than this bug warrants. Instead, this reconstructs the SAME
+   * information deterministically: a CLOSED position's own `closedAt` is
+   * durably persisted by `markClosed` itself, so the cooldown it implies
+   * can always be recomputed from it, independent of whether the
+   * dedicated `TokenCooldown` upsert ever happened. Effective cooldown is
+   * the LATER of whatever the dedicated row says and whatever the most
+   * recent closed position implies -- never weaker than either source
+   * alone.
+   */
   async getCooldownStatus(tokenAddress: string): Promise<CooldownStatus> {
     const address = normalizeAddress(tokenAddress);
-    const record = await this.prisma.tokenCooldown.findUnique({ where: { tokenAddress: address } });
-    return computeCooldownStatus(record?.cooldownEndsAt ?? null);
+    const [record, lastClosed] = await Promise.all([
+      this.prisma.tokenCooldown.findUnique({ where: { tokenAddress: address } }),
+      this.prisma.position.findFirst({ where: { tokenAddress: address, status: 'CLOSED' }, orderBy: { closedAt: 'desc' } }),
+    ]);
+    const recordEndsAt = record?.cooldownEndsAt ?? null;
+    const reconstructedEndsAt = lastClosed?.closedAt ? computeCooldownEndsAt(lastClosed.closedAt) : null;
+    const effectiveEndsAt = laterOf(recordEndsAt, reconstructedEndsAt);
+    return computeCooldownStatus(effectiveEndsAt);
   }
 
   /**

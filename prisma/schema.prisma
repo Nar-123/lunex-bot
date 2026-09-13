@@ -70,6 +70,15 @@ model TransactionAttempt {
   rawTx          String?
   txHash         String?
   lastError      String?
+  /// JSON-encoded verification payload (e.g. mint's {positionTokenId,
+  /// liquidity}), persisted atomically with status VERIFIED. This is what
+  /// makes a VERIFIED attempt's result recoverable after a crash: without
+  /// it, a resumed process that finds status already VERIFIED would have
+  /// no way to hand the caller the data it needs (see
+  /// execution/executeCriticalTransaction.ts's VERIFIED short-circuit).
+  /// Nullable for two reasons: attempts created before this column existed,
+  /// and attempts whose TVerifyData is genuinely `undefined`/void.
+  verifyData     String?
   /// Set only when status is FAILED -- distinguishes WHY: rejected pre-broadcast
   /// (SIMULATION_REJECTED / GAS_UNAFFORDABLE), rejected synchronously by the node
   /// at broadcast time (BROADCAST_REJECTED -- e.g. nonce too low, insufficient
@@ -148,6 +157,26 @@ model Position {
   openedAt       DateTime?
   closedAt       DateTime?
   closeReason    String?
+  /// VALIDATION PHASE: total USDG (raw) this position's exit actually
+  /// returned to the wallet, measured from the CONFIRMED receipts of the
+  /// remove-liquidity and swap transactions (ERC20 Transfer logs to the
+  /// wallet, summed). NULL = not (yet) measured -- honestly unavailable,
+  /// never 0-as-placeholder: a position closed by legacy code, or whose
+  /// receipts could not be decoded, reports no realized number rather
+  /// than a fabricated one. Realized PnL = realizedUsdgRaw - entryUsdgRaw
+  /// (computed at read time in reporting; only the measured proceeds are
+  /// stored). Decimal STRING, same SQLite-overflow reason as entryUsdgRaw.
+  realizedUsdgRaw String?
+  /// C7 concurrency fix: set by `PositionRepository.claimForResume()`'s
+  /// atomic `UPDATE ... WHERE id = ? AND status = ?` compare-and-swap --
+  /// makes "which process/cycle gets to resume this position" a single
+  /// atomic DB operation instead of a racy read-then-act. Also doubles as
+  /// the freshness signal: a claim within the freshness window is refused,
+  /// so a position someone is actively working on right now can't be
+  /// immediately re-claimed by a second concurrent cycle (e.g. the 30-min
+  /// screening cycle's `openPosition()` and the 15s exit cycle's
+  /// OPENING-resume pass both discovering the same brand-new position).
+  resumeClaimedAt DateTime?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -177,13 +206,19 @@ model ExitState {
   /// the moment it's back in range. OOR closes once
   /// `now - this >= EXITS.OOR.GRACE_WINDOW_MS`.
   oorStartedAt DateTime?
-  /// Set ONCE, the first time PNL <= EXITS.PNL_PROTECTION.TRIGGER_PNL_PCT
-  /// (-8%) — never cleared even if PNL later recovers (sticky, per spec:
-  /// "cuma mengubah parameter Trailing TP" is a permanent retarget, not a
-  /// momentary one). Non-null means Trailing TP's arm threshold is
-  /// EXITS.PNL_PROTECTION.NEW_TP_TARGET_PCT (0%) instead of
-  /// EXITS.TRAILING_TP.TRIGGER_PEAK_PNL_PCT (+5%).
-  pnlProtectionActivatedAt DateTime?
+  /// TIER 3 (renamed from pnlProtectionActivatedAt, same arming
+  /// condition so existing rows carry over): set ONCE, the first time this
+  /// position's MAXIMUM DRAWDOWN reached EXITS.SAFETY_EXIT.TRIGGER_PCT
+  /// (-8%). Sticky — never cleared, so a later dip back below the target
+  /// cannot disarm it and a restart cannot forget it. Non-null means the
+  /// position closes as soon as PnL recovers to
+  /// EXITS.SAFETY_EXIT.TARGET_PCT (0%).
+  safetyExitArmedAt DateTime?
+  /// TIER 3: the most negative PnL ever observed for this position, as a
+  /// fraction. Only ever moves down. Safety Exit arms against THIS rather
+  /// than against the current reading, so a position that dips to -9% and
+  /// bounces back to -1% between two 15s polls still arms.
+  maxDrawdownPnlPct Float?
   /// Set on the first tick this position's live metrics fail to read
   /// (PositionMetricsResult.ok === false); cleared on the next successful
   /// read. Safety Exit condition (a) — see EXITS.SAFETY_EXIT in constants.ts.
@@ -222,6 +257,34 @@ model ExitState {
   @@index([drawdownConfirmStartedAt])
 }
 
+/// TIER 3: rolling pool-price history, the data source for Bollinger %B
+/// (monitoring/bollinger.ts) and therefore for the OVEREXTENDED exit.
+///
+/// One row per pool per monitoring tick (~15s), collapsed into 5-minute
+/// "closes" at read time. Persistent rather than in-memory for the same
+/// reason every exit timer is: after a restart the bot must reach the SAME
+/// decision it would have reached without one, and an in-memory window
+/// would report %B unavailable for a full 100 minutes (20 x 5min) every
+/// time the process starts.
+///
+/// Bounded by PriceHistoryProvider.pruneOlderThan, called each exit-cycle
+/// tick -- without it this table grows forever at ~4 rows/min/pool.
+model PoolPriceSample {
+  id         String   @id @default(cuid())
+  /// v4 pool id (bytes32 hex) -- keyed by POOL, not by position: several
+  /// positions can share a pool and the price series belongs to the pool.
+  poolId     String
+  /// USDG per TOKEN, as a decimal STRING. Not Float: SQLite's REAL is
+  /// binary floating point and silently perturbs the last digits on
+  /// round-trip; a string round-trips exactly (same reasoning as
+  /// Position.entryUsdgRaw, different underlying cause).
+  price      String
+  observedAt DateTime
+
+  @@index([poolId, observedAt])
+  @@index([observedAt])
+}
+
 /// Live, operator-editable parameters (Module 10) -- singleton row (`id`
 /// always "singleton", exactly one bot instance). Defaults below match
 /// today's frozen `config.rules.*` constants exactly, so behavior is
@@ -240,16 +303,16 @@ model BotSettings {
   positionSizePct      Float    @default(0.35)
   /// Replaces CAPITAL.MAX_ACTIVE_POSITIONS (3).
   maxActivePositions   Int      @default(3)
-  /// Fraction, always negative -- replaces EXITS.HARD_STOP_LOSS_PCT (-0.15).
-  /// Cross-validated at write time against the frozen
-  /// EXITS.PNL_PROTECTION.TRIGGER_PNL_PCT (-0.08) -- see
-  /// settings/validateSettingsPatch.ts -- so a PATCH can never silently
-  /// defeat PNL Protection by making Hard Stop Loss fire first.
-  hardStopLossPct      Float    @default(-0.15)
-  /// Fraction, always positive -- replaces EXITS.TRAILING_TP.TRIGGER_PEAK_PNL_PCT
-  /// (0.05). Only takes effect for a position while PNL Protection has NOT
-  /// activated for it -- once activated, resolveExitDecision always uses
-  /// the frozen 0% target instead, regardless of this value.
-  trailingTpTriggerPct Float    @default(0.05)
+  /// Fraction, always negative -- replaces EXITS.HARD_STOP_LOSS_PCT.
+  /// TIER 3: default -0.15 -> -0.06, Meridian's measured stop. No longer
+  /// cross-validated against the Safety Exit trigger: under the Meridian
+  /// ladder the stop is deliberately TIGHTER than the -8% arming point
+  /// and wins outright when both are true (see resolveExitDecision.ts),
+  /// so the old "must be looser than -8%" rule encoded a policy that no
+  /// longer exists.
+  hardStopLossPct      Float    @default(-0.06)
+  /// Fraction, always positive -- replaces EXITS.TRAILING_TP.TRIGGER_PEAK_PNL_PCT.
+  /// TIER 3: default 0.05 -> 0.06, Meridian's measured trailing arm.
+  trailingTpTriggerPct Float    @default(0.06)
   updatedAt            DateTime @updatedAt
 }

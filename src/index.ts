@@ -39,7 +39,7 @@ async function main(): Promise<void> {
       .then((bot) => {
         telegramBot = bot;
       })
-      .catch((err) => {
+      .catch((err: unknown) => {
         deps.logger.error('telegram_bot_start_failed', { message: err instanceof Error ? err.message : String(err) });
       });
   } else {
@@ -63,7 +63,10 @@ async function main(): Promise<void> {
     // harmless to call even if the bot already started (or was disabled
     // entirely) -- it only matters if `loginWithRetry` is still looping.
     const closeHttpServer = new Promise<void>((resolve, reject) => {
-      httpServer.close((err) => (err ? reject(err) : resolve()));
+      httpServer.close((err) => {
+        if (err) reject(err);
+        else resolve();
+      });
     });
     telegramAbortController.abort();
     const closeTelegramBot = telegramBot ? telegramBot.stop() : Promise.resolve();
@@ -103,7 +106,7 @@ async function main(): Promise<void> {
   });
 }
 
-main().catch((err) => {
+main().catch((err: unknown) => {
   // Not routed through the structured logger -- if construction itself
   // failed (e.g. bad config), the logger may not exist yet either.
   console.error('[lunex-bot] fatal startup error:', err);

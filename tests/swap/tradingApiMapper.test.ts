@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  parseApprovalResponse,
   parseQuoteResponse,
   parseSwapResponse,
   TradingApiMappingError,
@@ -7,27 +8,35 @@ import {
   TradingApiUnsupportedRoutingError,
 } from '../../src/swap/tradingApiMapper';
 
+/**
+ * C5 fix: this fixture now matches the CONFIRMED real API shape (fetched
+ * directly from the live OpenAPI spec at
+ * https://trade-api.gateway.uniswap.org/v1/api.json), not an assumption --
+ * `priceImpact` is a NUMBER, `permitData` nests INSIDE `quote` (not at the
+ * top level), and there is no `allowanceTarget` field anywhere in the
+ * response (see `parseApprovalResponse`'s tests below for the real
+ * mechanism, `POST /check_approval`).
+ */
 describe('parseQuoteResponse', () => {
   const validBody = {
     routing: 'CLASSIC',
-    permitData: null,
-    allowanceTarget: '0x3333333333333333333333333333333333333333',
     quote: {
       chainId: 4663,
       input: { amount: '500' },
       output: { amount: '490' },
-      priceImpact: '0.42',
+      priceImpact: 0.42,
+      permitData: null,
     },
   };
 
-  it('maps a well-formed CLASSIC-routing response correctly, including converting priceImpact from a percentage string to a fraction', () => {
+  it('maps a well-formed CLASSIC-routing response correctly, including converting priceImpact from a percentage NUMBER to a fraction, and carries the raw quote object through as providerQuote', () => {
     const quote = parseQuoteResponse(validBody, 500n);
     expect(quote).toEqual({
       amountInRaw: 500n,
       expectedAmountOutRaw: 490n,
       minOutputAmountRaw: 0n,
       priceImpactPct: 0.0042,
-      allowanceTarget: '0x3333333333333333333333333333333333333333',
+      providerQuote: validBody.quote,
     });
   });
 
@@ -35,18 +44,27 @@ describe('parseQuoteResponse', () => {
     expect(() => parseQuoteResponse({ ...validBody, routing }, 500n)).not.toThrow();
   });
 
-  it('allowanceTarget is null when the response does not carry one', () => {
-    const { allowanceTarget, ...withoutTarget } = validBody;
-    void allowanceTarget;
-    const quote = parseQuoteResponse(withoutTarget, 500n);
-    expect(quote.allowanceTarget).toBeNull();
-  });
-
-  it('defaults priceImpactPct to 0 when the field is absent (never throws for a missing optional field)', () => {
+  it('TIER 3: an ABSENT priceImpact maps to null, NOT to 0 -- never throws, but never invents the most permissive possible reading either', () => {
+    // Supersedes the pre-TIER-3 `-> 0` default. `priceImpact` is optional
+    // in the real API, and now that the exit gate genuinely blocks on
+    // impact, "the provider declined to tell us" defaulting to zero would
+    // have been the single most dangerous value to pick. `null` means
+    // UNVERIFIED and the gate defers on it (proven in executeExit.test.ts).
     const { priceImpact, ...withoutImpact } = validBody.quote;
     void priceImpact;
     const quote = parseQuoteResponse({ ...validBody, quote: withoutImpact }, 500n);
-    expect(quote.priceImpactPct).toBe(0);
+    expect(quote.priceImpactPct).toBeNull();
+  });
+
+  it('TIER 3: a non-finite priceImpact (NaN/Infinity) is REJECTED loudly at the schema, never passed through as a number', () => {
+    // Verified empirically rather than assumed: the zod `number()` schema
+    // rejects both before the mapping code is even reached, so these
+    // surface as a TradingApiMappingError (a loud, definitive rejection)
+    // rather than as a silent value. The `Number.isFinite` guard further
+    // down `parseQuoteResponse` is defence-in-depth behind this.
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => parseQuoteResponse({ ...validBody, quote: { ...validBody.quote, priceImpact: bad } }, 500n)).toThrow(TradingApiMappingError);
+    }
   });
 
   it('throws TradingApiMappingError when the response does not match the expected shape at all', () => {
@@ -59,6 +77,11 @@ describe('parseQuoteResponse', () => {
 
   it('throws when output.amount is not a valid integer string', () => {
     const bad = { ...validBody, quote: { ...validBody.quote, output: { amount: 'not-a-number' } } };
+    expect(() => parseQuoteResponse(bad, 500n)).toThrow(TradingApiMappingError);
+  });
+
+  it('rejects a priceImpact sent as a STRING (the old, wrong assumed shape) -- proves the schema genuinely enforces the confirmed number type', () => {
+    const bad = { ...validBody, quote: { ...validBody.quote, priceImpact: '0.42' } };
     expect(() => parseQuoteResponse(bad, 500n)).toThrow(TradingApiMappingError);
   });
 
@@ -87,24 +110,25 @@ describe('parseQuoteResponse', () => {
   });
 
   describe('Permit2 opt-out verification (never falls back to guessing/signing if the API still wants a permit)', () => {
-    it('accepts a response with permitData explicitly null', () => {
-      expect(() => parseQuoteResponse({ ...validBody, permitData: null }, 500n)).not.toThrow();
+    it('accepts a response with quote.permitData explicitly null', () => {
+      expect(() => parseQuoteResponse({ ...validBody, quote: { ...validBody.quote, permitData: null } }, 500n)).not.toThrow();
     });
 
-    it('accepts a response that omits permitData entirely', () => {
-      const { permitData, ...withoutPermit } = validBody;
+    it('accepts a response that omits quote.permitData entirely', () => {
+      const { permitData, ...withoutPermit } = validBody.quote;
       void permitData;
-      expect(() => parseQuoteResponse(withoutPermit, 500n)).not.toThrow();
+      expect(() => parseQuoteResponse({ ...validBody, quote: withoutPermit }, 500n)).not.toThrow();
     });
 
-    it('throws TradingApiPermitRequiredError when the API still returns non-null permitData despite the opt-out request', () => {
-      expect(() => parseQuoteResponse({ ...validBody, permitData: { some: 'eip712-payload' } }, 500n)).toThrow(TradingApiPermitRequiredError);
+    it('throws TradingApiPermitRequiredError when the API still returns non-null quote.permitData despite the opt-out request', () => {
+      const withPermit = { ...validBody, quote: { ...validBody.quote, permitData: { some: 'eip712-payload' } } };
+      expect(() => parseQuoteResponse(withPermit, 500n)).toThrow(TradingApiPermitRequiredError);
     });
 
     it('does not silently attempt EIP-712 signing or otherwise proceed when permitData is present -- confirmed by the throw itself carrying no signed data', () => {
       let caught: unknown;
       try {
-        parseQuoteResponse({ ...validBody, permitData: {} }, 500n);
+        parseQuoteResponse({ ...validBody, quote: { ...validBody.quote, permitData: {} } }, 500n);
       } catch (err) {
         caught = err;
       }
@@ -144,5 +168,33 @@ describe('parseSwapResponse', () => {
 
   it('throws TradingApiMappingError when the response does not match the expected shape', () => {
     expect(() => parseSwapResponse({ notASwap: true }, 500n, 0n)).toThrow(TradingApiMappingError);
+  });
+});
+
+describe('parseApprovalResponse -- C5: the real POST /check_approval mechanism replacing the nonexistent allowanceTarget field', () => {
+  it('reports no approval needed when `approval` is null', () => {
+    expect(parseApprovalResponse({ approval: null })).toEqual({ needsApproval: false, spender: null });
+  });
+
+  it('reports no approval needed when `approval` is omitted entirely', () => {
+    expect(parseApprovalResponse({})).toEqual({ needsApproval: false, spender: null });
+  });
+
+  it('decodes the spender from real ERC20 approve() calldata when approval IS needed', () => {
+    const spender = '0x5555555555555555555555555555555555555555';
+    const data = `0x095ea7b3000000000000000000000000${spender.slice(2)}${'f'.repeat(64)}`;
+    const result = parseApprovalResponse({ approval: { to: '0x0000000000000000000000000000000000000002', data } });
+    expect(result.needsApproval).toBe(true);
+    expect(result.spender?.toLowerCase()).toBe(spender.toLowerCase());
+  });
+
+  it('throws TradingApiMappingError when approval.data cannot be decoded as ERC20 approve()', () => {
+    expect(() => parseApprovalResponse({ approval: { to: '0x0000000000000000000000000000000000000002', data: '0xdeadbeef' } })).toThrow(
+      TradingApiMappingError,
+    );
+  });
+
+  it('throws TradingApiMappingError when the response does not match the expected shape', () => {
+    expect(() => parseApprovalResponse({ approval: { to: 123 } })).toThrow(TradingApiMappingError);
   });
 });

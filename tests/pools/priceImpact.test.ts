@@ -82,29 +82,59 @@ describe('estimateExitPriceImpact', () => {
     expect(result.ok).toBe(false);
   });
 
-  it('never under-estimates impact when the fetched tick window is too narrow -- verified: the SDK treats unfetched regions as zero liquidity, so this fails safe (high impact, rejected) rather than silently passing', async () => {
-    const tinyLiquidity = 1n; // a window far too narrow for a 1000-USDG-equivalent swap
-    const narrowState: V4PoolStateSnapshot = {
-      sqrtPriceX96: BigInt(SQRT_PRICE_X96_AT_TICK_0),
-      liquidity: tinyLiquidity,
-      tickCurrent: 0,
-      ticks: [
-        { index: -TICK_SPACING, liquidityNet: tinyLiquidity, liquidityGross: tinyLiquidity },
-        { index: TICK_SPACING, liquidityNet: -tinyLiquidity, liquidityGross: tinyLiquidity },
-      ],
-    };
-    const result = await estimateExitPriceImpact(key, narrowState, TOKEN, USDG, POSITION_SIZE_USDG_RAW);
-    // This does NOT throw / come back ok:false -- the swap math treats the
-    // region beyond the provided ticks as having no liquidity at all,
-    // which pushes the computed impact toward 100% rather than toward 0%.
-    // Confirmed empirically: this is the safe failure direction (a pool a
-    // caller under-fetched data for gets conservatively rejected, never
-    // wrongly accepted) -- so `PoolStateProviderPort` implementations only
-    // need to fetch a "reasonably wide" window, not a provably complete one.
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.passesThreshold).toBe(false);
-      expect(result.priceImpactPct).toBeGreaterThan(0.5);
-    }
+  describe('H7 regression: a GENUINELY truncated (non-zero-net) tick window -- self-describing rejection, never a false low impact', () => {
+    it('a tick list missing its upper boundary (net sum != 0) is rejected with a clear, self-describing reason -- NOT a smoothly-degrading high-impact number', async () => {
+      const liquidity = 10n ** 21n;
+      // A real position spans [-6000, 6000] (current tick 0 is inside it),
+      // but the fetch window only captured the LOWER boundary tick -- the
+      // upper boundary (+6000, which would net this back to zero) fell
+      // outside the window. This is what a GENUINELY truncated fetch
+      // produces -- unlike the old (wrong) fixture this test replaces,
+      // which used a complete, net-zero pair and therefore could never
+      // have exercised real truncation at all.
+      const truncatedState: V4PoolStateSnapshot = {
+        sqrtPriceX96: BigInt(SQRT_PRICE_X96_AT_TICK_0),
+        liquidity,
+        tickCurrent: 0,
+        ticks: [{ index: -6000, liquidityNet: liquidity, liquidityGross: liquidity }],
+      };
+
+      const result = await estimateExitPriceImpact(key, truncatedState, TOKEN, USDG, POSITION_SIZE_USDG_RAW);
+
+      // Never a "pass" (false low impact), and never a wrongly-passing
+      // high-impact rejection with the wrong reason -- a clear,
+      // self-describing truncation diagnosis instead.
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toMatch(/truncated/);
+        expect(result.reason).toMatch(/does not|sums to/);
+      }
+    });
+
+    it('a complete, genuinely net-zero tick list is NOT flagged as truncated (the pre-check does not false-positive on a real, complete window)', async () => {
+      const liquidity = 10n ** 21n;
+      const completeState: V4PoolStateSnapshot = {
+        sqrtPriceX96: BigInt(SQRT_PRICE_X96_AT_TICK_0),
+        liquidity,
+        tickCurrent: 0,
+        ticks: [
+          { index: -6000, liquidityNet: liquidity, liquidityGross: liquidity },
+          { index: 6000, liquidityNet: -liquidity, liquidityGross: liquidity },
+        ],
+      };
+      const result = await estimateExitPriceImpact(key, completeState, TOKEN, USDG, POSITION_SIZE_USDG_RAW);
+      expect(result.ok).toBe(true);
+    });
+  });
+
+  it('C8 regression: a dynamic-fee-sentinel pool (fee=0x800000, with a hook) produces a NEGATIVE simulated impact and is rejected as ok:false -- never treated as a pass', async () => {
+    // A dynamic-fee pool requires a non-zero hooks address (verified: the
+    // SDK's own Pool constructor throws "Dynamic fee pool requires a
+    // hook" otherwise) -- reproduces the exact scenario found in the
+    // audit: fee=0x800000 with any hook produces ~-639% simulated impact.
+    const dynamicFeeKey: V4PoolKey = { ...key, fee: 0x800000, hooks: '0x0000000000000000000000000000000000001000' };
+    const result = await estimateExitPriceImpact(dynamicFeeKey, stateWithLiquidity(10n ** 30n), TOKEN, USDG, POSITION_SIZE_USDG_RAW);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/negative/);
   });
 });

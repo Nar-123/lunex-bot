@@ -50,9 +50,9 @@ export function buildApproveDeps(
   const wallet = options.walletAddress ?? getExecutorAddress();
 
   return {
-    buildTransaction: async () => {
+    buildTransaction: () => {
       const { to, data } = encodeErc20Approve(tokenAddress, spender, amountInRaw);
-      return { to, data, value: 0n };
+      return Promise.resolve({ to, data, value: 0n });
     },
     simulate: txSteps.simulateTx,
     estimateGas: txSteps.estimateGasForTx,

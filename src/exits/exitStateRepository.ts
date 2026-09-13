@@ -8,7 +8,8 @@ interface PrismaRow {
   trailingPeakPnlPct: number | null;
   drawdownConfirmStartedAt: Date | null;
   oorStartedAt: Date | null;
-  pnlProtectionActivatedAt: Date | null;
+  safetyExitArmedAt: Date | null;
+  maxDrawdownPnlPct: number | null;
   metricsFailureSince: Date | null;
   swapAttemptCount: number;
   swapUsdgBalanceBeforeRaw: string | null;
@@ -31,7 +32,8 @@ function toRecord(row: PrismaRow): ExitStateRecord {
     trailingPeakPnlPct: row.trailingPeakPnlPct,
     drawdownConfirmStartedAt: row.drawdownConfirmStartedAt,
     oorStartedAt: row.oorStartedAt,
-    pnlProtectionActivatedAt: row.pnlProtectionActivatedAt,
+    safetyExitArmedAt: row.safetyExitArmedAt,
+    maxDrawdownPnlPct: row.maxDrawdownPnlPct,
     metricsFailureSince: row.metricsFailureSince,
     swapAttemptCount: row.swapAttemptCount,
     swapUsdgBalanceBeforeRaw: fromPrismaBigIntString(row.swapUsdgBalanceBeforeRaw),
