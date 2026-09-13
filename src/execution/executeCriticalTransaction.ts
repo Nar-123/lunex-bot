@@ -314,6 +314,16 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
 
     const verification = await deps.verifyOnChain(txHash);
     if (!verification.ok) {
+      if (verification.resumable === true) {
+        // P1 fix: the confirmed transaction's effect is not in doubt -- only
+        // a read needed to finish verifying it failed. Marking FAILED here
+        // would let callers treat an already-landed transaction as never
+        // having happened (the exit flow would revert a burned LP to
+        // ACTIVE, or retry an already-filled swap). Status stays CONFIRMED,
+        // so the next call with this key skips straight back to this step.
+        attempt = await repo.update(attempt.id, { lastError: verification.reason });
+        return ambiguousFailure(`confirmed on-chain, verification incomplete, resume required: ${verification.reason}`, attempt);
+      }
       attempt = await repo.update(attempt.id, {
         status: 'FAILED',
         failureCode: 'VERIFICATION_FAILED',

@@ -125,6 +125,85 @@ describe('buildSwapDeps -- verifyOnChain requires a genuine USDG increase', () =
   });
 });
 
+describe('buildSwapDeps -- P1: a failed proceeds read after the balance check passed is resumable, never definitive', () => {
+  const HASH = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`;
+  const noopExecutor = (): SwapExecutor => ({ getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn(async () => SWAP_TX) });
+
+  it('returns resumable:true and persists the accepted USDG increase', async () => {
+    const exitStates = new InMemoryExitStateRepository();
+    await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: 0n });
+    const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), noopExecutor(), exitStates, {
+      readBalance: vi.fn(async () => USDG(1050)),
+      readUsdgTransfersTo: vi.fn(async () => { throw new Error('RPC timeout'); }),
+      walletAddress: WALLET,
+    });
+
+    const result = await deps.verifyOnChain(HASH);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.resumable).toBe(true);
+      expect(result.reason).toMatch(/proceeds could not be measured/);
+    }
+    expect((await exitStates.getOrCreate('pos-1')).swapVerifiedUsdgIncreaseRaw).toBe(USDG(50));
+  });
+
+  it('a resumed verify reuses the persisted increase and never re-reads the live balance -- a concurrent USDG outflow cannot falsely fail an already-filled swap', async () => {
+    const exitStates = new InMemoryExitStateRepository();
+    await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: 0n, swapVerifiedUsdgIncreaseRaw: USDG(50) });
+    const readBalance = vi.fn(async () => USDG(600)); // a mint spent 450 USDG between ticks
+    const deps = buildSwapDeps('pos-1', TOKEN, null, noopExecutor(), exitStates, {
+      readBalance,
+      readUsdgTransfersTo: vi.fn(async () => USDG(50)),
+      walletAddress: WALLET,
+    });
+
+    const result = await deps.verifyOnChain(HASH);
+
+    expect(result).toEqual({ ok: true, data: { usdgIncreaseRaw: USDG(50), usdgProceedsRaw: USDG(50) } });
+    expect(readBalance).not.toHaveBeenCalled();
+  });
+
+  it('a failed BALANCE check stays definitive (no resumable flag) and persists nothing', async () => {
+    const exitStates = new InMemoryExitStateRepository();
+    await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: 0n });
+    const readUsdgTransfersTo = vi.fn(async () => USDG(0));
+    const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), noopExecutor(), exitStates, {
+      readBalance: vi.fn(async () => USDG(1000)),
+      readUsdgTransfersTo,
+      walletAddress: WALLET,
+    });
+
+    const result = await deps.verifyOnChain(HASH);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.resumable).toBeUndefined();
+    expect(readUsdgTransfersTo).not.toHaveBeenCalled();
+    expect((await exitStates.getOrCreate('pos-1')).swapVerifiedUsdgIncreaseRaw).toBeNull();
+  });
+
+  it('buildTransaction resets swapVerifiedUsdgIncreaseRaw for every new attempt', async () => {
+    const exitStates = new InMemoryExitStateRepository();
+    await exitStates.update('pos-1', { swapVerifiedUsdgIncreaseRaw: USDG(77) }); // left over from an earlier attempt
+    const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), noopExecutor(), exitStates, { readBalance: vi.fn(async () => USDG(1000)), walletAddress: WALLET });
+
+    await deps.buildTransaction();
+
+    expect((await exitStates.getOrCreate('pos-1')).swapVerifiedUsdgIncreaseRaw).toBeNull();
+  });
+
+  it('resume-only deps (quote null) refuse to build calldata and never call buildSwapTx or read a balance', async () => {
+    const exitStates = new InMemoryExitStateRepository();
+    const executor = noopExecutor();
+    const readBalance = vi.fn(async () => USDG(1000));
+    const deps = buildSwapDeps('pos-1', TOKEN, null, executor, exitStates, { readBalance, walletAddress: WALLET });
+
+    await expect(deps.buildTransaction()).rejects.toThrow(/resume-only/);
+    expect(executor.buildSwapTx).not.toHaveBeenCalled();
+    expect(readBalance).not.toHaveBeenCalled();
+  });
+});
+
 describe('buildSwapDeps -- restart-safety of the verification baseline', () => {
   it('the baseline set during buildTransaction is what a LATER, independent verifyOnChain call reads back -- not a value re-read fresh at verify time', async () => {
     const exitStates = new InMemoryExitStateRepository();

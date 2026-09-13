@@ -141,8 +141,20 @@ export interface TxSafetyDeps<TVerifyData = unknown> {
    * existing implementation) simply declares zero parameters and ignores
    * it, since a function accepting fewer parameters than a type provides
    * is fully valid JS/TS.
+   *
+   * `resumable: true` on a failure means "the transaction's on-chain
+   * effect is already proven (or at least not disproven), but a read
+   * needed to COMPLETE verification was unavailable" -- e.g. the exit
+   * legs' receipt-log proceeds decode hitting an RPC blip after the
+   * liquidity-zero / balance-increase check already passed. The pipeline
+   * keeps such an attempt at CONFIRMED (never FAILED) and a later call
+   * with the same idempotencyKey re-runs ONLY this function -- nothing is
+   * rebuilt, re-signed, or re-broadcast. Omitted/false keeps the original
+   * meaning: a definitive VERIFICATION_FAILED.
    */
-  verifyOnChain: (confirmedTxHash: `0x${string}`) => Promise<{ ok: true; data: TVerifyData } | { ok: false; reason: string }>;
+  verifyOnChain: (
+    confirmedTxHash: `0x${string}`,
+  ) => Promise<{ ok: true; data: TVerifyData } | { ok: false; reason: string; resumable?: boolean }>;
 }
 
 export type ExecutionResult<TVerifyData = unknown> =

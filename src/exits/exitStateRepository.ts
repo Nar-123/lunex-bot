@@ -14,6 +14,7 @@ interface PrismaRow {
   swapAttemptCount: number;
   swapUsdgBalanceBeforeRaw: string | null;
   swapMinOutputAmountRaw: string | null;
+  swapVerifiedUsdgIncreaseRaw: string | null;
   pendingCloseReason: string | null;
 }
 
@@ -38,6 +39,7 @@ function toRecord(row: PrismaRow): ExitStateRecord {
     swapAttemptCount: row.swapAttemptCount,
     swapUsdgBalanceBeforeRaw: fromPrismaBigIntString(row.swapUsdgBalanceBeforeRaw),
     swapMinOutputAmountRaw: fromPrismaBigIntString(row.swapMinOutputAmountRaw),
+    swapVerifiedUsdgIncreaseRaw: fromPrismaBigIntString(row.swapVerifiedUsdgIncreaseRaw),
     pendingCloseReason: row.pendingCloseReason as ExitTriggerReason | null,
   };
 }
@@ -46,6 +48,7 @@ function toPrismaPatch(patch: Partial<ExitStateFields>): Record<string, unknown>
   const out: Record<string, unknown> = { ...patch };
   if ('swapUsdgBalanceBeforeRaw' in patch) out.swapUsdgBalanceBeforeRaw = toPrismaBigIntString(patch.swapUsdgBalanceBeforeRaw ?? null);
   if ('swapMinOutputAmountRaw' in patch) out.swapMinOutputAmountRaw = toPrismaBigIntString(patch.swapMinOutputAmountRaw ?? null);
+  if ('swapVerifiedUsdgIncreaseRaw' in patch) out.swapVerifiedUsdgIncreaseRaw = toPrismaBigIntString(patch.swapVerifiedUsdgIncreaseRaw ?? null);
   return out;
 }
 

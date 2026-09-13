@@ -3,7 +3,7 @@ import { config } from '../config';
 import { readErc20Allowance, readErc20Balance } from '../blockchain/erc20';
 import { getExecutorAddress } from '../blockchain/walletClient';
 import { executeCriticalTransaction } from '../execution/executeCriticalTransaction';
-import type { TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
+import type { ExecutionResult, TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
 import type { PositionRecord, PositionRepository } from '../positions/types';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring/types';
 import type { SwapExecutor, SwapQuote } from '../swap/types';
@@ -55,7 +55,8 @@ export interface ExecuteExitDeps {
   buildSwapDeps?: (
     positionId: string,
     tokenAddress: PositionRecord['tokenAddress'],
-    quote: SwapQuote,
+    /** `null` = resume-only deps for an attempt that already holds a signed payload -- see `swapTx.ts`. */
+    quote: SwapQuote | null,
     swap: SwapExecutor,
     exitStates: ExitStateRepository,
   ) => TxSafetyDeps<SwapVerifyData>;
@@ -201,6 +202,21 @@ export async function executeExit(position: PositionRecord, deps: ExecuteExitDep
     return finalizeClose(position, exitState, deps, removeKey, swapKey);
   }
 
+  // P1 fix: this attempt already SIGNED a swap (SIGNED/SENT/CONFIRMED -- a
+  // txHash exists), so the swap may already be on-chain: broadcast
+  // uncertain, receipt wait interrupted, or confirmed with verification
+  // incomplete because the proceeds read failed. Resume THAT exact payload
+  // under the same key. Re-deriving the amount from the live TOKEN balance
+  // (already ~0 once the swap filled -- the same trap C3 fixed for VERIFIED),
+  // re-quoting, or re-approving here would throw forever or send a second
+  // swap. Resume-only deps carry no quote, so the pipeline can only re-run
+  // the steps this attempt has not completed yet.
+  if (existingSwapAttempt && existingSwapAttempt.status !== 'FAILED' && existingSwapAttempt.txHash !== null) {
+    const resumeSwapDeps = buildSwapDeps(position.id, position.tokenAddress, null, deps.swapExecutor, deps.exitStates);
+    const resumedSwap = await executeCriticalTransaction(swapKey, 'exit:swap', resumeSwapDeps, deps.txAttempts);
+    return settleSwapLeg(resumedSwap, position, exitState, deps, removeKey, swapKey);
+  }
+
   const amountInRaw = await readTokenBalance(position.tokenAddress, wallet);
   if (amountInRaw <= 0n) {
     throw new Error(`position ${position.id}: remove-liquidity is VERIFIED but TOKEN balance reads 0 -- invariant violated`);
@@ -265,7 +281,18 @@ export async function executeExit(position: PositionRecord, deps: ExecuteExitDep
 
   const swapDeps = buildSwapDeps(position.id, position.tokenAddress, quote, deps.swapExecutor, deps.exitStates);
   const swapResult = await executeCriticalTransaction(swapKey, 'exit:swap', swapDeps, deps.txAttempts);
+  return settleSwapLeg(swapResult, position, exitState, deps, removeKey, swapKey);
+}
 
+/** Shared outcome mapping for a fresh swap attempt and a resumed signed one. */
+async function settleSwapLeg(
+  swapResult: ExecutionResult<SwapVerifyData>,
+  position: PositionRecord,
+  exitState: { pendingCloseReason: string | null },
+  deps: ExecuteExitDeps,
+  removeKey: string,
+  swapKey: string,
+): Promise<ExitExecutionOutcome> {
   if (!swapResult.ok) {
     if (!swapResult.resumable) {
       // Definitive, but Tx A is ALREADY VERIFIED -- LP is gone, cannot
@@ -274,6 +301,8 @@ export async function executeExit(position: PositionRecord, deps: ExecuteExitDep
       await deps.exitStates.incrementSwapAttempt(position.id);
       return { outcome: 'SWAP_FAILED_RETRY_PENDING', reason: swapResult.reason };
     }
+    // Ambiguous, including "confirmed but proceeds not yet measured" --
+    // same key next tick, which resumes via the signed-attempt path above.
     return { outcome: 'PENDING', reason: swapResult.reason };
   }
 

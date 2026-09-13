@@ -67,6 +67,13 @@ export function shouldBlockForPriceImpact(priceImpactPct: number | null, enabled
  * `swapMinOutputAmountRaw`) precisely so a resumed `verifyOnChain` call, in
  * a potentially different process, still has the correct baseline instead
  * of re-reading a balance that may already reflect the swap's own effect.
+ *
+ * `quote` may be `null` ONLY for resume-only deps: `executeExit.ts` passes
+ * null when the attempt under this key already holds a signed payload, so
+ * `buildTransaction` is never reached (executeCriticalTransaction skips it
+ * past BUILT) and no fresh quote is fetched for a swap that may already be
+ * on-chain. If it is somehow reached anyway, it throws (resumable) rather
+ * than build calldata from nothing.
  */
 export interface BuildSwapDepsOptions {
   /** Injectable for tests -- defaults to the real on-chain ERC20 read (same reasoning as `capitalSnapshotProvider.ts`'s `readBalance` default). */
@@ -80,7 +87,7 @@ export interface BuildSwapDepsOptions {
 export function buildSwapDeps(
   positionId: string,
   tokenAddress: Address,
-  quote: SwapQuote,
+  quote: SwapQuote | null,
   swapExecutor: SwapExecutor,
   exitStates: ExitStateRepository,
   options: BuildSwapDepsOptions = {},
@@ -92,10 +99,14 @@ export function buildSwapDeps(
 
   return {
     buildTransaction: async () => {
+      if (quote === null) {
+        throw new Error(`cannot build exit swap tx for position ${positionId}: resume-only deps have no quote -- an already-signed swap attempt must never be rebuilt`);
+      }
       const usdgBalanceBefore = await readBalance(usdgAddress, wallet);
       await exitStates.update(positionId, {
         swapUsdgBalanceBeforeRaw: usdgBalanceBefore,
         swapMinOutputAmountRaw: quote.minOutputAmountRaw,
+        swapVerifiedUsdgIncreaseRaw: null, // a new attempt has not passed its balance check yet
       });
 
       return swapExecutor.buildSwapTx(tokenAddress, quote);
@@ -111,35 +122,45 @@ export function buildSwapDeps(
     getReceiptIfAvailable: txSteps.getReceiptIfAvailable,
     verifyOnChain: async (confirmedTxHash) => {
       const exitState = await exitStates.getOrCreate(positionId);
-      if (exitState.swapUsdgBalanceBeforeRaw === null) {
-        return { ok: false, reason: 'no swapUsdgBalanceBeforeRaw baseline recorded -- cannot verify (invariant violated: buildTransaction should have set this)' };
-      }
-      const minIncrease = exitState.swapMinOutputAmountRaw ?? 0n;
-      const usdgBalanceAfter = await readBalance(usdgAddress, wallet);
-      const usdgIncreaseRaw = usdgBalanceAfter - exitState.swapUsdgBalanceBeforeRaw;
+      let usdgIncreaseRaw: bigint;
+      if (exitState.swapVerifiedUsdgIncreaseRaw !== null) {
+        // An earlier call already accepted this attempt's balance increase
+        // (then failed only on the proceeds read below). Never re-read the
+        // live balance: concurrent wallet activity since then could push it
+        // below the baseline and falsely fail a swap that already filled.
+        usdgIncreaseRaw = exitState.swapVerifiedUsdgIncreaseRaw;
+      } else {
+        if (exitState.swapUsdgBalanceBeforeRaw === null) {
+          return { ok: false, reason: 'no swapUsdgBalanceBeforeRaw baseline recorded -- cannot verify (invariant violated: buildTransaction should have set this)' };
+        }
+        const minIncrease = exitState.swapMinOutputAmountRaw ?? 0n;
+        const usdgBalanceAfter = await readBalance(usdgAddress, wallet);
+        usdgIncreaseRaw = usdgBalanceAfter - exitState.swapUsdgBalanceBeforeRaw;
 
-      // "Genuinely increased" (spec's literal requirement) when protection
-      // is off (minIncrease === 0n): usdgIncreaseRaw > 0n is required, NOT
-      // just >= 0n -- a swap that had zero effect must fail verification
-      // even though 0 >= 0 would trivially pass a naive >= check.
-      if (usdgIncreaseRaw <= 0n || usdgIncreaseRaw < minIncrease) {
-        return {
-          ok: false,
-          reason: `USDG balance increased by only ${usdgIncreaseRaw} (required > 0${minIncrease > 0n ? ` and >= ${minIncrease}` : ''})`,
-        };
+        // "Genuinely increased" (spec's literal requirement) when protection
+        // is off (minIncrease === 0n): usdgIncreaseRaw > 0n is required, NOT
+        // just >= 0n -- a swap that had zero effect must fail verification
+        // even though 0 >= 0 would trivially pass a naive >= check.
+        if (usdgIncreaseRaw <= 0n || usdgIncreaseRaw < minIncrease) {
+          return {
+            ok: false,
+            reason: `USDG balance increased by only ${usdgIncreaseRaw} (required > 0${minIncrease > 0n ? ` and >= ${minIncrease}` : ''})`,
+          };
+        }
+        await exitStates.update(positionId, { swapVerifiedUsdgIncreaseRaw: usdgIncreaseRaw });
       }
       // VALIDATION PHASE: realized proceeds from THIS swap's own confirmed
-      // receipt. Same resumable-on-read-failure discipline as the
-      // remove-liquidity leg: the swap is already proven by the balance
-      // check above; a measurement read failure must never convert that
-      // into a definitive failure. `resumeVerified` replays the decoder
-      // against the same hash on resume.
+      // receipt. The swap is already proven by the balance check above, so a
+      // failed proceeds read is `resumable: true` -- the attempt stays
+      // CONFIRMED, swapAttemptCount is never bumped, and the swap is never
+      // re-sent. (P1 fix: this used to return a plain `ok: false`, which the
+      // pipeline treats as a definitive VERIFICATION_FAILED.)
       let usdgProceedsRaw: bigint;
       try {
         usdgProceedsRaw = await readUsdgTransfersTo(confirmedTxHash, usdgAddress, wallet);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        return { ok: false, reason: `swap verified but proceeds could not be measured (resumable): ${message}` };
+        return { ok: false, resumable: true, reason: `swap verified but proceeds could not be measured: ${message}` };
       }
       return { ok: true, data: { usdgIncreaseRaw, usdgProceedsRaw } };
     },

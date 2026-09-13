@@ -244,6 +244,12 @@ model ExitState {
   /// when EXITS.MIN_RECEIVED_PROTECTION_ENABLED is false, in which case
   /// verification degrades to "genuinely increased at all."
   swapMinOutputAmountRaw String?
+  /// USDG increase the CURRENT swap attempt's balance check already
+  /// accepted (decimal STRING, same overflow reasoning). Reset to null when
+  /// a new attempt is built; lets a resumed verifyOnChain (after a failed
+  /// proceeds read) skip re-reading a balance that concurrent wallet
+  /// activity may since have moved. See exits/swapTx.ts.
+  swapVerifiedUsdgIncreaseRaw String?
   /// The exit-trigger reason (SAFETY_EXIT/HARD_STOP_LOSS/TRAILING_TP/OOR)
   /// recorded at the moment markClosing() is called — read back to pass to
   /// markClosed() once the exit actually completes, potentially ticks or a

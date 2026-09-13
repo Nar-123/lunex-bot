@@ -80,7 +80,7 @@ export interface AppDeps {
   buildApproveDepsForOpen?: (amountInRaw: bigint) => TxSafetyDeps<OpenApproveVerifyData>;
   buildMintDeps?: (input: MintInput, live: LivePositionStateProvider, pool: PoolPriceProvider) => TxSafetyDeps<MintVerifyData>;
   buildRemoveLiquidityDeps?: (position: PositionRecord, live: LivePositionStateProvider, pool: PoolPriceProvider) => TxSafetyDeps<RemoveLiquidityVerifyData>;
-  buildSwapDeps?: (positionId: string, tokenAddress: Address, quote: SwapQuote, swap: SwapExecutor, exitStates: ExitStateRepository) => TxSafetyDeps<SwapVerifyData>;
+  buildSwapDeps?: (positionId: string, tokenAddress: Address, quote: SwapQuote | null, swap: SwapExecutor, exitStates: ExitStateRepository) => TxSafetyDeps<SwapVerifyData>;
   buildApproveDepsForExit?: (tokenAddress: Address, spender: Address, amountInRaw: bigint) => TxSafetyDeps<ExitApproveVerifyData>;
   /** Same reasoning as the tx-builder overrides above -- unused in production (real reads apply), lets the integration smoke test avoid ever hitting a real RPC for allowance/balance checks. */
   readAllowance?: (tokenAddress: Address, owner: Address, spender: Address) => Promise<bigint>;

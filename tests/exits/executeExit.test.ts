@@ -107,7 +107,7 @@ describe('executeExit -- C3 regression: swap already VERIFIED must never re-deri
     const txAttempts = new InMemoryTransactionAttemptRepository();
     const position = await makeClosingPosition(positions, USDG(500));
 
-    exitStates.seed({ positionId: position.id, pendingCloseReason: 'HARD_STOP_LOSS', swapAttemptCount: 0, trailingPeakPnlPct: null, drawdownConfirmStartedAt: null, oorStartedAt: null, safetyExitArmedAt: null, maxDrawdownPnlPct: null, metricsFailureSince: null, swapUsdgBalanceBeforeRaw: null, swapMinOutputAmountRaw: null });
+    exitStates.seed({ positionId: position.id, pendingCloseReason: 'HARD_STOP_LOSS', swapAttemptCount: 0, trailingPeakPnlPct: null, drawdownConfirmStartedAt: null, oorStartedAt: null, safetyExitArmedAt: null, maxDrawdownPnlPct: null, metricsFailureSince: null, swapUsdgBalanceBeforeRaw: null, swapMinOutputAmountRaw: null, swapVerifiedUsdgIncreaseRaw: null });
 
     // "Process 1" (before the simulated crash): both legs already reached
     // VERIFIED and are persisted -- exactly the state a crash right before
@@ -156,7 +156,7 @@ describe('executeExit -- C3 regression: swap already VERIFIED must never re-deri
     const txAttempts = new InMemoryTransactionAttemptRepository();
     const position = await makeClosingPosition(positions, USDG(500));
 
-    exitStates.seed({ positionId: position.id, pendingCloseReason: 'HARD_STOP_LOSS', swapAttemptCount: 0, trailingPeakPnlPct: null, drawdownConfirmStartedAt: null, oorStartedAt: null, safetyExitArmedAt: null, maxDrawdownPnlPct: null, metricsFailureSince: null, swapUsdgBalanceBeforeRaw: null, swapMinOutputAmountRaw: null });
+    exitStates.seed({ positionId: position.id, pendingCloseReason: 'HARD_STOP_LOSS', swapAttemptCount: 0, trailingPeakPnlPct: null, drawdownConfirmStartedAt: null, oorStartedAt: null, safetyExitArmedAt: null, maxDrawdownPnlPct: null, metricsFailureSince: null, swapUsdgBalanceBeforeRaw: null, swapMinOutputAmountRaw: null, swapVerifiedUsdgIncreaseRaw: null });
 
     // Remove-liquidity paid out 480 USDG (principal+fees side in USDG),
     // the swap paid out 490 USDG -> 970 total measured proceeds.
@@ -182,7 +182,7 @@ describe('executeExit -- C3 regression: swap already VERIFIED must never re-deri
     const txAttempts = new InMemoryTransactionAttemptRepository();
     const position = await makeClosingPosition(positions, USDG(500));
 
-    exitStates.seed({ positionId: position.id, pendingCloseReason: 'TRAILING_TP', swapAttemptCount: 0, trailingPeakPnlPct: null, drawdownConfirmStartedAt: null, oorStartedAt: null, safetyExitArmedAt: null, maxDrawdownPnlPct: null, metricsFailureSince: null, swapUsdgBalanceBeforeRaw: null, swapMinOutputAmountRaw: null });
+    exitStates.seed({ positionId: position.id, pendingCloseReason: 'TRAILING_TP', swapAttemptCount: 0, trailingPeakPnlPct: null, drawdownConfirmStartedAt: null, oorStartedAt: null, safetyExitArmedAt: null, maxDrawdownPnlPct: null, metricsFailureSince: null, swapUsdgBalanceBeforeRaw: null, swapMinOutputAmountRaw: null, swapVerifiedUsdgIncreaseRaw: null });
 
     const removeKey = `${position.closeIdempotencyKey}:removeLiquidity`;
     const removeAttempt = await txAttempts.create(removeKey, 'exit:removeLiquidity');
@@ -199,6 +199,156 @@ describe('executeExit -- C3 regression: swap already VERIFIED must never re-deri
     });
 
     expect(outcome.outcome).toBe('CLOSED');
+  });
+});
+
+describe('executeExit -- P1: a proceeds-read failure after a confirmed on-chain leg stays resumable and never re-sends anything', () => {
+  const resumableProceedsFailure = () => vi.fn(async () => ({ ok: false as const, resumable: true, reason: 'proceeds could not be measured: RPC timeout' }));
+
+  it('remove-liquidity: confirmed burn + failed proceeds read -> PENDING, stays CLOSING (never reverted to ACTIVE), swap not started; resume closes without rebuilding or re-broadcasting the burn', async () => {
+    const positions = new InMemoryPositionRepository();
+    const exitStates = new InMemoryExitStateRepository();
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const position = await makeClosingPosition(positions, USDG(500));
+    await exitStates.update(position.id, { pendingCloseReason: 'HARD_STOP_LOSS' });
+
+    const firstRemove = fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n }, { verifyOnChain: resumableProceedsFailure() });
+    const firstSwapFactory = successfulSwapDeps();
+    const first = await executeExit(position, {
+      positions,
+      exitStates,
+      txAttempts,
+      ...baseDeps({ buildRemoveLiquidityDeps: vi.fn(() => firstRemove), buildSwapDeps: firstSwapFactory }),
+    });
+
+    expect(first.outcome).toBe('PENDING');
+    const afterFirst = await positions.findById(position.id);
+    expect(afterFirst?.status).toBe('CLOSING');
+    expect(afterFirst?.closeIdempotencyKey).toBe(position.closeIdempotencyKey);
+    const removeAttempt = await txAttempts.find(`${position.closeIdempotencyKey}:removeLiquidity`);
+    expect(removeAttempt?.status).toBe('CONFIRMED');
+    expect(removeAttempt?.failureCode).toBeNull();
+    expect(firstSwapFactory).not.toHaveBeenCalled();
+    if (!afterFirst) throw new Error('unreachable');
+
+    const resumeRemove = fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(480) });
+    const second = await executeExit(afterFirst, {
+      positions,
+      exitStates,
+      txAttempts,
+      ...baseDeps({ buildRemoveLiquidityDeps: vi.fn(() => resumeRemove), buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: USDG(490), usdgProceedsRaw: USDG(490) })) }),
+    });
+
+    expect(second.outcome).toBe('CLOSED');
+    expect(resumeRemove.buildTransaction).not.toHaveBeenCalled();
+    expect(resumeRemove.simulate).not.toHaveBeenCalled();
+    expect(resumeRemove.signTransaction).not.toHaveBeenCalled();
+    expect(resumeRemove.broadcastRaw).not.toHaveBeenCalled();
+    expect(resumeRemove.waitForReceipt).not.toHaveBeenCalled();
+    expect(resumeRemove.verifyOnChain).toHaveBeenCalledTimes(1);
+    const closed = await positions.findById(position.id);
+    expect(closed?.closeReason).toBe('HARD_STOP_LOSS');
+    expect(closed?.realizedUsdgRaw).toBe(USDG(970));
+  });
+
+  it('swap: confirmed, balance-verified swap + failed proceeds read -> PENDING without bumping swapAttemptCount; resume with TOKEN balance now 0 closes without re-quoting, re-approving, or re-sending', async () => {
+    const positions = new InMemoryPositionRepository();
+    const exitStates = new InMemoryExitStateRepository();
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const position = await makeClosingPosition(positions, USDG(500));
+    await exitStates.update(position.id, { pendingCloseReason: 'TRAILING_TP' });
+    const removeFactory = vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(480) }));
+
+    const firstSwap = fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n }, { verifyOnChain: resumableProceedsFailure() });
+    const first = await executeExit(position, {
+      positions,
+      exitStates,
+      txAttempts,
+      ...baseDeps({ buildRemoveLiquidityDeps: removeFactory, buildSwapDeps: vi.fn(() => firstSwap) }),
+    });
+
+    expect(first.outcome).toBe('PENDING');
+    expect((await exitStates.getOrCreate(position.id)).swapAttemptCount).toBe(0);
+    const swapAttempt = await txAttempts.find(`${position.closeIdempotencyKey}:swap:0`);
+    expect(swapAttempt?.status).toBe('CONFIRMED');
+    expect(swapAttempt?.failureCode).toBeNull();
+    const afterFirst = await positions.findById(position.id);
+    expect(afterFirst?.status).toBe('CLOSING');
+    if (!afterFirst) throw new Error('unreachable');
+
+    const resumeSwap = fakeTxDeps({ usdgIncreaseRaw: USDG(490), usdgProceedsRaw: USDG(490) });
+    const resumeSwapFactory = vi.fn(() => resumeSwap);
+    const swapExecutor = makeSwapExecutor(makeQuote(), { needsApproval: true, spender: SPENDER });
+    const readTokenBalance = vi.fn(async () => 0n); // the swap already filled
+    const buildApproveDeps = successfulApproveDeps();
+    const second = await executeExit(afterFirst, {
+      positions,
+      exitStates,
+      txAttempts,
+      ...baseDeps({ buildRemoveLiquidityDeps: removeFactory, buildSwapDeps: resumeSwapFactory, swapExecutor, readTokenBalance, buildApproveDeps }),
+    });
+
+    expect(second.outcome).toBe('CLOSED');
+    expect(resumeSwapFactory).toHaveBeenCalledWith(position.id, TOKEN, null, swapExecutor, exitStates);
+    expect(readTokenBalance).not.toHaveBeenCalled();
+    expect(swapExecutor.getQuote).not.toHaveBeenCalled();
+    expect(swapExecutor.checkApproval).not.toHaveBeenCalled();
+    expect(buildApproveDeps).not.toHaveBeenCalled();
+    expect(resumeSwap.buildTransaction).not.toHaveBeenCalled();
+    expect(resumeSwap.signTransaction).not.toHaveBeenCalled();
+    expect(resumeSwap.broadcastRaw).not.toHaveBeenCalled();
+    expect(resumeSwap.waitForReceipt).not.toHaveBeenCalled();
+    expect(resumeSwap.verifyOnChain).toHaveBeenCalledTimes(1);
+    expect((await exitStates.getOrCreate(position.id)).swapAttemptCount).toBe(0);
+    expect((await positions.findById(position.id))?.realizedUsdgRaw).toBe(USDG(970));
+  });
+
+  it('swap: an interrupted receipt wait (SENT) resumes the same signed swap even though TOKEN balance already reads 0 -- no invariant throw, no second swap', async () => {
+    const positions = new InMemoryPositionRepository();
+    const exitStates = new InMemoryExitStateRepository();
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const position = await makeClosingPosition(positions, USDG(500));
+    await exitStates.update(position.id, { pendingCloseReason: 'OOR_PROFIT' });
+    const removeFactory = successfulRemoveDeps();
+
+    const firstSwap = fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n }, { waitForReceipt: vi.fn(async () => { throw new Error('provider dropped connection'); }) });
+    const first = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeFactory, buildSwapDeps: vi.fn(() => firstSwap) }) });
+    expect(first.outcome).toBe('PENDING');
+    expect((await txAttempts.find(`${position.closeIdempotencyKey}:swap:0`))?.status).toBe('SENT');
+
+    const resumeSwap = fakeTxDeps({ usdgIncreaseRaw: USDG(490), usdgProceedsRaw: USDG(490) });
+    const second = await executeExit(position, {
+      positions,
+      exitStates,
+      txAttempts,
+      ...baseDeps({ buildRemoveLiquidityDeps: removeFactory, buildSwapDeps: vi.fn(() => resumeSwap), readTokenBalance: vi.fn(async () => 0n) }),
+    });
+
+    expect(second.outcome).toBe('CLOSED');
+    expect(resumeSwap.signTransaction).not.toHaveBeenCalled();
+    expect(resumeSwap.broadcastRaw).not.toHaveBeenCalled();
+    expect(resumeSwap.waitForReceipt).toHaveBeenCalledTimes(1);
+  });
+
+  it('swap: a resumed signed swap that turns out reverted is still a definitive failure -- bumps swapAttemptCount, stays CLOSING, never re-signed', async () => {
+    const positions = new InMemoryPositionRepository();
+    const exitStates = new InMemoryExitStateRepository();
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const position = await makeClosingPosition(positions, USDG(500));
+    const removeFactory = successfulRemoveDeps();
+
+    const firstSwap = fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n }, { broadcastRaw: vi.fn(async () => { throw new Error('ECONNRESET'); }) });
+    await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeFactory, buildSwapDeps: vi.fn(() => firstSwap) }) });
+    expect((await txAttempts.find(`${position.closeIdempotencyKey}:swap:0`))?.status).toBe('SIGNED');
+
+    const resumeSwap = fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n }, { waitForReceipt: vi.fn(async () => ({ status: 'reverted' as const, blockNumber: 9n })) });
+    const outcome = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeFactory, buildSwapDeps: vi.fn(() => resumeSwap) }) });
+
+    expect(outcome.outcome).toBe('SWAP_FAILED_RETRY_PENDING');
+    expect(resumeSwap.signTransaction).not.toHaveBeenCalled();
+    expect(resumeSwap.broadcastRaw).toHaveBeenCalledWith('0xdeadbeef'); // the SAME persisted signed payload, not a new one
+    expect((await exitStates.getOrCreate(position.id)).swapAttemptCount).toBe(1);
+    expect((await positions.findById(position.id))?.status).toBe('CLOSING');
   });
 });
 
@@ -714,7 +864,29 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
         expect((await exitStates.getOrCreate(position.id)).swapAttemptCount).toBe(3);
       });
 
-      it('an AMBIGUOUS swap failure does NOT advance the tier -- the resumed attempt re-quotes at the SAME width, under the SAME idempotency key', async () => {
+      it('an AMBIGUOUS swap failure BEFORE signing does NOT advance the tier -- the resumed attempt re-quotes at the SAME width, under the SAME idempotency key', async () => {
+        const positions = new InMemoryPositionRepository();
+        const exitStates = new InMemoryExitStateRepository();
+        const txAttempts = new InMemoryTransactionAttemptRepository();
+        const position = await makeClosingPosition(positions, USDG(500));
+        const { executor, bps } = recordingSwapExecutor();
+        const ambiguousSwapDeps = vi.fn(() =>
+          fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n }, { simulate: vi.fn(async () => { throw new Error('RPC timeout'); }) }),
+        );
+        const deps = { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: successfulRemoveDeps(), buildSwapDeps: ambiguousSwapDeps, swapExecutor: executor }) };
+
+        const first = await executeExit(position, deps);
+        expect(first.outcome).toBe('PENDING'); // resumable, not definitive
+        expect((await txAttempts.find(`${position.closeIdempotencyKey}:swap:0`))?.status).toBe('BUILT'); // nothing signed yet
+        await executeExit(position, deps);
+
+        // Widening the fill on the strength of a failure nobody has actually
+        // established would be guessing, not escalating.
+        expect(bps).toEqual([100, 100]);
+        expect((await exitStates.getOrCreate(position.id)).swapAttemptCount).toBe(0);
+      });
+
+      it('an AMBIGUOUS swap failure AFTER signing does NOT advance the tier either -- the same signed payload is resumed, never re-quoted at any width (P1)', async () => {
         const positions = new InMemoryPositionRepository();
         const exitStates = new InMemoryExitStateRepository();
         const txAttempts = new InMemoryTransactionAttemptRepository();
@@ -726,12 +898,15 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
         const deps = { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: successfulRemoveDeps(), buildSwapDeps: ambiguousSwapDeps, swapExecutor: executor }) };
 
         const first = await executeExit(position, deps);
-        expect(first.outcome).toBe('PENDING'); // resumable, not definitive
-        await executeExit(position, deps);
+        expect(first.outcome).toBe('PENDING');
+        expect((await txAttempts.find(`${position.closeIdempotencyKey}:swap:0`))?.status).toBe('SIGNED');
+        const second = await executeExit(position, deps);
 
-        // Widening the fill on the strength of a failure nobody has actually
-        // established would be guessing, not escalating.
-        expect(bps).toEqual([100, 100]);
+        // The calldata is already signed at the tier-0 width; a fresh quote
+        // could not change it, and the swap may already be on-chain.
+        expect(second.outcome).toBe('PENDING');
+        expect(bps).toEqual([100]);
+        expect(ambiguousSwapDeps).toHaveBeenLastCalledWith(position.id, TOKEN, null, executor, exitStates);
         expect((await exitStates.getOrCreate(position.id)).swapAttemptCount).toBe(0);
       });
 

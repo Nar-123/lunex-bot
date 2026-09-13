@@ -128,19 +128,19 @@ export function buildRemoveLiquidityDeps(
         return { ok: false, reason: `expected liquidity 0 after burn, still reads ${live.liquidity}` };
       }
       // VALIDATION PHASE: realized proceeds from THIS transaction's own
-      // confirmed receipt. A read failure here throws -- which the pipeline
-      // treats as ambiguous/resumable, never a definitive failure (the burn
-      // is already proven by the liquidity read above; reverting a VERIFIED
-      // burn because the PnL side-measurement's RPC read blipped would be
-      // exactly the "false definitive failure" the safety rules forbid).
-      // On resume, `resumeVerified` replays this same decoder against the
-      // same hash and gets the same number.
+      // confirmed receipt. The burn is already proven by the liquidity read
+      // above, so a failed proceeds read is returned as `resumable: true`:
+      // the pipeline keeps the attempt at CONFIRMED (never FAILED), so the
+      // exit is never reverted to ACTIVE over a burned LP, and the next tick
+      // re-runs only this verification against the same hash -- nothing is
+      // rebuilt or re-broadcast. (P1 fix: this used to return a plain
+      // `ok: false`, which the pipeline treats as a definitive failure.)
       let usdgProceedsRaw: bigint;
       try {
         usdgProceedsRaw = await readUsdgTransfersTo(confirmedTxHash, usdgAddress, wallet);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        return { ok: false, reason: `burn verified but proceeds could not be measured (resumable): ${message}` };
+        return { ok: false, resumable: true, reason: `burn verified but proceeds could not be measured: ${message}` };
       }
       return { ok: true, data: { liquidityZero: true, usdgProceedsRaw } };
     },

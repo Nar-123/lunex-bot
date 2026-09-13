@@ -153,6 +153,16 @@ export interface ExitStateFields {
   swapUsdgBalanceBeforeRaw: bigint | null;
   /** The minimum USDG increase `verifyOnChain` requires for the current swap attempt (0 when `EXITS.MIN_RECEIVED_PROTECTION_ENABLED` is false -- verification then degrades to "genuinely increased at all," matching the spec's literal on-chain-verification requirement without inventing a minimum that isn't supposed to exist). Persisted alongside `swapUsdgBalanceBeforeRaw` for the same restart-safety reason. */
   swapMinOutputAmountRaw: bigint | null;
+  /**
+   * The USDG increase the CURRENT swap attempt's balance check already
+   * accepted, persisted the moment that check passed (reset to null by
+   * `swapTx.ts`'s `buildTransaction` for every new attempt). A resumed
+   * `verifyOnChain` -- after the proceeds read failed -- reuses this instead
+   * of re-reading the live balance, which concurrent wallet activity (a
+   * mint spending USDG between ticks) could have pushed below the baseline,
+   * turning an already-filled swap into a false definitive failure.
+   */
+  swapVerifiedUsdgIncreaseRaw: bigint | null;
   /** The trigger reason recorded at markClosing() time, read back for markClosed() once the exit completes -- may be ticks or a restart later. */
   pendingCloseReason: ExitTriggerReason | null;
 }
@@ -171,6 +181,7 @@ export const EMPTY_EXIT_STATE: ExitStateFields = {
   swapAttemptCount: 0,
   swapUsdgBalanceBeforeRaw: null,
   swapMinOutputAmountRaw: null,
+  swapVerifiedUsdgIncreaseRaw: null,
   pendingCloseReason: null,
 };
 

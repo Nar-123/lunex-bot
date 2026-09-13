@@ -53,6 +53,15 @@ describe('PrismaExitStateRepository (real SQLite DB, real migration)', () => {
     expect(record.swapMinOutputAmountRaw).toBe(bigAmount / 2n);
   });
 
+  it('P1: swapVerifiedUsdgIncreaseRaw defaults to null, round-trips an extreme bigint exactly, and can be reset to null', async () => {
+    expect((await repo.getOrCreate('pos-h')).swapVerifiedUsdgIncreaseRaw).toBeNull();
+    const big = 123_456_789n * 10n ** 18n + 1n;
+    await repo.update('pos-h', { swapVerifiedUsdgIncreaseRaw: big });
+    expect((await repo.getOrCreate('pos-h')).swapVerifiedUsdgIncreaseRaw).toBe(big);
+    await repo.update('pos-h', { swapVerifiedUsdgIncreaseRaw: null });
+    expect((await repo.getOrCreate('pos-h')).swapVerifiedUsdgIncreaseRaw).toBeNull();
+  });
+
   it('update merges a patch without clobbering previously-set fields', async () => {
     await repo.update('pos-c', { trailingPeakPnlPct: 0.07 });
     await repo.update('pos-c', { oorStartedAt: new Date('2026-01-01T00:00:00.000Z') });

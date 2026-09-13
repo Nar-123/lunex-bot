@@ -24,6 +24,70 @@ function makeDeps(overrides: Partial<TxSafetyDeps<{ verified: true }>> = {}): Tx
   };
 }
 
+describe('executeCriticalTransaction -- P1: resumable verification failure after on-chain confirmation', () => {
+  const resumableFailure = () => vi.fn(async () => ({ ok: false as const, resumable: true, reason: 'proceeds could not be measured: RPC timeout' }));
+
+  it('verifyOnChain {ok:false, resumable:true} keeps the attempt CONFIRMED with no failureCode, reports resumable:true, records the reason', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    const result = await executeCriticalTransaction('p1-a', 'p', makeDeps({ verifyOnChain: resumableFailure() }), repo);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.resumable).toBe(true);
+      expect(result.attempt.status).toBe('CONFIRMED');
+      expect(result.attempt.failureCode).toBeNull();
+      expect(result.attempt.lastError).toMatch(/proceeds could not be measured/);
+    }
+  });
+
+  it('resuming re-runs ONLY verifyOnChain against the persisted hash -- never rebuilds, re-simulates, re-signs, re-broadcasts, or re-waits', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    await executeCriticalTransaction('p1-b', 'p', makeDeps({ verifyOnChain: resumableFailure() }), repo);
+
+    const resumeDeps = makeDeps();
+    const resumed = await executeCriticalTransaction('p1-b', 'p', resumeDeps, repo);
+
+    expect(resumed.ok).toBe(true);
+    if (resumed.ok) expect(resumed.attempt.status).toBe('VERIFIED');
+    expect(resumeDeps.buildTransaction).not.toHaveBeenCalled();
+    expect(resumeDeps.simulate).not.toHaveBeenCalled();
+    expect(resumeDeps.estimateGas).not.toHaveBeenCalled();
+    expect(resumeDeps.getNonce).not.toHaveBeenCalled();
+    expect(resumeDeps.signTransaction).not.toHaveBeenCalled();
+    expect(resumeDeps.broadcastRaw).not.toHaveBeenCalled();
+    expect(resumeDeps.waitForReceipt).not.toHaveBeenCalled();
+    expect(resumeDeps.verifyOnChain).toHaveBeenCalledTimes(1);
+    expect(resumeDeps.verifyOnChain).toHaveBeenCalledWith(TX_HASH);
+  });
+
+  it('repeated resumable failures never escalate to FAILED, while attemptCount keeps growing (stuck-detectable)', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    let last: Awaited<ReturnType<typeof executeCriticalTransaction>> | undefined;
+    for (let i = 0; i < 6; i++) {
+      last = await executeCriticalTransaction('p1-c', 'p', makeDeps({ verifyOnChain: resumableFailure() }), repo);
+    }
+    expect(last?.ok).toBe(false);
+    if (last && !last.ok) {
+      expect(last.resumable).toBe(true);
+      expect(last.attempt.status).toBe('CONFIRMED');
+      expect(last.attempt.attemptCount).toBe(6);
+    }
+  });
+
+  it('a verification failure with resumable:false (or omitted) is still a definitive VERIFICATION_FAILED -- the original contract is unchanged', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    const deps = makeDeps({ verifyOnChain: vi.fn(async () => ({ ok: false as const, resumable: false, reason: 'liquidity still non-zero' })) });
+    const result = await executeCriticalTransaction('p1-d', 'p', deps, repo);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.resumable).toBe(false);
+      expect(result.attempt.status).toBe('FAILED');
+      expect(result.attempt.failureCode).toBe('VERIFICATION_FAILED');
+    }
+  });
+});
+
 describe('executeCriticalTransaction -- happy path', () => {
   it('runs every step in order and returns ok:true with VERIFIED status', async () => {
     const repo = new InMemoryTransactionAttemptRepository();
