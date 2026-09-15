@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-
+import { existsSync, readFileSync } from 'node:fs';
+import { join, resolve, sep } from 'node:path';
 export class GmgnCliExecutionError extends Error {
   constructor(
     message: string,
@@ -21,7 +22,7 @@ export class GmgnCliExecutionError extends Error {
  * *argument injection* -- a value crafted to be parsed as a flag instead
  * of a plain value (e.g. an address field that was actually the string
  * `--config=/etc/passwd`). We only ever pass three kinds of values as CLI
- * arguments: a chain slug we chose ourselves, a timeframe we chose
+ * arguments: a chain slug we chose ourselves, an interval we chose
  * ourselves, and an EVM address GMGN itself returned (which must already
  * be a well-formed 20-byte hex address to mean anything) -- token
  * name/symbol (genuinely free-form, attacker-controlled) are never passed
@@ -31,7 +32,8 @@ const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 // Must start with a letter/digit (never `-`) so a slug can never be
 // misread by the CLI's own argument parser as a flag (e.g. "--flag").
 const CHAIN_SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
-const TIMEFRAME_RE = /^[0-9]{1,2}[hHdD]$/;
+// gmgn-cli `--interval` accepts 1m/5m/1h/6h/24h -- the NdH/NdD shape.
+const INTERVAL_RE = /^[0-9]{1,2}[hHdDmM]$/;
 
 export function assertValidEvmAddress(value: string): string {
   if (!EVM_ADDRESS_RE.test(value)) {
@@ -47,9 +49,9 @@ export function assertValidChainSlug(value: string): string {
   return value;
 }
 
-export function assertValidTimeframe(value: string): string {
-  if (!TIMEFRAME_RE.test(value)) {
-    throw new Error(`Refusing to use "${value}" as a CLI argument: not an allowlisted timeframe shape`);
+export function assertValidInterval(value: string): string {
+  if (!INTERVAL_RE.test(value)) {
+    throw new Error(`Refusing to use "${value}" as a CLI argument: not an allowlisted interval shape`);
   }
   return value;
 }
@@ -72,16 +74,84 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const IS_WINDOWS = process.platform === 'win32';
+// npm's Windows shims follow the exact layout `<name>.cmd` / `<name>.ps1` /
+// extensionless sh next to `node_modules/<name>/package.json`, whose `bin`
+// field names the real JS entry point.
+const NPM_GLOBAL_ROOTS = [
+  process.env.npm_config_prefix,
+  process.env.APPDATA ? `${process.env.APPDATA}${sep}npm` : undefined,
+  process.env.NPM_CONFIG_PREFIX,
+].filter((p): p is string => Boolean(p));
+
+function readBinEntryFromPackageJson(pkgPath: string): string | undefined {
+  try {
+    const bin = (JSON.parse(readFileSync(pkgPath, 'utf-8')) as { bin?: unknown }).bin;
+    if (typeof bin === 'string' && bin.length > 0) return bin;
+    if (bin && typeof bin === 'object' && !Array.isArray(bin)) {
+      const entries = Object.values(bin).filter((v): v is string => typeof v === 'string' && v.length > 0);
+      return entries[0];
+    }
+  } catch {
+    // unreadable/corrupt package.json -- not resolvable, fall through
+  }
+  return undefined;
+}
+
+/**
+ * Windows only: `execFile` (deliberately shell-free, see the module doc)
+ * cannot execute npm's `gmgn-cli.cmd` shims -- Node spawns them without a
+ * shell and gets ENOENT. Instead of dropping the no-shell guarantee (e.g.
+ * `shell: true`, which would re-open the argument-injection surface the
+ * argv allowlists above exist to close), resolve the shim to the real JS
+ * entry (`node_modules/gmgn-cli/dist/index.js`) and spawn
+ * `node <entry> <argv>` -- argv is passed through verbatim, so every
+ * pre-call validation still covers exactly what is executed.
+ * Unix is unaffected: `gmgn-cli` is a shebang script `execFile` can run.
+ *
+ * `roots` is injectable so tests can point resolution at a synthetic npm
+ * layout instead of the machine's real global install.
+ */
+export function resolveWindowsCliEntry(
+  cliPath: string,
+  roots: readonly string[] = NPM_GLOBAL_ROOTS,
+): { command: string; args: string[] } {
+  // Bare command name only (e.g. "gmgn-cli", GMGN_CLI_PATH's default) --
+  // an explicit path is the operator's choice and stays untouched.
+  if (!cliPath.includes(sep) && !cliPath.includes('/')) {
+    for (const root of roots) {
+      const pkgDir = resolve(root, 'node_modules', cliPath);
+      const binEntry = readBinEntryFromPackageJson(join(pkgDir, 'package.json'));
+      if (!binEntry) continue;
+      // resolve() normalizes ../ and either separator; the containment
+      // check keeps the entry inside the package dir (a bin field
+      // pointing elsewhere is not a layout npm produced).
+      const entry = resolve(pkgDir, binEntry);
+      if (entry.startsWith(pkgDir + sep) && existsSync(entry)) {
+        return { command: process.execPath, args: [entry] };
+      }
+    }
+  }
+  // Unresolvable (e.g. a custom GMGN_CLI_PATH) -- spawn as-is and let the
+  // resulting ENOENT surface as a GmgnCliExecutionError like any other
+  // process-level failure, with the user's path visible in the message.
+  return { command: cliPath, args: [] };
+}
+
 function execFileOnce(
   cliPath: string,
   args: readonly string[],
   timeoutMs: number,
   env: NodeJS.ProcessEnv,
 ): Promise<string> {
+  // Resolve per-call rather than at module load so a missing CLI surfaces
+  // as the same GmgnCliExecutionError path on every attempt.
+  const resolved = IS_WINDOWS ? resolveWindowsCliEntry(cliPath) : { command: cliPath, args: [] as string[] };
+  const argv = [...resolved.args, ...args];
   return new Promise((resolve, reject) => {
     execFile(
-      cliPath,
-      args as string[],
+      resolved.command,
+      argv,
       { timeout: timeoutMs, env, maxBuffer: 10 * 1024 * 1024 },
       (error, stdout) => {
         if (error) {

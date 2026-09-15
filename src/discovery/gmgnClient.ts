@@ -1,8 +1,8 @@
 import type { CandidateToken } from './types';
 
 export interface GetTopTokensParams {
-  /** e.g. "6h" — matches GMGN's timeframe tab. */
-  timeframe: string;
+  /** e.g. "6h" — the gmgn-cli `--interval` value (1m/5m/1h/6h/24h). */
+  interval: string;
   limit: number;
 }
 

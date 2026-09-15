@@ -1,4 +1,5 @@
 import type { AllowedAssetType, RejectedAssetType } from '../config/constants';
+import type { StockClassification } from './robinhoodStockClassifier';
 
 /** Union of every asset-type tag GMGN can report — allowed and rejected. */
 export type AssetType = AllowedAssetType | RejectedAssetType;
@@ -36,4 +37,19 @@ export interface CandidateToken {
   source: 'GMGN';
   /** Original provider payload, kept only for debugging/audit — never read by filters/strategy logic. */
   raw?: unknown;
+  /**
+   * Phase 12: the on-chain Stock classifier's own three-value result,
+   * set by `classifyCandidates`/`applyStockClassification`
+   * (`robinhoodStockClassifier.ts`) for EVERY candidate it processes --
+   * unlike `assetType`, which is only ever rewritten for the
+   * `ROBINHOOD_OFFICIAL_STOCK` case. `STOCK_ONLY` mode's `checkAssetType`
+   * reads THIS field, not `assetType`, specifically so a classifier
+   * failure (`'UNKNOWN'`) is distinguishable from a confirmed
+   * `'NON_STOCK'` result and can be rejected fail-safe rather than
+   * silently treated as "not stock." `undefined` means classification was
+   * never attempted for this candidate (e.g. a test fixture built without
+   * going through `classifyCandidates`) -- also treated as fail-safe
+   * reject under `STOCK_ONLY` mode, same reasoning.
+   */
+  stockClassification?: StockClassification;
 }

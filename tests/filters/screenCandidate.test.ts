@@ -62,11 +62,84 @@ describe('screenCandidate', () => {
     expect(result.failedRule).toBe('COOLDOWN');
   });
 
-  it('rejects a Stock-type asset regardless of every other metric being excellent', async () => {
-    const token = makeCandidateToken({ assetType: 'Stock', marketCapUsd: 100_000_000, totalFeeEth: 50 });
-    const result = await screenCandidate(token, deps());
+  it('rejects a confirmed Stock candidate regardless of every other metric being excellent, when ASSET_TYPE is enabled', async () => {
+    const token = makeCandidateToken({ assetType: 'Stock', stockClassification: 'ROBINHOOD_OFFICIAL_STOCK', marketCapUsd: 100_000_000, totalFeeEth: 50 });
+    const result = await screenCandidate(token, deps(), Date.now(), true);
     expect(result.passed).toBe(false);
     expect(result.failedRule).toBe('ASSET_TYPE');
+  });
+
+  describe('ASSET_TYPE.ENABLED gating, STOCK_ONLY mode (Phase 12, operator-approved specification revision)', () => {
+    it('ENABLED=true rejects a confirmed Stock candidate (hard safety, unchanged by the Phase 12 revision)', async () => {
+      const token = makeCandidateToken({ assetType: 'Stock', stockClassification: 'ROBINHOOD_OFFICIAL_STOCK', marketCapUsd: 100_000_000, totalFeeEth: 50 });
+      const result = await screenCandidate(token, deps(), Date.now(), true);
+      expect(result.passed).toBe(false);
+      expect(result.failedRule).toBe('ASSET_TYPE');
+      expect(result.checks.find((c) => c.rule === 'ASSET_TYPE')?.passed).toBe(false);
+    });
+
+    it('ENABLED=true now ALLOWS a confirmed NON_STOCK candidate, even with assetType="Unknown" -- the actual live-GMGN case, and the whole point of Phase 12', async () => {
+      const token = makeCandidateToken({ assetType: 'Unknown', stockClassification: 'NON_STOCK', marketCapUsd: 100_000_000, totalFeeEth: 50 });
+      const result = await screenCandidate(token, deps(), Date.now(), true);
+      expect(result.passed).toBe(true);
+      expect(result.failedRule).toBeUndefined();
+    });
+
+    it('ENABLED=true still REJECTS when the Stock classifier could not resolve (UNKNOWN) -- fail-safe, never silently allowed just because assetType also reads "Unknown"', async () => {
+      const token = makeCandidateToken({ assetType: 'Unknown', stockClassification: 'UNKNOWN', marketCapUsd: 100_000_000, totalFeeEth: 50 });
+      const result = await screenCandidate(token, deps(), Date.now(), true);
+      expect(result.passed).toBe(false);
+      expect(result.failedRule).toBe('ASSET_TYPE');
+    });
+
+    it('ENABLED=false lets an otherwise-passing candidate through regardless of stockClassification', async () => {
+      const token = makeCandidateToken({ assetType: 'Unknown', stockClassification: 'UNKNOWN' });
+      const result = await screenCandidate(token, deps(), Date.now(), false);
+      expect(result.passed).toBe(true);
+      expect(result.failedRule).toBeUndefined();
+    });
+
+    it('the real config default is ENABLED=true, mode=STOCK_ONLY -- calling screenCandidate with no override reflects that: confirmed NON_STOCK passes', async () => {
+      const token = makeCandidateToken({ assetType: 'Unknown', stockClassification: 'NON_STOCK' });
+      const result = await screenCandidate(token, deps()); // no 4th arg -- uses config.rules.filters.ASSET_TYPE.ENABLED
+      expect(result.passed).toBe(true);
+      expect(result.failedRule).toBeUndefined();
+    });
+
+    it('reporting stays intact when disabled: ASSET_TYPE still appears in checks[] with its true pass/fail, just non-blocking', async () => {
+      const token = makeCandidateToken({ assetType: 'Stock', stockClassification: 'ROBINHOOD_OFFICIAL_STOCK' });
+      const result = await screenCandidate(token, deps(), Date.now(), false);
+      expect(result.checks).toHaveLength(8);
+      const assetTypeCheck = result.checks.find((c) => c.rule === 'ASSET_TYPE');
+      expect(assetTypeCheck?.passed).toBe(false); // honestly reported as a confirmed Stock, would fail...
+      expect(assetTypeCheck?.reason).toMatch(/rejected/);
+      expect(result.passed).toBe(true); // ...but did not block the candidate
+      expect(result.failedRule).toBeUndefined();
+    });
+
+    it('disabling ASSET_TYPE does not rewrite token.assetType or touch any other rule', async () => {
+      const token = makeCandidateToken({ assetType: 'Unknown' });
+      const result = await screenCandidate(token, deps(), Date.now(), false);
+      expect(token.assetType).toBe('Unknown'); // never mapped to Meme/Project
+      expect(result.checks.map((c) => c.rule)).toEqual([
+        'MARKET_CAP',
+        'TOKEN_AGE',
+        'VOLUME',
+        'TOTAL_FEE',
+        'HOLDER_CONCENTRATION',
+        'ASSET_TYPE',
+        'DUPLICATE_POSITION',
+        'COOLDOWN',
+      ]);
+      expect(result.checks.every((c) => c.rule === 'ASSET_TYPE' || c.passed)).toBe(true);
+    });
+
+    it('other rules still block normally with ASSET_TYPE disabled -- MARKET_CAP failure is not swallowed', async () => {
+      const token = makeCandidateToken({ assetType: 'Unknown', marketCapUsd: 100 }); // fails MARKET_CAP too
+      const result = await screenCandidate(token, deps(), Date.now(), false);
+      expect(result.passed).toBe(false);
+      expect(result.failedRule).toBe('MARKET_CAP'); // first failure in spec-table order, ASSET_TYPE never gets a chance to matter
+    });
   });
 });
 

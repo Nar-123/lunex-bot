@@ -1,3 +1,4 @@
+import { config } from '../config';
 import type { CandidateToken } from '../discovery/types';
 import type { FilterCheckResult, ScreeningDeps, ScreeningResult } from './types';
 import { checkMarketCap } from './rules/marketCap';
@@ -14,11 +15,26 @@ import { checkCooldown } from './rules/cooldown';
  * and ALWAYS evaluates all of them (never short-circuits) so a rejected
  * candidate's full breakdown is available for logs/reporting. `passed` is
  * true only if every check passed.
+ *
+ * `assetTypeEnabled` defaults to `config.rules.filters.ASSET_TYPE.ENABLED`
+ * (currently `true` -- fail-closed per Draft V1 Section 3: only `Meme`/
+ * `Project` are allowed, `Unknown` and every other type are rejected; see
+ * that constant's doc comment for the full history, including the earlier
+ * temporary deviation this restored from). It is an explicit parameter, not
+ * just an inline config read, purely so tests can exercise both the enabled
+ * (Draft V1 original, current default) and disabled (historical temporary
+ * deviation) behavior deterministically -- no production call site passes
+ * it, so production always gets the real config value. `checkAssetType` is
+ * ALWAYS computed and ALWAYS included in
+ * `checks`, enabled or not -- disabling only removes it from the set of
+ * checks that can fail the candidate (`token.assetType` itself is never
+ * rewritten, and no substitute heuristic is introduced).
  */
 export async function screenCandidate(
   token: CandidateToken,
   deps: ScreeningDeps,
   now: number = Date.now(),
+  assetTypeEnabled: boolean = config.rules.filters.ASSET_TYPE.ENABLED,
 ): Promise<ScreeningResult> {
   const checks: FilterCheckResult[] = [
     checkMarketCap(token),
@@ -31,7 +47,8 @@ export async function screenCandidate(
     await checkCooldown(token, deps.cooldownChecker),
   ];
 
-  const firstFailed = checks.find((c) => !c.passed);
+  const blockingChecks = assetTypeEnabled ? checks : checks.filter((c) => c.rule !== 'ASSET_TYPE');
+  const firstFailed = blockingChecks.find((c) => !c.passed);
 
   return {
     tokenAddress: token.address,

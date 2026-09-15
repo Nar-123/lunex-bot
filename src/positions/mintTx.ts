@@ -37,8 +37,15 @@ export interface BuildMintDepsOptions {
   ensureBinding?: () => Promise<void>;
 }
 
-/** Same construction pattern as `exits/removeLiquidityTx.ts`'s `buildV4Position` -- real `Token` entities, not placeholders, since the v4 SDK calls real methods on them. Uses `fromAmount0`/`fromAmount1` (single-sided) rather than a known liquidity value, since a NEW position's liquidity is exactly what needs deriving from the decided USDG deposit amount. */
-function buildMintV4Position(input: MintInput, sqrtPriceX96: bigint, tickCurrent: number) {
+/**
+ * Same construction pattern as `exits/removeLiquidityTx.ts`'s `buildV4Position` -- real `Token` entities, not placeholders, since the v4 SDK calls real methods on them. Uses `fromAmount0`/`fromAmount1` (single-sided) rather than a known liquidity value, since a NEW position's liquidity is exactly what needs deriving from the decided USDG deposit amount.
+ *
+ * Exported (Phase 12G) purely so `tests/positions/mintTx.test.ts` can assert
+ * the constructed USDG `Token`'s `.decimals` directly matches
+ * `config.quoteAsset.DECIMALS` -- not a new abstraction, the function
+ * already existed, only its visibility changed.
+ */
+export function buildMintV4Position(input: MintInput, sqrtPriceX96: bigint, tickCurrent: number) {
   const usdgAddress = getAddress(config.quoteAsset.ADDRESS);
   const currency0Address = getAddress(input.pool.currency0);
   const currency1Address = getAddress(input.pool.currency1);

@@ -17,6 +17,11 @@ export function makeCandidateToken(overrides: Partial<CandidateToken> = {}): Can
     rank: 1,
     discoveredAt: now,
     source: 'GMGN',
+    // Phase 12: STOCK_ONLY mode reads `stockClassification`, not the
+    // flattened `assetType` string -- set here so this fixture keeps
+    // "passes every static filter rule by default" true under the new
+    // default mode without every existing call site needing an update.
+    stockClassification: 'NON_STOCK',
     ...overrides,
   };
 }

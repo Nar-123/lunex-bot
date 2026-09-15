@@ -23,7 +23,7 @@ export interface OpenPositionInput {
   pool: PositionPoolContext;
   tickLower: number;
   tickUpper: number;
-  /** The decided position size -- `decideCapitalAllocation`'s `positionSizeUsdgRaw` (35% of free USDG, already checked against the 3-position and 90%-exposure caps). */
+  /** The decided position size -- `decideCapitalAllocation`'s `positionSizeUsdgRaw` (35% of the stable base portfolio balance, truncated as needed to respect the 3-position and 95%-exposure caps). */
   entryUsdgRaw: bigint;
   /** The pool price snapshot the range/decision were computed from (Modules 3/4) -- the PNL basis, recorded once, never recomputed. The ACTUAL mint transaction reads a FRESH live price at build time (see `mintTx.ts`), same as `exits/removeLiquidityTx.ts` -- these two can legitimately differ if price moved between decision and execution. */
   entryTick: number;

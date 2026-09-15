@@ -131,6 +131,7 @@ export const config = {
     priceImpact: constants.PRICE_IMPACT,
     lpStrategy: constants.LP_STRATEGY,
     capital: constants.CAPITAL,
+    canary: constants.CANARY,
     cycle: constants.CYCLE,
     monitoring: constants.MONITORING,
     exits: constants.EXITS,

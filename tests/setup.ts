@@ -16,7 +16,10 @@ const testEnv: Record<string, string> = {
   CHAIN_ID: '4663', // Robinhood Chain — must match a real entry in GMGN_CHAIN_SLUGS
   PRIVATE_KEY: '0x' + '11'.repeat(32),
   USDG_TOKEN_ADDRESS: '0x' + '22'.repeat(20),
-  USDG_DECIMALS: '18',
+  // Phase 12G fix: the real on-chain USDG contract's decimals() is 6, not
+  // 18 -- this fixture was carrying the same wrong default env.ts used to
+  // have. See src/config/env.ts's doc comment on USDG_DECIMALS.
+  USDG_DECIMALS: '6',
   // Unset by default (env.ts's own default is ''), which breaks any code
   // path that actually encodes calldata against it (e.g.
   // positions/approveTx.ts's fixed USDG->PositionManager approve) --

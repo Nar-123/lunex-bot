@@ -10,6 +10,8 @@ import { PrismaCooldownRepository } from '../cooldown/cooldownRepository';
 import { PrismaSettingsRepository } from '../settings/settingsRepository';
 import { GmgnCliClient } from '../discovery/gmgnCliClient';
 import { DiscoveryService } from '../discovery/discoveryService';
+import { CachedRobinhoodStockClassifier, OnChainRobinhoodStockClassifier } from '../discovery/robinhoodStockClassifier';
+import { InMemoryCanaryGuard } from '../capital/canary';
 import { PoolManagerLogDiscovery } from '../pools/poolDiscovery';
 import { StateViewPoolStateProvider } from '../pools/poolStateProvider';
 import { SwapLogPoolVolumeProvider } from '../pools/poolVolumeProvider';
@@ -43,7 +45,9 @@ export function createRealAppDeps(): AppDeps {
     cooldown: new PrismaCooldownRepository(prisma),
     activePositionChecker: new PositionActivePositionChecker(positions),
     capitalSnapshot: new PositionCapitalSnapshotProvider(positions, walletAddress),
+    canaryGuard: new InMemoryCanaryGuard(),
     discoveryService: new DiscoveryService(new GmgnCliClient()),
+    stockClassifier: new CachedRobinhoodStockClassifier(new OnChainRobinhoodStockClassifier()),
     poolDiscovery: new PoolManagerLogDiscovery(),
     poolState: new StateViewPoolStateProvider(),
     poolVolume: new SwapLogPoolVolumeProvider(),

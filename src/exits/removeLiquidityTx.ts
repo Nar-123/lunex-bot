@@ -25,8 +25,15 @@ export interface BuildRemoveLiquidityDepsOptions {
   walletAddress?: Address;
 }
 
-/** Same construction pattern as `monitoring/computePositionMetrics.ts` -- real `Token` entities (not placeholders), since the v4 SDK's `Position`/`Pool` classes call real methods on them (`.isNative`, `.equals()`, etc.), not just read `.address`. */
-function buildV4Position(position: PositionRecord, liquidity: bigint, sqrtPriceX96: bigint, tickCurrent: number) {
+/**
+ * Same construction pattern as `monitoring/computePositionMetrics.ts` -- real `Token` entities (not placeholders), since the v4 SDK's `Position`/`Pool` classes call real methods on them (`.isNative`, `.equals()`, etc.), not just read `.address`.
+ *
+ * Exported (Phase 12G) purely so `tests/exits/removeLiquidityTx.test.ts` can
+ * assert the constructed USDG `Token`'s `.decimals` directly matches
+ * `config.quoteAsset.DECIMALS` -- not a new abstraction, the function
+ * already existed, only its visibility changed.
+ */
+export function buildV4Position(position: PositionRecord, liquidity: bigint, sqrtPriceX96: bigint, tickCurrent: number) {
   const usdgAddress = getAddress(config.quoteAsset.ADDRESS);
   const currency0Address = getAddress(position.pool.currency0);
   const currency1Address = getAddress(position.pool.currency1);

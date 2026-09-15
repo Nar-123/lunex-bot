@@ -4,6 +4,7 @@ import { computePositionMetrics } from '../../src/monitoring/computePositionMetr
 import { v3TickMathUtils, v4Sdk } from '../../src/blockchain/uniswapSdk';
 import type { PositionRecord } from '../../src/positions/types';
 import type { LivePositionState, PoolPriceState } from '../../src/monitoring/types';
+import { config } from '../../src/config';
 
 const { TickMath } = v3TickMathUtils;
 const CHAIN_ID = 4663;
@@ -214,5 +215,56 @@ describe('computePositionMetrics -- both orientations agree on the same real-wor
       expect(resultA.currentPriceUsdgPerToken).toBe(resultB.currentPriceUsdgPerToken);
       expect(resultA.pnlPct).toBeCloseTo(resultB.pnlPct, 6);
     }
+  });
+});
+
+describe('computePositionMetrics -- Phase 12G: display-price fields genuinely track config.quoteAsset.DECIMALS (6), not a stale 18', () => {
+  /**
+   * `currentPriceUsdgPerToken`/`entryPriceUsdgPerToken` are the ONE part of
+   * this function's output actually affected by the USDG decimals bug (see
+   * Phase 12F/12G's finding): `pnlPct`/`currentValueUsdgRaw`/`feesEarnedUsdgRaw`
+   * are all raw-bigint/`.quote()`-derived and proven decimals-agnostic
+   * (`@uniswap/sdk-core`'s `CurrencyAmount.add/subtract/multiply/divide`
+   * never touch `decimalScale` -- only `.toSignificant()`/`.toFixed()`/
+   * `.toExact()` do), but `.toSignificant()` on a `Price` DOES apply
+   * `baseCurrency.decimals`/`quoteCurrency.decimals` via its `scalar`
+   * getter (`@uniswap/sdk-core`'s `price.js`) -- exactly what
+   * `computePositionMetrics.ts` calls for these two fields. This
+   * independently re-derives the SAME price via the SDK's own
+   * `tickToPrice`, once at the REAL config decimals (6) and once at the
+   * old wrong default (18), to prove the production function's output
+   * matches the correct one and would have been ~10^12x off under the old
+   * default -- not a tautological re-statement of the production code.
+   */
+  it('matches an independently-computed decimals=6 price, and would differ from a decimals=18 computation by ~10^12x', () => {
+    expect(config.quoteAsset.DECIMALS).toBe(6);
+    const usdgIsCurrency0 = false;
+    const liquidity = deriveEntryLiquidity(usdgIsCurrency0);
+    const position = makePosition(usdgIsCurrency0);
+    const poolPrice: PoolPriceState = { sqrtPriceX96: sqrtAt(ENTRY_TICK), tickCurrent: ENTRY_TICK };
+
+    const result = computePositionMetrics(position, { ...NO_FEES, liquidity }, poolPrice);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    const otherToken = new Token(CHAIN_ID, TOKEN_LOW, position.tokenDecimals, 'TOKEN');
+    const usdgTokenCorrect = new Token(CHAIN_ID, USDG_ADDR, 6, 'USDG');
+    const usdgTokenWrong = new Token(CHAIN_ID, USDG_ADDR, 18, 'USDG');
+    const priceCorrect = v4Sdk.tickToPrice(otherToken, usdgTokenCorrect, ENTRY_TICK).toSignificant(6);
+    const priceWrong = v4Sdk.tickToPrice(otherToken, usdgTokenWrong, ENTRY_TICK).toSignificant(6);
+
+    // The production function (reading the REAL, now-fixed config.quoteAsset.DECIMALS=6) must match the independently-computed decimals=6 price exactly.
+    expect(result.currentPriceUsdgPerToken).toBe(priceCorrect);
+
+    // And that correct price must differ from what an 18-decimals build
+    // would have shown by ~10^12x -- proving this field genuinely was (and
+    // without the fix, would still be) broken by the exact magnitude found
+    // in Phase 12F, not a cosmetic rounding difference. Direction: USDG is
+    // the QUOTE currency here (`Price.scalar = 10^base.decimals /
+    // 10^quote.decimals`), so a too-HIGH configured quote decimals (18 vs
+    // the real 6) makes the wrong price SMALLER, not larger.
+    const ratio = Number(priceCorrect) / Number(priceWrong);
+    expect(ratio).toBeGreaterThan(1e11);
+    expect(ratio).toBeLessThan(1e13);
   });
 });

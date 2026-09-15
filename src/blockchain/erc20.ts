@@ -96,6 +96,41 @@ export async function readErc20Decimals(tokenAddress: Address): Promise<number> 
   });
 }
 
+/**
+ * Phase 12G fail-fast guard: confirms `config.quoteAsset.DECIMALS` (a
+ * static, trusted-everywhere value -- `mintTx.ts`, `removeLiquidityTx.ts`,
+ * `screeningCycle.ts`, `poolVolumeProvider.ts`, `computePositionMetrics.ts`
+ * all read it directly, none re-verify it) genuinely matches the USDG
+ * contract's own on-chain `decimals()` before the app starts screening or
+ * transacting. Reuses `readErc20Decimals` (the SAME generic ERC20 read
+ * already used for candidate tokens) rather than duplicating RPC logic --
+ * `readDecimals` stays injectable purely so this can be unit-tested without
+ * a live RPC call, the same discipline `capitalSnapshotProvider.ts`'s
+ * injectable `readBalance` and `mintTx.ts`'s injectable
+ * `discoverTokenId`/`ensureBinding` already use throughout this codebase.
+ *
+ * Deliberately does NOT catch/soften the on-chain read failing (e.g. RPC
+ * unreachable at startup) -- an unreadable USDG contract is itself a
+ * legitimate reason to fail fast, not a reason to silently skip the check
+ * and trust the static config.
+ */
+export async function assertQuoteAssetDecimalsMatchOnChain(
+  tokenAddress: Address,
+  configuredDecimals: number,
+  readDecimals: (tokenAddress: Address) => Promise<number> = readErc20Decimals,
+): Promise<void> {
+  const onChainDecimals = await readDecimals(tokenAddress);
+  if (onChainDecimals !== configuredDecimals) {
+    throw new Error(
+      `FATAL: quote asset decimals mismatch -- config.quoteAsset.DECIMALS is ${configuredDecimals} but the ` +
+        `real on-chain USDG contract (${tokenAddress}) reports decimals()=${onChainDecimals}. Every raw USDG ` +
+        'amount in mintTx.ts/removeLiquidityTx.ts/screeningCycle.ts/poolVolumeProvider.ts/computePositionMetrics.ts ' +
+        'would be misinterpreted by this codebase. Refusing to start. Fix USDG_DECIMALS in .env to match the real ' +
+        'on-chain value.',
+    );
+  }
+}
+
 /** Encodes calldata for an ERC20 `approve(spender, amount)` call -- `to` is the TOKEN contract itself (not the spender), matching ERC20's own call shape. */
 export function encodeErc20Approve(tokenAddress: Address, spender: Address, amount: bigint): { to: Address; data: `0x${string}` } {
   return {

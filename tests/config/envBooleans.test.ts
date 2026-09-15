@@ -29,6 +29,11 @@ const BASE_VALID_ENV: Record<string, string> = {
   JWT_SECRET: 'test-jwt-secret-not-for-real-use',
   // C5 fix: UNISWAP_API_KEY is now required (env.ts).
   UNISWAP_API_KEY: 'test-uniswap-trading-api-key-not-for-real-use',
+  // Phase 10A: CANARY_ENABLED's superRefine requires at least one numeric
+  // cap whenever it is "true" -- supplied here so this file's generic
+  // per-field "false"/"true" round-trip covers CANARY_ENABLED the same as
+  // every other boolean field, without special-casing it.
+  CANARY_MAX_POSITION_PCT: '0.01',
 };
 
 function discoverBooleanFields(): string[] {

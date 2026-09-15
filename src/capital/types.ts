@@ -28,6 +28,14 @@ export interface CapitalSnapshot {
  */
 export interface CapitalRules {
   MAX_ACTIVE_POSITIONS: number;
+  /**
+   * Phase 10C-REVISION: despite the field name (kept for historical/
+   * `settings/` API-surface compatibility -- see `settings/types.ts`),
+   * `decideCapitalAllocation` applies this fraction to the STABLE
+   * `basePortfolioBalance` (free + deployed), never to the current/
+   * shrinking free balance alone. See that function's doc comment for the
+   * full worked example and rationale.
+   */
   POSITION_SIZE_PCT_OF_FREE_BALANCE: number;
   MAX_TOTAL_DEPLOYED_PCT_OF_PORTFOLIO: number;
   ETH_GAS_RESERVE_ENABLED: boolean;

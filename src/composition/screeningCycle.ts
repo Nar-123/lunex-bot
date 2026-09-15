@@ -1,11 +1,14 @@
-import { getAddress } from 'viem';
+import { getAddress, parseUnits } from 'viem';
 import { Token } from '@uniswap/sdk-core';
 import { config } from '../config';
+import { classifyCandidates } from '../discovery/robinhoodStockClassifier';
 import { screenCandidates, getPassingCandidates } from '../filters/screenCandidate';
 import { selectPool } from '../pools/selectPool';
 import { computeLpRange } from '../strategies/computeLpRange';
 import { decideCapitalAllocation } from '../capital/decideCapitalAllocation';
 import type { CapitalRules } from '../capital/types';
+import { applyCanaryPositionCap, canaryAllowsNewEntry } from '../capital/canary';
+import type { CanaryRules } from '../capital/canary';
 import { openPosition } from '../positions/openPosition';
 import type { PositionPoolContext } from '../positions/types';
 import type { AppDeps } from './types';
@@ -70,17 +73,90 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
     return { candidatesEvaluated: 0, passed: 0, failed: 0, deployed: 0, skipped: [], paused: true };
   }
 
+  // Phase 10A: canary mode's own rules, read fresh every cycle from frozen
+  // `config.rules.canary` (never settings-derived -- unlike positionSizePct
+  // above, this is not a UI-exposed live toggle). `MAX_USDG` is converted
+  // from its human-readable config form to raw USDG units exactly once
+  // here, not re-parsed per candidate.
+  const canaryRules: CanaryRules = {
+    enabled: config.rules.canary.ENABLED,
+    maxPositionPct: config.rules.canary.MAX_POSITION_PCT,
+    maxUsdgRaw: config.rules.canary.MAX_USDG === null ? null : parseUnits(String(config.rules.canary.MAX_USDG), config.quoteAsset.DECIMALS),
+    maxPositions: config.rules.canary.MAX_POSITIONS,
+    stopAfterSuccess: config.rules.canary.STOP_AFTER_SUCCESS,
+  };
+  // No effect at all while canary is disabled (the default) --
+  // `canaryAllowsNewEntry` returns `true` unconditionally in that case, so
+  // this can never skip a cycle for a production run.
+  if (!canaryAllowsNewEntry(canaryRules, deps.canaryGuard.succeededCount())) {
+    deps.logger.info('screening_cycle', { canaryBlocked: true, candidatesEvaluated: 0, passed: 0, failed: 0, deployed: 0 });
+    return { candidatesEvaluated: 0, passed: 0, failed: 0, deployed: 0, skipped: [], paused: false };
+  }
+
   const capitalRules: CapitalRules = {
     ...config.rules.capital,
     MAX_ACTIVE_POSITIONS: settings.maxActivePositions,
     POSITION_SIZE_PCT_OF_FREE_BALANCE: settings.positionSizePct,
   };
 
-  const candidates = await deps.discoveryService.discoverTopCandidates();
+  // ASSET_TYPE (see `config/constants.ts`'s `FILTERS.ASSET_TYPE` doc
+  // comment) is back to fail-closed (`ENABLED: true`) now that
+  // `discovery/robinhoodStockClassifier.ts` can confirm the highest-risk
+  // case -- an official Robinhood Stock Token -- with an on-chain,
+  // non-heuristic check. This warning stays wired for the (currently
+  // dormant) case where ENABLED is deliberately flipped back off; read
+  // through a `boolean`-typed local for the same `no-unnecessary-condition`
+  // reasoning as `tryNextCandidateOnFailure` below.
+  const assetTypeFilterPolicy: { ENABLED: boolean } = config.rules.filters.ASSET_TYPE;
+  if (!assetTypeFilterPolicy.ENABLED) {
+    deps.logger.warn('asset_type_filter_disabled', {
+      reason: 'GMGN supplies no authoritative asset-classification field -- temporary Draft V1 deviation',
+      risk: 'equity/ETF/RWA/tokenized-stock-like tokens are not guaranteed to be excluded from deployment',
+    });
+  }
+
+  const discovered = await deps.discoveryService.discoverTopCandidates();
+  // Enriches `assetType` for any candidate that is a CONFIRMED official
+  // Robinhood Stock Token (on-chain EIP-1967 beacon check) -- never
+  // rewrites anything else. See `robinhoodStockClassifier.ts`'s doc
+  // comment: a `NON_STOCK`/`UNKNOWN` result is never treated as proof of
+  // Meme/Project, so it never changes `assetType`.
+  const candidates = await classifyCandidates(discovered, deps.stockClassifier);
   const screeningResults = await screenCandidates(candidates, {
     activePositionChecker: deps.activePositionChecker,
     cooldownChecker: deps.cooldown,
   });
+
+  // Phase 12D: diagnostic-only logging, closing the observability gap
+  // Phase 12C found -- `screeningResults` (full per-candidate `checks[]`)
+  // was previously computed here and then discarded, with only the
+  // aggregate `summary` below ever logged, leaving no trace of WHICH rule
+  // stopped a rejected candidate or WHY. This loop iterates the
+  // ALREADY-COMPUTED `screeningResults` read-only -- it re-evaluates
+  // nothing, calls no filter/check again, and runs entirely BEFORE
+  // `getPassingCandidates` below, so it cannot influence `passing`,
+  // `summary`, or which candidates proceed. A logging failure for one
+  // candidate (or all of them) is swallowed and can never affect the real
+  // screening result -- see `tests/composition/screeningCycle.test.ts`'s
+  // "logging failure cannot change screening result" test.
+  for (let i = 0; i < screeningResults.length; i++) {
+    const result = screeningResults[i];
+    if (!result || result.passed) continue;
+    try {
+      const failedCheck = result.checks.find((c) => c.rule === result.failedRule);
+      deps.logger.info('screening_rejection', {
+        address: result.tokenAddress,
+        symbol: result.symbol,
+        name: candidates[i]?.name,
+        failedRule: result.failedRule,
+        reason: failedCheck?.reason,
+        passedCheckCount: result.checks.filter((c) => c.passed).length,
+      });
+    } catch {
+      // Never let diagnostic logging affect the real screening pipeline.
+    }
+  }
+
   const passing = getPassingCandidates(candidates, screeningResults);
 
   const summary: ScreeningCycleSummary = {
@@ -112,13 +188,17 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
       if (!tryNextCandidateOnFailure) break;
       continue;
     }
+    // Phase 10A: only ever NARROWS the already-approved size above -- an
+    // identity function while canary is disabled, so production sizing is
+    // completely unaffected. See `capital/canary.ts`'s doc comment.
+    const positionSizeUsdgRaw = applyCanaryPositionCap(capitalDecision.positionSizeUsdgRaw, snapshot.freeUsdgBalance, canaryRules);
 
     const tokenAddress = getAddress(candidate.address);
     const tokenDecimals = await deps.readTokenDecimals(tokenAddress);
     const tokenSdk = new Token(config.chain.chainId, tokenAddress, tokenDecimals, candidate.symbol);
     const usdgSdk = new Token(config.chain.chainId, usdgAddress, config.quoteAsset.DECIMALS, 'USDG');
 
-    const poolResult = await selectPool(tokenSdk, usdgSdk, capitalDecision.positionSizeUsdgRaw, {
+    const poolResult = await selectPool(tokenSdk, usdgSdk, positionSizeUsdgRaw, {
       discovery: deps.poolDiscovery,
       state: deps.poolState,
       volume: deps.poolVolume,
@@ -156,7 +236,7 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
         pool,
         tickLower: rangeResult.tickLower,
         tickUpper: rangeResult.tickUpper,
-        entryUsdgRaw: capitalDecision.positionSizeUsdgRaw,
+        entryUsdgRaw: positionSizeUsdgRaw,
         entryTick: priceState.tickCurrent,
         entrySqrtPriceX96: priceState.sqrtPriceX96,
       },
@@ -174,6 +254,11 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
 
     if (openOutcome.outcome === 'ACTIVE' || openOutcome.outcome === 'PENDING') {
       summary.deployed++;
+      // Phase 10A: records the deployment against canary's own cross-cycle
+      // latch -- no-op semantically while canary is disabled (the guard's
+      // count is simply never checked in that case, see `canaryAllowsNewEntry`
+      // above), so this line has zero effect on production behavior.
+      if (canaryRules.enabled) deps.canaryGuard.recordSuccess();
     } else {
       summary.skipped.push({ symbol: candidate.symbol, stage: 'open', reason: openOutcome.reason });
       if (!tryNextCandidateOnFailure) break;

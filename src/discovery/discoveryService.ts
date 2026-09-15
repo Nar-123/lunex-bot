@@ -12,7 +12,7 @@ export class DiscoveryService {
 
   async discoverTopCandidates(): Promise<CandidateToken[]> {
     const tokens = await this.client.getTopTokens({
-      timeframe: config.rules.discovery.TIMEFRAME.toLowerCase(),
+      interval: config.rules.discovery.TIMEFRAME.toLowerCase(),
       limit: config.rules.discovery.TOP_N,
     });
     return tokens.slice(0, config.rules.discovery.TOP_N).sort((a, b) => a.rank - b.rank);

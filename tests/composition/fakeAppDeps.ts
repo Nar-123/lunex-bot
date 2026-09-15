@@ -10,6 +10,7 @@ import { InMemoryTransactionAttemptRepository } from '../execution/inMemoryTrans
 import { InMemoryExitStateRepository } from '../exits/inMemoryExitStateRepository';
 import { InMemorySettingsRepository } from '../settings/inMemorySettingsRepository';
 import { PositionCapitalSnapshotProvider } from '../../src/positions/capitalSnapshotProvider';
+import { InMemoryCanaryGuard } from '../../src/capital/canary';
 import { createInMemoryLogger } from '../../src/composition/logger';
 
 export const WALLET = '0x9999999999999999999999999999999999999999' as Address;
@@ -97,7 +98,12 @@ export function createFakeAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
     // (1000 USDG) means the snapshot genuinely reflects whatever the
     // in-memory repository's actual position rows are at read time.
     capitalSnapshot: new PositionCapitalSnapshotProvider(positions, WALLET, async () => USDG(1000)),
+    canaryGuard: new InMemoryCanaryGuard(),
     discoveryService: { discoverTopCandidates: vi.fn(async () => []) } as unknown as AppDeps['discoveryService'],
+    // Default fake: NON_STOCK, which is a no-op on `assetType` (see
+    // `applyStockClassification`), so existing fixtures (`assetType: 'Meme'`)
+    // pass through unchanged unless a test explicitly overrides this.
+    stockClassifier: { classify: vi.fn(async () => 'NON_STOCK' as const) },
     poolDiscovery: { findPoolsForPair: vi.fn(async () => [POOL_REF]) },
     poolState: {
       getState: vi.fn(async () => ({

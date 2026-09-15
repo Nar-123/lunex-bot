@@ -49,17 +49,27 @@ describe('PositionCapitalSnapshotProvider', () => {
 
   describe('invariant: no capital is counted as neither free nor deployed during the CLOSING window', () => {
     it('reproduces the exact gap scenario from review and confirms it is now rejected correctly', async () => {
-      // 1 ACTIVE (300) + 1 CLOSING (300) + 100 free.
-      // TRUE total portfolio = 700; true at-risk = 600 (closing capital
-      // is still fully locked); true 90% cap = 630; true room for a new
-      // position = 30. A naive 35%-of-free-balance new position (35) would
-      // push true exposure to 635 -- OVER the true cap -- and must be
-      // rejected. The pre-fix code (ACTIVE-only totalDeployedUsdg) saw
-      // totalPortfolio=400/cap=360/projected=335 and WRONGLY approved it.
+      // 1 ACTIVE (300) + 1 CLOSING (3000, deliberately large -- see below)
+      // + 100 free. Recalibrated for the 95% cap / truncate-not-reject
+      // production policy update: at the OLD 90%-cap/reject-outright
+      // policy, active=300/closing=300 was enough to demonstrate the gap.
+      // At 95% (more generous) PLUS truncation (a position is only ever
+      // rejected outright when remaining capacity is <= 0, not merely
+      // "less than the full 35% target"), that same small example no
+      // longer even reaches the cap -- so `closing` is made much larger
+      // here specifically to keep genuinely exercising the CLOSING-capital
+      // accounting gap this describe block is about, independent of the
+      // cap/truncation policy change:
+      //   CORRECT: deployed = 300+3000 = 3300, portfolio = 100+3300 = 3400,
+      //     95% cap = 3230, remaining = 3230-3300 = -70 -> REJECT (no room at all).
+      //   BUGGY (pre-fix, closing excluded from every sum -- vanishes
+      //     entirely, counted as neither free nor deployed): deployed=300
+      //     (active only), portfolio=100+300=400, cap=380, remaining=80,
+      //     target=35% of 100=35 <= 80 -> would have WRONGLY approved.
       const repo = new InMemoryPositionRepository();
       const active = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002', entryUsdgRaw: USDG(300) }));
       await repo.markActive(active.id, '1', new Date());
-      const closing = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000003', entryUsdgRaw: USDG(300) }));
+      const closing = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000003', entryUsdgRaw: USDG(3_000) }));
       await repo.markActive(closing.id, '2', new Date());
       await repo.markClosing(closing.id, 'exit:1');
 
@@ -68,13 +78,15 @@ describe('PositionCapitalSnapshotProvider', () => {
 
       // The snapshot itself must reflect the TRUE numbers, not the buggy ones.
       expect(snapshot.freeUsdgBalance).toBe(USDG(100));
-      expect(snapshot.totalDeployedUsdg).toBe(USDG(600)); // 300 + 300, not just 300
+      expect(snapshot.totalDeployedUsdg).toBe(USDG(3_300)); // 300 + 3000, not just 300
       expect(snapshot.activePositionsCount).toBe(2);
 
       const decision = decideCapitalAllocation(snapshot, RULES);
-      // 35% of 100 free = 35; projected deployed = 600 + 35 = 635;
-      // 90% of true portfolio (700) = 630 -- 635 > 630, must reject.
+      // True portfolio 3400, 95% cap 3230, already-deployed 3300 -> zero
+      // (negative) remaining capacity -- correctly rejected outright, not
+      // merely truncated, since there is no room left at all.
       expect(decision.ok).toBe(false);
+      if (!decision.ok) expect(decision.reason).toMatch(/remaining capacity/i);
     });
 
     it('the same scenario correctly ALLOWS a new deployment once true exposure has enough room', async () => {
@@ -194,7 +206,8 @@ describe('PositionCapitalSnapshotProvider', () => {
     it('reproduces the exact gap from review: an unresolved failed OPENING position wrongly REJECTS a deployment the true balance has ample room for, and markFailed fixes it', async () => {
       // Wallet genuinely holds 1000 USDG, completely free except for one
       // real ACTIVE position (100). A second, unrelated deploy attempt
-      // (B, sized at 850 in some earlier cycle) fails DEFINITIVELY --
+      // (B, sized at 950 -- recalibrated up from 850 for the 95% cap /
+      // truncate-not-reject policy update, see below) fails DEFINITIVELY --
       // pre-broadcast, at broadcast, or reverted, doesn't matter which --
       // its USDG never left the wallet, so onChainBalance stays 1000.
       const repo = new InMemoryPositionRepository();
@@ -203,31 +216,33 @@ describe('PositionCapitalSnapshotProvider', () => {
 
       const a = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002', entryUsdgRaw: USDG(100) }));
       await repo.markActive(a.id, '1', new Date());
-      const b = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000003', entryUsdgRaw: USDG(850) }));
+      const b = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000003', entryUsdgRaw: USDG(950) }));
       // B's deploy transaction fails definitively here. Before `markFailed`
       // existed, NOTHING could ever move B out of OPENING -- it stays
       // OPENING forever, not just for a brief mining-delay window.
 
       const stuckSnapshot = await provider.getSnapshot();
-      // Buggy-looking numbers: B's 850 is reserved out of free AND summed
+      // Buggy-looking numbers: B's 950 is reserved out of free AND summed
       // into deployed, even though it was never actually spent.
-      expect(stuckSnapshot.freeUsdgBalance).toBe(USDG(150)); // 1000 - 850, wrong: should be 1000
-      expect(stuckSnapshot.totalDeployedUsdg).toBe(USDG(950)); // 100 + 850, wrong: should be 100
+      expect(stuckSnapshot.freeUsdgBalance).toBe(USDG(50)); // 1000 - 950, wrong: should be 1000
+      expect(stuckSnapshot.totalDeployedUsdg).toBe(USDG(1_050)); // 100 + 950, wrong: should be 100
       // It does NOT disappear from both sums (the opposite failure mode) --
       // it's stuck double-committed, which is exactly why the accounting
       // identity below still balances even though every individual number
       // is wrong relative to the TRUE state:
-      expect(stuckSnapshot.freeUsdgBalance + stuckSnapshot.totalDeployedUsdg).toBe(USDG(1100));
+      expect(stuckSnapshot.freeUsdgBalance + stuckSnapshot.totalDeployedUsdg).toBe(USDG(1_100));
 
       const stuckDecision = decideCapitalAllocation(stuckSnapshot, RULES);
-      // TRUE state: free=1000, deployed=100, portfolio=1100, cap=990,
-      // true correct size=350, true projected=450 <= 990 -> SHOULD approve.
+      // TRUE state: free=1000, deployed=100, portfolio=1100, 95% cap=1045,
+      // true correct size=350, true projected=450 <= 1045 -> SHOULD approve.
       // But the stuck-OPENING phantom reservation makes it compute
-      // size=35%*150=52.5, projected=950+52.5=1002.5 > 990 (the cap) --
-      // a deployment that should be approved is wrongly REJECTED, and
-      // will stay wrongly rejected FOREVER (not just during a mining
-      // window), since nothing before `markFailed` existed to clear it.
+      // deployed=1050 against the SAME 1045 cap -- already past it, zero
+      // (negative) remaining capacity regardless of target -- a deployment
+      // that should be approved is wrongly REJECTED, and will stay wrongly
+      // rejected FOREVER (not just during a mining window), since nothing
+      // before `markFailed` existed to clear it.
       expect(stuckDecision.ok).toBe(false);
+      if (!stuckDecision.ok) expect(stuckDecision.reason).toMatch(/remaining capacity/i);
 
       // The fix: mark B's row FAILED once its transaction's definitive
       // failure is known (this is `executeCriticalTransaction` returning
@@ -244,7 +259,9 @@ describe('PositionCapitalSnapshotProvider', () => {
       const fixedDecision = decideCapitalAllocation(fixedSnapshot, RULES);
       expect(fixedDecision.ok).toBe(true);
       if (!fixedDecision.ok) throw new Error('unreachable');
-      expect(fixedDecision.positionSizeUsdgRaw).toBe(USDG(350)); // 35% of the true 1000 free
+      // Phase 10C-REVISION: target is 35% of the STABLE base portfolio
+      // balance (free 1000 + deployed 100 = 1100), not 35% of free alone.
+      expect(fixedDecision.positionSizeUsdgRaw).toBe(USDG(385));
     });
 
     it('three small stuck-FAILED positions can permanently exhaust MAX_ACTIVE_POSITIONS on their own, independent of capital size -- markFailed on all three restores availability', async () => {

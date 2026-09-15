@@ -1,9 +1,11 @@
+import type { Address } from 'viem';
 import { config } from './config';
 import { createRealAppDeps, startApp } from './composition';
 import { startApiServer } from './api';
 import { startTelegramBot } from './telegram';
 import type { RunningTelegramBot } from './telegram';
 import { disconnectPrismaClient } from './storage/prismaClient';
+import { assertQuoteAssetDecimalsMatchOnChain } from './blockchain/erc20';
 
 /**
  * Application entrypoint (Modules 9B + 10 + 11) — real wiring for all
@@ -17,6 +19,14 @@ import { disconnectPrismaClient } from './storage/prismaClient';
  * everything, wire OS signals for graceful shutdown).
  */
 async function main(): Promise<void> {
+  // Phase 12G: fail fast, before any deps/cycles/servers exist, if the
+  // static `config.quoteAsset.DECIMALS` this whole codebase trusts
+  // verbatim ever stops matching the real on-chain USDG contract's own
+  // `decimals()` -- see `blockchain/erc20.ts`'s doc comment. A thrown
+  // error here propagates to `main().catch()` below and exits(1) before
+  // touching capital, screening, or any transaction path.
+  await assertQuoteAssetDecimalsMatchOnChain(config.quoteAsset.ADDRESS as Address, config.quoteAsset.DECIMALS);
+
   const deps = createRealAppDeps();
   deps.logger.info('startup', { chainId: config.chain.chainId, env: config.nodeEnv, db: config.database.provider });
 

@@ -7,7 +7,7 @@ import {
   runGmgnCliJson,
   assertValidEvmAddress,
   assertValidChainSlug,
-  assertValidTimeframe,
+  assertValidInterval,
   assertValidLimit,
   type RunGmgnCliOptions,
 } from './cliExec';
@@ -37,12 +37,14 @@ export type RunCliFn = (
 
 /**
  * GMGN integration, implemented as a `gmgn-cli` child process rather than
- * a direct HTTP call (per verified production usage). Every argument that
- * reaches `execFile`'s argv is either a value we chose ourselves (chain
- * slug, timeframe, limit) or a GMGN-returned EVM address that has already
- * passed `assertValidEvmAddress` -- token name/symbol (free-form,
- * attacker-controlled) are NEVER passed as CLI arguments, only sanitized
- * for display (see `gmgnMapper.ts` / `sanitize.ts`).
+ * a direct HTTP call (per verified production usage; verified live against
+ * official gmgn-cli 1.6.2 -- see `gmgnMapper.ts`'s doc comment for the
+ * captured response shapes). Every argument that reaches `execFile`'s argv
+ * is either a value we chose ourselves (chain slug, interval, limit) or a
+ * GMGN-returned EVM address that has already passed `assertValidEvmAddress`
+ * -- token name/symbol (free-form, attacker-controlled) are NEVER passed as
+ * CLI arguments, only sanitized for display (see `gmgnMapper.ts` /
+ * `sanitize.ts`).
  *
  * `runCli` is injectable so tests can exercise the two-call
  * (trending + per-candidate token-info) orchestration, retry, and
@@ -67,14 +69,18 @@ export class GmgnCliClient implements GmgnClient {
     return this.apiKey ? { ...process.env, GMGN_API_KEY: this.apiKey } : process.env;
   }
 
-  async getTopTokens({ timeframe, limit }: GetTopTokensParams): Promise<CandidateToken[]> {
+  async getTopTokens({ interval, limit }: GetTopTokensParams): Promise<CandidateToken[]> {
     const chainSlug = assertValidChainSlug(getGmgnChainSlug(config.chain.chainId));
-    const safeTimeframe = assertValidTimeframe(timeframe);
+    const safeInterval = assertValidInterval(interval);
     const safeLimit = assertValidLimit(limit);
 
     const trendingBody = await this.runCli(
       this.cliPath,
-      ['market', 'trending', '--chain', chainSlug, '--timeframe', safeTimeframe, '--limit', String(safeLimit), '--json'],
+      // Verified against installed official gmgn-cli 1.6.2: the trending
+      // subcommand's window flag is `--interval` (1m/5m/1h/6h/24h), and
+      // JSON-on-stdout is the CLI's default -- `--raw` only switches from
+      // pretty-printed to single-line JSON, both JSON.parse-able either way.
+      ['market', 'trending', '--chain', chainSlug, '--interval', safeInterval, '--limit', String(safeLimit), '--raw'],
       { ...this.execOptions, env: this.childEnv() },
     );
 
@@ -89,7 +95,7 @@ export class GmgnCliClient implements GmgnClient {
         const address = assertValidEvmAddress(partial.address);
         const infoBody = await this.runCli(
           this.cliPath,
-          ['token', 'info', '--chain', chainSlug, '--address', address, '--json'],
+          ['token', 'info', '--chain', chainSlug, '--address', address, '--raw'],
           { ...this.execOptions, env: this.childEnv() },
         );
         const tokenInfo = parseTokenInfo(infoBody);

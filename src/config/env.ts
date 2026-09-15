@@ -66,7 +66,20 @@ const envSchema = z.object({
 
   // Token / protocol addresses
   USDG_TOKEN_ADDRESS: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
-  USDG_DECIMALS: z.coerce.number().int().min(0).max(18).default(18),
+  /**
+   * Phase 12G fix: the real on-chain USDG contract on Robinhood Chain
+   * (`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168`) returns `decimals() = 6`
+   * (verified directly via `eth_call`, selector `0x313ce567` -- see Phase
+   * 12F/12G). The default here was previously `18` (a plausible-looking but
+   * WRONG guess -- USDG is not an 18-decimal token like most ERC20s), which
+   * every USDG-decimals-sensitive code path (`config/constants.ts`'s
+   * `QUOTE_ASSET.DECIMALS`) trusted verbatim. `index.ts`'s startup sequence
+   * additionally calls `blockchain/erc20.ts`'s
+   * `assertQuoteAssetDecimalsMatchOnChain` to fail fast if this value is
+   * ever wrong again (a redeployed/migrated USDG, a copy-paste `.env`
+   * mistake) rather than silently trusting a static number forever.
+   */
+  USDG_DECIMALS: z.coerce.number().int().min(0).max(18).default(6),
 
   UNISWAP_V2_FACTORY_ADDRESS: z.string().optional().default(''),
   UNISWAP_V2_ROUTER_ADDRESS: z.string().optional().default(''),
@@ -240,6 +253,17 @@ const envSchema = z.object({
   ETH_GAS_RESERVE_ENABLED: booleanEnv(false),
   ETH_GAS_RESERVE_MIN: z.coerce.number().min(0).default(0),
 
+  // Phase 10A: canary mode — a dedicated, disabled-by-default position-size
+  // cap for the FIRST live transaction, entirely separate from CAPITAL's
+  // 35% production default. The two numeric caps are deliberately left
+  // `.optional()` with NO default value -- an invented "safe-looking"
+  // number here would be exactly the kind of unapproved capital-allocation
+  // change this feature exists to prevent. They stay unset until an
+  // operator explicitly configures at least one (enforced below).
+  CANARY_ENABLED: booleanEnv(false),
+  CANARY_MAX_POSITION_PCT: z.coerce.number().gt(0).max(1).optional(),
+  CANARY_MAX_USDG: z.coerce.number().positive().optional(),
+
   // TIER 3 (Meridian alignment): the exit price-impact gate is now ON by
   // default -- Meridian's measured `maxExitPriceImpactPct: 0.5` is the
   // single filter its own strategy doc credits with working against a
@@ -269,6 +293,20 @@ const envSchema = z.object({
         `${invalidEntries.map((e) => `"${e}"`).join(', ')} -- must be a comma-separated list of positive integer ` +
         'Telegram user ids (whitespace around entries and empty segments from stray commas are tolerated; ' +
         'anything else is rejected rather than silently dropped or parsed as NaN).',
+    });
+  }
+
+  // Phase 10A: an operator who sets CANARY_ENABLED=true without configuring
+  // EITHER numeric cap would otherwise silently get the full 35% production
+  // size on the very first live transaction -- exactly the outcome canary
+  // mode exists to prevent. Fail startup loudly instead.
+  if (data.CANARY_ENABLED && data.CANARY_MAX_POSITION_PCT === undefined && data.CANARY_MAX_USDG === undefined) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['CANARY_ENABLED'],
+      message:
+        'CANARY_ENABLED=true requires at least one of CANARY_MAX_POSITION_PCT or CANARY_MAX_USDG to be set -- ' +
+        'an operator-defined cap, never invented by the code. Set one (or both) before enabling canary mode.',
     });
   }
 });

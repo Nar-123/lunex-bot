@@ -60,6 +60,90 @@ export const FILTERS = {
     'Wrapped Stock',
     'Unknown',
   ] as const,
+  /**
+   * `ALLOWED_ASSET_TYPES` / `REJECTED_ASSET_TYPES` above are Draft V1's
+   * ORIGINAL spec-locked allow-list rule, preserved EXACTLY as they always
+   * meant -- never silently repurposed. They remain the live definition of
+   * `'ALLOW_LIST'` mode below (historical reference / rollback path), but
+   * `'ALLOW_LIST'` is NOT the current default -- see `ASSET_TYPE_MODE`.
+   *
+   * HISTORY (2026-09-14):
+   * 1. Live verification (gmgn-cli 1.6.2, `market trending --raw` against
+   *    the real GMGN OpenAPI) found GMGN supplies NO asset-type, category,
+   *    or equivalent classification field at all -- not "returns an
+   *    unrecognized value" (which `'Unknown'` was designed to catch, per
+   *    `gmgnMapper.ts`'s `normalizeAssetType`), but "the field is entirely
+   *    absent." Every live candidate mapped to `'Unknown'`, rejected by
+   *    this filter regardless of merit -- ENABLED was temporarily set to
+   *    `false` (analysis + approval in that phase's session notes) so
+   *    `checkAssetType` stayed intact and fully reported, just non-blocking.
+   * 2. Follow-up research located a REAL, non-heuristic secondary signal:
+   *    every verified Robinhood Stock Token is deployed as an EIP-1967
+   *    `BeaconProxy` pointing at one shared Robinhood-controlled
+   *    implementation contract -- a structural on-chain fact, not a
+   *    third party's opinion, and confirmed (live, this chain) to NOT be
+   *    fooled by a ticker-squatting impostor ("AAPL Cat" resolves to an
+   *    unrelated implementation). See `discovery/robinhoodStockClassifier.ts`.
+   * 3. `ENABLED` was restored to `true`: this check can confirm the
+   *    highest-risk case (an official Robinhood Stock Token) with
+   *    certainty, but it can ONLY ever produce a REJECT-confirming
+   *    answer -- `NON_STOCK` is never proof of `'Meme'`/`'Project'`
+   *    (Robinhood Chain is permissionless; independent third parties
+   *    deploy their OWN tokenized RWAs outside Robinhood's own registry).
+   *    Under `ALLOW_LIST` mode, nothing found anywhere establishes a
+   *    POSITIVE Meme/Project signal, so `'Unknown'` stayed rejected per
+   *    Draft V1's original fail-closed intent. Exhaustive multi-phase
+   *    research (Phase 11/11B/11C) into first-party, on-chain-structural,
+   *    and editorial-aggregator sources found none address-bound and
+   *    authoritative enough to safely automate.
+   * 4. PHASE 12 (2026-09-15) -- OPERATOR-APPROVED SPECIFICATION REVISION,
+   *    not a bug fix: `Draft V1` §3's positive-classification requirement
+   *    is deliberately REVISED (the "Option B" path the Phase-11-era
+   *    decision record named as the only way to reopen this). New default
+   *    mode is `'STOCK_ONLY'`:
+   *      OLD (`ALLOW_LIST`, Draft V1 §3 original): Meme/Project allowed,
+   *        every other type (including Unknown) rejected.
+   *      NEW (`STOCK_ONLY`, Phase 12): only a CONFIRMED Robinhood Stock
+   *        Token is rejected; every other candidate (including Unknown --
+   *        now understood as "not positively classified as Stock," never
+   *        again as an automatic reject) continues past this gate.
+   *    Reason (operator's own words): the operator chose not to keep
+   *    blocking genuine crypto tokens merely because no authoritative
+   *    positive Meme/Project source exists -- confirmed absent by three
+   *    full research phases, not a gap this revision papers over.
+   *    Uniswap V2/V3/V4 venue is explicitly NOT an asset class under
+   *    either mode (unchanged, see `robinhoodStockClassifier.ts`, proven
+   *    by the TWINE regression in `tests/filters/assetType.test.ts`).
+   *    STOCK_ONLY mode is driven by `CandidateToken.stockClassification`
+   *    (the classifier's own three-value result: `ROBINHOOD_OFFICIAL_STOCK`
+   *    / `NON_STOCK` / `UNKNOWN`), NOT by the flattened `assetType`
+   *    string -- deliberately, so a classifier RPC failure or malformed
+   *    beacon read (`UNKNOWN`) is REJECTED, never silently treated as
+   *    "not stock, therefore safe." See `filters/rules/assetType.ts`'s
+   *    doc comment for the exact fail-safe logic.
+   *
+   * `screenCandidate()` (`filters/screenCandidate.ts`) still supports an
+   * explicit `assetTypeEnabled` override for tests; production always
+   * reads `ASSET_TYPE.ENABLED`/`ASSET_TYPE_MODE` from this constant.
+   * `composition/screeningCycle.ts` still logs a prominent
+   * `asset_type_filter_disabled` warning every cycle IF `ENABLED` is ever
+   * flipped back to `false` -- currently dormant, unaffected by the mode
+   * change above.
+   */
+  ASSET_TYPE: {
+    ENABLED: true,
+  },
+  /**
+   * Phase 12 (2026-09-15), operator-approved: `'STOCK_ONLY'` is the new
+   * default -- reject only a confirmed Robinhood Stock Token, allow every
+   * other outcome (including a classifier result of `NON_STOCK` OR a
+   * candidate whose `assetType` is `'Unknown'`) to continue past this
+   * gate. `'ALLOW_LIST'` preserves the original Draft V1 §3 behavior
+   * (`ALLOWED_ASSET_TYPES`/`REJECTED_ASSET_TYPES` above) for historical
+   * reference / an explicit future rollback -- never removed, never
+   * silently repurposed.
+   */
+  ASSET_TYPE_MODE: 'STOCK_ONLY' as const,
   COOLDOWN_MS: 2 * 60 * 60 * 1000, // 2 hours, per-token (NOT global)
   // Explicitly NOT a filter — do not add a honeypot check here or elsewhere.
   HONEYPOT_CHECK_INCLUDED: false,
@@ -104,6 +188,18 @@ export const PRICE_IMPACT = {
   MAX_EXIT_IMPACT_PCT: 0.005, // 0.5% -- Meridian `maxExitPriceImpactPct`
 } as const;
 
+/**
+ * Phase 12G: `DECIMALS` MUST equal the real on-chain USDG contract's own
+ * `decimals()` (confirmed `6`, not the generic-ERC20-shaped `18` this was
+ * previously misconfigured as -- see `env.ts`'s doc comment on
+ * `USDG_DECIMALS` for the full incident record). Every USDG `Token`/`Price`
+ * construction across the codebase (`mintTx.ts`, `removeLiquidityTx.ts`,
+ * `screeningCycle.ts`, `poolVolumeProvider.ts`, `computePositionMetrics.ts`)
+ * trusts this value verbatim and is NOT re-validated per call site --
+ * `index.ts`'s startup sequence is the single fail-fast guard that this
+ * static value still matches the live chain, via
+ * `blockchain/erc20.ts`'s `assertQuoteAssetDecimalsMatchOnChain`.
+ */
 export const QUOTE_ASSET = {
   SYMBOL: 'USDG',
   ADDRESS: env.USDG_TOKEN_ADDRESS,
@@ -135,7 +231,12 @@ export const CAPITAL = {
   // (not 35% of the original/starting balance).
   POSITION_SIZE_PCT_OF_FREE_BALANCE: 0.35,
   MAX_ACTIVE_POSITIONS: 3,
-  MAX_TOTAL_DEPLOYED_PCT_OF_PORTFOLIO: 0.9, // hard cap
+  // Global exposure hard cap. Each entry TARGETS 35% of free balance, but
+  // is truncated to whatever remaining capacity is left under this cap --
+  // see `decideCapitalAllocation.ts`'s doc comment for the exact formula.
+  // 90% -> 95%: an explicit operator policy update, not a relaxation of
+  // the per-entry 35% target, which is unchanged.
+  MAX_TOTAL_DEPLOYED_PCT_OF_PORTFOLIO: 0.95, // hard cap
   ONE_POSITION_PER_TOKEN: true,
 
   /**
@@ -146,6 +247,27 @@ export const CAPITAL = {
    */
   ETH_GAS_RESERVE_ENABLED: env.ETH_GAS_RESERVE_ENABLED, // default false
   ETH_GAS_RESERVE_MIN: env.ETH_GAS_RESERVE_MIN, // TBD, feature currently disabled; default 0
+} as const;
+
+// ---------------------------------------------------------------------------
+// 5a. Canary Mode (Phase 10A) -- a dedicated, disabled-by-default cap for
+// the FIRST live transaction, entirely separate from CAPITAL's 35%
+// production default above, which this block never changes or reads from.
+// MAX_POSITIONS and STOP_AFTER_SUCCESS are fixed by design (a canary run is
+// a one-shot pipeline proof, not a tunable concurrency limit) -- only
+// ENABLED and the two size caps are operator-configurable, and the size
+// caps are deliberately `null` (never invented) until an operator sets
+// them via env; `env.ts`'s superRefine already refuses to start if
+// ENABLED=true with both caps unset.
+// ---------------------------------------------------------------------------
+export const CANARY = {
+  ENABLED: env.CANARY_ENABLED, // default false
+  /** Fraction 0-1 of free USDG balance (e.g. 0.01 = 1%). `null` = not configured. */
+  MAX_POSITION_PCT: env.CANARY_MAX_POSITION_PCT ?? null,
+  /** Absolute cap, human USDG units (e.g. 50 = 50 USDG) -- converted to raw units at the point of use via `QUOTE_ASSET.DECIMALS`. `null` = no absolute cap configured. */
+  MAX_USDG: env.CANARY_MAX_USDG ?? null,
+  MAX_POSITIONS: 1,
+  STOP_AFTER_SUCCESS: true,
 } as const;
 
 // ---------------------------------------------------------------------------

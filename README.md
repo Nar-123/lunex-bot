@@ -3266,3 +3266,323 @@ both legs' verify functions, four `executeExit` end-to-end scenarios
 (remove-leg and swap-leg proceeds failure, interrupted receipt wait with
 TOKEN balance 0, resumed signed swap that reverted), and a real-SQLite
 round-trip of the new column.
+
+## Validation phase — ASSET_TYPE temporary deviation (approved 2026-09-14)
+
+Live GMGN verification (gmgn-cli 1.6.2, `market trending --raw` against the
+real GMGN OpenAPI, Robinhood Chain, all 10 live candidates audited
+field-by-field — fixtures: `tests/discovery/fixtures/gmgn_trending.json`,
+`gmgn_tokeninfo.json`) confirmed GMGN supplies **no asset-type, category,
+or equivalent classification field at all**. This is a different failure
+mode than the one `ASSET_TYPE`'s `'Unknown'` bucket was originally designed
+for (Module 2: *"an unrecognized `asset_type` string normalizes to
+`'Unknown'`, which is on the rejected list"* — i.e. GMGN returns a value we
+don't recognize). Here GMGN never sends the field at all, so every
+candidate maps to `'Unknown'` and the filter rejects 100% of candidates
+regardless of merit — the fail-safe for "unrecognized category" became, in
+practice, "always closed."
+
+**Origin traced** (blocker analysis, 2026-09-14): `ASSET_TYPE` is a Draft
+V1 rule present since the initial commit, not something introduced during
+GMGN integration work. It has **no Meridian equivalent** — Meridian's
+codebase mentions `asset_type` exactly once, as an unused passthrough field
+on a Jupiter API model (`models/token.rs`); its actual screening filter
+(`tools/screening.rs`) never references it, and its memecoin scope comes
+structurally from only ever querying Meteora DLMM SOL pools, not from a
+classification gate. `ASSET_TYPE` is a Lunex-specific control, needed
+because Robinhood Chain (unlike Meridian's Solana/Meteora venue) can list
+literal equities/ETFs/RWAs alongside memecoins.
+
+**Data-source audit** (why no field can substitute, per the same "no
+invented conversion, no substitute metric" resolution rule as LOW_YIELD
+below): the full live payload was inspected end-to-end. `launchpad` /
+`launchpad_platform` (e.g. `"pons"`, `"pons_v2"`, `"longxyz"`) identifies
+the *launch venue*, not an asset class, and GMGN documents no
+launchpad→asset-type mapping — using it would be exactly the undocumented
+heuristic ruled out by the approving decision. `standard` (`"erc20"`) is a
+token standard every token on the chain shares, including a tokenized
+stock. No other field in either the `market trending` or `token info`
+payload carries a classification signal.
+
+**Resolution (Decision Matrix option C — temporary, reversible):**
+
+- `FILTERS.ASSET_TYPE.ENABLED` is now `false` (`src/config/constants.ts`).
+  `ALLOWED_ASSET_TYPES`, `REJECTED_ASSET_TYPES`, `checkAssetType`'s logic,
+  its rejection reason string, and its unit tests
+  (`tests/filters/assetType.test.ts`) are completely unchanged — disabling
+  a rule is a policy default, not a removal, matching the `LOW_YIELD`
+  precedent below.
+- `screenCandidate()` (`src/filters/screenCandidate.ts`) still ALWAYS
+  computes `checkAssetType` and includes it in every `ScreeningResult.checks`
+  entry — the true pass/fail against the allow-list stays visible for
+  logs/reporting. Disabling only removes it from the set of checks that can
+  set `failedRule`/`passed = false`. `token.assetType` is never rewritten,
+  and no heuristic classification is substituted anywhere.
+- `runScreeningCycle` (`src/composition/screeningCycle.ts`) logs a `warn`
+  (`asset_type_filter_disabled`) every non-paused cycle while the flag is
+  `false`, so the deviation can never go unnoticed in operational logs.
+- **Re-enabling** requires a trustworthy Robinhood Chain asset-classification
+  source (Decision Matrix option A — e.g. a second authoritative data
+  provider, or GMGN adding the field back), then flipping `ENABLED` back to
+  `true`. No other code change is needed to re-enable it.
+
+**Remaining risk while disabled:** a listed equity/ETF/RWA/tokenized-stock
+token on Robinhood Chain is **not guaranteed to be excluded** from
+deployment by this filter — it can still be rejected by the other 7 hard
+filters (market cap, age, volume, fee, holder concentration, duplicate
+position, cooldown), but nothing today specifically screens for asset
+class. This is the deliberate, logged trade-off approved to unblock live
+candidates until a real classification source exists.
+
+## Validation phase — ASSET_TYPE restored: on-chain Robinhood Stock Token classifier
+
+Follow-up research (same date) found a REAL, non-heuristic secondary
+classification source and this phase wires it in, restoring the filter
+above to its original fail-closed default.
+
+**Source, verified on-chain, not a third party's claim.** Every verified
+Robinhood Stock Token is deployed as an **EIP-1967 `BeaconProxy`**
+pointing at ONE shared, Robinhood-controlled implementation contract.
+`discovery/robinhoodStockClassifier.ts` reads the standard EIP-1967 beacon
+storage slot (`0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50`
+— independently recomputed via `keccak256('eip1967.proxy.beacon') - 1` and
+confirmed against a real `eth_getStorageAt` read on NVDA's live contract,
+after an initial one-hex-digit transcription error in this same slot value
+was caught by that live check and corrected; see "Live validation" below)
+directly via Lunex's existing read-only viem client, resolves the beacon's
+`implementation()`, and compares it to Robinhood's currently-verified
+"Stock" implementation contract
+(`0xb35490d6f9163DE4F80d88dc75c3516eb64C5aE2`). No new HTTP dependency, no
+API key, no rate limit beyond Lunex's own RPC quota — this is a structural
+fact about the token contract's own code, not an opinion from GMGN,
+Robinscan, or any explorer.
+
+**Live-verified this session** (browser network calls against
+`robinhoodchain.blockscout.com`, the chain's official explorer):
+- NVDA and AAPL (real Robinhood Stock Tokens) both resolve to the Stock
+  implementation above.
+- **"AAPL Cat"** — a real on-chain token that puts `AAPL` in its NAME to
+  look like the real thing — resolves to a completely different,
+  unrelated implementation (`DropERC20`, an `EIP-1167` minimal-clone
+  pattern). This is direct, empirical proof the check is NOT fooled by
+  name/ticker similarity — it never even looks at name or symbol.
+- Every real memecoin candidate checked (PONS, TWINE, DARWIN, PROHUMAN,
+  RSTR, IA, Franklin, RSI, 富贵) has no beacon slot set at all.
+
+**What this can and cannot prove — read carefully, this shaped every
+decision below:**
+- `ROBINHOOD_OFFICIAL_STOCK`: high-confidence REJECT signal — maps to the
+  existing `'Stock'` entry in `REJECTED_ASSET_TYPES` (already covers both
+  equities and ETFs; Robinhood's own product structure doesn't sub-type
+  them, so neither does this check — no sub-typing is needed since both
+  are rejected identically).
+- `NON_STOCK`: this token is NOT one of Robinhood's own Stock Tokens. It
+  is **NEVER** proof that the token is a genuine Meme/Project — Robinhood
+  Chain is confirmed **permissionless**, and independent third parties
+  deploy their OWN tokenized funds/private-credit/real-estate RWAs
+  outside Robinhood's own registry. `applyStockClassification` therefore
+  leaves `assetType` completely untouched for `NON_STOCK` (and
+  `UNKNOWN`) — it never maps either to an allowed type.
+- `UNKNOWN`: the check could not complete (RPC failure, malformed/non-
+  conforming beacon call). Never a pass, never a confirmed reject — see
+  `OnChainRobinhoodStockClassifier`'s doc comment for the exact fail-
+  closed branch on every error path.
+
+**Wiring:** `composition/screeningCycle.ts` calls
+`classifyCandidates(discovered, deps.stockClassifier)` immediately after
+discovery, before `screenCandidates()` runs — every candidate's
+`assetType` is enriched (or left alone) before the existing, completely
+unchanged `checkAssetType` rule ever sees it. `composition/deps.ts` wires
+the real `CachedRobinhoodStockClassifier(new OnChainRobinhoodStockClassifier())`;
+the cache never stores an `UNKNOWN` result (a transient RPC failure is
+always retried next cycle, never allowed to "stick" as a stale
+classification), and caches the two definitive outcomes since a beacon's
+implementation is a structural on-chain fact that doesn't flip cycle-to-
+cycle.
+
+**`FILTERS.ASSET_TYPE.ENABLED` is `true` again** (`src/config/constants.ts`).
+This is the FIRST-implementation, deliberately conservative choice: since
+nothing anywhere establishes a POSITIVE Meme/Project classification
+signal (this check only ever produces a reject-confirming or an
+inconclusive answer), Draft V1's original fail-closed intent — reject
+`'Unknown'` — has to stay in force for the filter to mean anything. In
+practice today this means: a confirmed Stock Token is rejected with
+certainty and an accurate `'Stock'` reason; everything else is still
+`'Unknown'` and still rejected, exactly as Draft V1 always specified.
+**Throughput is not restored by this phase** — that requires a genuine
+POSITIVE classification source, which remains explicitly future work; no
+heuristic (name, symbol, launchpad, website, Twitter, `pool.exchange`,
+GMGN tags) was substituted for one, per the same rule that has applied
+throughout this whole investigation.
+
+**Tests:** `tests/discovery/robinhoodStockClassifier.test.ts` covers every
+branch of the classifier (matching/non-matching implementation, zero
+beacon slot, RPC failure, malformed beacon call, the cache's asymmetric
+UNKNOWN-is-never-cached behavior, and the "AAPL Cat" impostor scenario
+using its real on-chain implementation address) plus the pure
+`applyStockClassification`/`classifyCandidates` enrichment logic in
+isolation. `tests/composition/screeningCycle.test.ts` proves the
+end-to-end case: a candidate the classifier confirms as
+`ROBINHOOD_OFFICIAL_STOCK` never reaches capital allocation, pool
+selection, or `openPosition` — confirmed via a `capitalSnapshot.getSnapshot`
+spy that is never called.
+
+## Validation phase — ASSET_TYPE positive-classification decision (operator checkpoint)
+
+**Draft V1 §3 confirmed authoritative, verbatim, against the original
+source document** (Robinhood USDG Auto-LP Bot — Project Strategy &
+Technical Draft V1, §3 Token Screening — supplied and quoted directly by
+the operator, not inferred from this codebase or from Meridian):
+
+> "Setiap kandidat harus melewati hard filter berikut... Allowed Asset —
+> Meme / Project. Rejected — Stock, ETF, Index, RWA, Tokenized Equity,
+> Wrapped Stock, Unknown."
+
+This settles, from the primary source itself, a question the earlier
+temporary-deviation phase could only infer: the spec requires **positive**
+classification into `Meme`/`Project` before a candidate may pass — mere
+exclusion of TradFi-shaped categories is NOT sufficient on its own — and
+`Unknown` is named directly in the Rejected row, on equal footing with
+`Stock`/`RWA`/etc. Every element of this — the two-member allow-list, the
+seven-member reject-list including `Unknown`, and the "hard filter...
+must pass" (mandatory, blocking) framing — was found to be an **exact
+match** to the current implementation (`FILTERS.ALLOWED_ASSET_TYPES`,
+`FILTERS.REJECTED_ASSET_TYPES`, `FILTERS.ASSET_TYPE.ENABLED: true`). No
+divergence exists between spec and code.
+
+**Follow-up research** (same investigation) looked for an authoritative
+source that could positively confirm `Meme`/`Project` status, so
+screening could resume passing real candidates. Checked exhaustively:
+every documented GMGN CLI command (not just the two already integrated —
+`market search`, `market signal`, `token security`, `token pool` included,
+none carry a classification field on any chain GMGN serves, Solana
+included); Robinhood's own first-party sources (Stock-Token-only, no
+community/meme registry exists — the chain is permissionless and
+Robinhood's own terms disclaim control over third-party deployments);
+`robinhoodchain.blockscout.com`'s `public_tags` (empty for every
+non-stock token checked); `chain4663.com` (a stale, paused, Stock/ETF-only
+mirror); Trust Wallet's `assets` repo (no Robinhood Chain folder exists at
+all); CoinGecko and CoinMarketCap categories (both self-submitted by
+project teams and editorially reviewed, not structural facts — CoinGecko
+does carry real signal where it has coverage, e.g. 富贵 and Cash Cat both
+correctly tagged `Meme`, Morpho correctly tagged `DeFi`/`Lending` and NOT
+`Meme` — but coverage is confirmed insufficient for Lunex's actual
+discovery universe: "Recursive Self Inu," a genuine GMGN-discovered
+low-cap candidate, has zero CoinGecko presence, and PONS — one of Lunex's
+own most-often-rediscovered candidates — is tagged `Launchpad`, not
+`Meme`). **No source found meets the bar for a production blocking PASS
+authority.**
+
+**Operator decision (this phase):** presented with exactly two options —
+(A) preserve Draft V1 exactly, accepting that new-entry screening stays
+closed until a sufficiently authoritative positive source exists, or (B)
+formally revise Draft V1 itself from a positive-classification
+requirement to an exclusion-based one — **the operator selected Option
+A.** No strategy revision is authorized.
+
+**Recorded decision:** *Operator selected Option A: Draft V1 is preserved
+without amendment. New-entry screening remains closed until a
+sufficiently authoritative positive Meme/Project classification source
+becomes available.*
+
+**What this is, and is not:**
+- This is an **external data-source limitation**, not an implementation
+  defect. The code correctly and faithfully enforces exactly what Draft
+  V1 §3 specifies; the gap is that no real-world data provider currently
+  supplies the field the spec's positive-classification requirement
+  presupposes.
+- The **current `ASSET_TYPE` implementation is spec-compliant** —
+  confirmed against the primary source document, not inferred.
+- **0 of 10 live GMGN-discovered candidates passing `ASSET_TYPE` is the
+  EXPECTED outcome** under currently available data, not a bug, a
+  regression, or something to silently work around.
+- The **on-chain Robinhood Stock Token classifier remains enabled and
+  fail-closed** exactly as built (`discovery/robinhoodStockClassifier.ts`,
+  `FILTERS.ASSET_TYPE.ENABLED: true`) — it continues to confirm the one
+  case it CAN prove with certainty (an official Robinhood Stock Token),
+  while `NON_STOCK`/`UNKNOWN` continue to fall through to `'Unknown'`,
+  rejected, never inferred to `Meme`/`Project`.
+- **No heuristic was introduced**, CoinGecko was NOT wired in as a
+  blocking authority, and no code, test, or configuration value was
+  changed by this decision — this section is documentation of an operator
+  decision, not an implementation change.
+
+**Re-opening this decision requires either:** a genuinely authoritative
+positive Meme/Project classification source being found (none currently
+qualifies, per the research above), or an explicit future Option-B
+approval — a documented strategy revision to Draft V1 itself, with the
+same operator sign-off process used here, before any code changes.
+
+## Phase 12 (2026-09-15) — Operator decision: Stock-only asset exclusion
+
+**This is the Option-B approval the section above named as the only way
+to reopen the prior decision.** It is an explicit, operator-approved
+**specification revision to Draft V1 §3** — not a bug fix, not an
+implementation correction, and not a silent reinterpretation of any
+existing constant.
+
+**Context:** Phases 11 / 11B / 11C each independently researched whether
+a sufficiently authoritative positive Meme/Project classification source
+now exists (editorial aggregators, first-party issuer documentation,
+on-chain structural evidence). All three concluded: no — coverage stayed
+low (worst case), self-submitted/editorial in nature (best case found:
+CoinGecko + CoinMarketCap tags, corroborated for exactly 1 of 10 real
+GMGN candidates), and no first-party or on-chain source was found that
+binds to an exact contract address with documented, non-heuristic
+semantics. See those phases' session records for the full research.
+
+**Operator's decision, in the operator's own words:** rather than
+continue blocking genuine crypto tokens purely because no authoritative
+positive Meme/Project source exists, the operator chose to revise the
+gate itself — reject only what can be POSITIVELY, structurally confirmed
+as a Stock Token (the one classification this bot has always been able
+to prove with certainty), and allow everything else to continue into the
+rest of the pipeline.
+
+**OLD policy (`ALLOW_LIST` mode, Draft V1 §3 original — preserved in code
+for historical reference/rollback, no longer the default):**
+- `Meme` / `Project` → allowed
+- `Unknown` → rejected
+- `Stock` (and every other TradFi-shaped category) → rejected
+
+**NEW policy (`STOCK_ONLY` mode, Phase 12 — current production default):**
+- Confirmed Stock (on-chain `ROBINHOOD_OFFICIAL_STOCK`) → **rejected**
+  (hard safety, unchanged)
+- Confirmed non-Stock (on-chain `NON_STOCK`) → **allowed to continue**
+- `Unknown` → **allowed to continue**, now correctly understood as "not
+  positively classified as Stock" rather than an automatic reject — but
+  **only once the Stock classifier has actually run**; see the fail-safe
+  note below
+- Uniswap V2/V3/V4 venue → **never** an asset class by itself, under
+  either mode (unchanged; proven by the real TWINE regression)
+
+**Critical fail-safe preserved, not weakened:** `STOCK_ONLY` mode's
+`checkAssetType` (`filters/rules/assetType.ts`) reads the classifier's
+own three-value result (`CandidateToken.stockClassification`:
+`ROBINHOOD_OFFICIAL_STOCK` / `NON_STOCK` / `UNKNOWN`) — NOT the flattened
+`assetType` string, which reads `'Unknown'` in BOTH the "confirmed
+non-stock" and "classifier failed to resolve" cases and therefore cannot
+distinguish them. A classifier RPC failure or malformed beacon read
+(`UNKNOWN`), or a candidate that was never run through classification at
+all, is **rejected fail-safe** — never silently treated as "not stock,
+therefore safe" merely because it happens to also read `'Unknown'`. The
+on-chain Stock classifier itself (`robinhoodStockClassifier.ts`), its
+EIP-1967 beacon check, and its own fail-closed `UNKNOWN` semantics are
+completely unchanged by this phase.
+
+**What did NOT change:** `ASSET_TYPE.ENABLED` stays `true`; the Stock
+classifier, duplicate-position/cooldown checks, pool validation, price
+impact guard, simulation, approval safety, nonce/mutex/idempotency,
+receipt/NFT verification, capital policy (35% target / 95% global cap /
+3 max positions / one-token-one-position), and the canary infrastructure
+(still `CANARY_ENABLED=false`) are all byte-for-byte unchanged.
+`ALLOWED_ASSET_TYPES`/`REJECTED_ASSET_TYPES` (the `ALLOW_LIST` mode's own
+definition) are preserved exactly as Draft V1 §3 always meant them — kept
+for an explicit future rollback, never repurposed.
+
+Phase 11's shadow classifier (`discovery/shadowAssetClassifier.ts`)
+remains in the codebase for observability/research continuity. Its
+Meme/Project output is, and has always been, purely informational — it
+was never wired into `screenCandidate`/`getPassingCandidates`/
+`openPosition` before this phase and still is not; only Stock
+classification is a hard asset rejection.

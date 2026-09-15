@@ -6,7 +6,9 @@ import type { SettingsRepository } from '../settings/types';
 import type { CooldownChecker } from '../filters/types';
 import type { ActivePositionChecker } from '../filters/types';
 import type { CapitalSnapshotProvider } from '../capital/types';
+import type { CanaryGuard } from '../capital/canary';
 import type { DiscoveryService } from '../discovery/discoveryService';
+import type { RobinhoodStockClassifier } from '../discovery/robinhoodStockClassifier';
 import type { PoolDiscoveryPort, PoolStateProviderPort, PoolVolumeProviderPort } from '../pools/types';
 import type { LivePositionStateProvider, PoolPriceProvider, PriceHistoryProvider } from '../monitoring/types';
 import type { SwapExecutor, SwapQuote } from '../swap/types';
@@ -47,7 +49,11 @@ export interface AppDeps {
   };
   activePositionChecker: ActivePositionChecker;
   capitalSnapshot: CapitalSnapshotProvider;
+  /** Phase 10A: canary mode's cross-cycle "has it already succeeded" state -- see `capital/canary.ts`. No effect while `config.rules.canary.ENABLED` is false (the default). */
+  canaryGuard: CanaryGuard;
   discoveryService: DiscoveryService;
+  /** On-chain, non-heuristic Robinhood Stock Token detector (EIP-1967 beacon check) -- see `discovery/robinhoodStockClassifier.ts`. Runs on every discovered candidate before screening. */
+  stockClassifier: RobinhoodStockClassifier;
   poolDiscovery: PoolDiscoveryPort;
   poolState: PoolStateProviderPort;
   poolVolume: PoolVolumeProviderPort;

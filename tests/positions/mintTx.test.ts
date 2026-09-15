@@ -1,10 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Address } from 'viem';
-import { buildMintDeps } from '../../src/positions/mintTx';
+import { buildMintDeps, buildMintV4Position } from '../../src/positions/mintTx';
 import { MintedTokenIdNotFoundError } from '../../src/blockchain/erc721';
 import type { MintInput } from '../../src/positions/mintTx';
 import { v3TickMathUtils } from '../../src/blockchain/uniswapSdk';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../../src/monitoring/types';
+import { config } from '../../src/config';
 
 const { TickMath } = v3TickMathUtils;
 const WALLET = '0x9999999999999999999999999999999999999999' as Address;
@@ -40,6 +41,36 @@ function makeMintInput(overrides: Partial<MintInput> = {}): MintInput {
 function makePoolPrice(tick = 0): PoolPriceProvider {
   return { getPriceState: vi.fn(async () => ({ sqrtPriceX96: sqrtAt(tick), tickCurrent: tick })) };
 }
+
+describe('buildMintV4Position -- Phase 12G: USDG Token decimals must match config.quoteAsset.DECIMALS (6), never a hardcoded/stale value', () => {
+  it('the constructed USDG-side Token carries exactly config.quoteAsset.DECIMALS (6, not 18)', () => {
+    expect(config.quoteAsset.DECIMALS).toBe(6);
+    // TOKEN_ADDR sorts before USDG_ADDR -> currency0=TOKEN, currency1=USDG (see makeMintInput's pool fixture).
+    const position = buildMintV4Position(makeMintInput(), sqrtAt(0), 0);
+    expect(position.pool.currency1.decimals).toBe(config.quoteAsset.DECIMALS);
+    expect(position.pool.currency1.decimals).toBe(6);
+  });
+
+  it('the OTHER (non-USDG) token keeps its own real decimals, unaffected by the USDG fix -- token ordering/decimals independence', () => {
+    const position = buildMintV4Position(makeMintInput({ tokenDecimals: 9 }), sqrtAt(0), 0);
+    expect(position.pool.currency0.decimals).toBe(9);
+    expect(position.pool.currency1.decimals).toBe(6);
+  });
+
+  it('raw entryUsdgRaw drives the SDK liquidity math at its own raw magnitude -- decimals never multiplies/divides it into a 10^12-off amount', () => {
+    // usdgIsCurrency0 is false in this fixture (TOKEN sorts first), so the
+    // USDG-only deposit goes through fromAmount1. The v3-sdk liquidity
+    // round-trip (raw amount -> liquidity -> amount1) can legitimately
+    // round DOWN by a few wei -- asserted with a small tolerance, not exact
+    // equality -- but a decimals-driven bug here would be off by a factor
+    // of 10^12 (~1_000_000_000_000x), impossible to mistake for rounding.
+    const rawAmount = 1_000_000n * 10n ** 6n; // 1,000,000 USDG at the REAL 6-decimal scale
+    const position = buildMintV4Position(makeMintInput({ entryUsdgRaw: rawAmount }), sqrtAt(0), 0);
+    const resultRaw = BigInt(position.amount1.quotient.toString());
+    const diff = resultRaw > rawAmount ? resultRaw - rawAmount : rawAmount - resultRaw;
+    expect(diff).toBeLessThan(1_000_000n); // generous rounding tolerance, still 15+ orders of magnitude below a 10^12 scaling bug
+  });
+});
 
 describe('buildMintDeps', () => {
   it('buildTransaction targets the configured PositionManager with nonzero calldata and zero value (USDG is never native)', async () => {
