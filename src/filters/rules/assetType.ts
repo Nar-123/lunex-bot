@@ -61,6 +61,13 @@ function checkStockOnly(token: CandidateToken): FilterCheckResult {
 }
 
 export function checkAssetType(token: CandidateToken): FilterCheckResult {
-  const mode: 'STOCK_ONLY' | 'ALLOW_LIST' = config.rules.filters.ASSET_TYPE_MODE;
+  // Read through a union-typed interface (same idiom as screeningCycle.ts's
+  // `cyclePolicy`): `ASSET_TYPE_MODE` is a frozen `'STOCK_ONLY'` literal, and
+  // a directly-annotated local gets narrowed back to that literal, making
+  // the ternary type-level dead code (no-unnecessary-condition). The mode is
+  // a documented rollback toggle, so the branch stays. Type-only change --
+  // the runtime value and the dispatch are identical.
+  const filters: { ASSET_TYPE_MODE: 'STOCK_ONLY' | 'ALLOW_LIST' } = config.rules.filters;
+  const mode = filters.ASSET_TYPE_MODE;
   return mode === 'STOCK_ONLY' ? checkStockOnly(token) : checkAllowList(token);
 }
