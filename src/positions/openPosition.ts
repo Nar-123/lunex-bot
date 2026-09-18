@@ -8,6 +8,8 @@ import { executeCriticalTransaction } from '../execution/executeCriticalTransact
 import type { TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring/types';
 import type { CreatePositionInput, PositionPoolContext, PositionRecord, PositionRepository } from './types';
+import { DuplicateActiveTokenPositionError } from './types';
+import type { CapitalRules } from '../capital/types';
 import { buildApproveDeps as realBuildApproveDeps, needsApproval, type ApproveVerifyData } from './approveTx';
 import { buildMintDeps as realBuildMintDeps, type MintInput, type MintVerifyData } from './mintTx';
 
@@ -28,6 +30,18 @@ export interface OpenPositionInput {
   /** The pool price snapshot the range/decision were computed from (Modules 3/4) -- the PNL basis, recorded once, never recomputed. The ACTUAL mint transaction reads a FRESH live price at build time (see `mintTx.ts`), same as `exits/removeLiquidityTx.ts` -- these two can legitimately differ if price moved between decision and execution. */
   entryTick: number;
   entrySqrtPriceX96: bigint;
+  /**
+   * P1-1: a reader for the RAW on-chain USDG balance (no OPENING
+   * reservation subtracted -- `CapitalSnapshotProvider.readOnChainUsdgBalance`)
+   * plus the SAME `CapitalRules` `screeningCycle.ts` used to decide
+   * `entryUsdgRaw` -- passed through so `positions.createIfCapitalAllows`
+   * can re-derive free capital, deployed total and position count from ONE
+   * consistent, freshly-read state while holding `CapitalLock`, instead of
+   * pairing a stale pre-derived free balance with a fresh deployed sum
+   * (which double-counted concurrent OPENING reservations).
+   */
+  readOnChainUsdgBalance: () => Promise<bigint>;
+  capitalRules: CapitalRules;
 }
 
 export interface OpenPositionDeps {
@@ -66,7 +80,33 @@ export async function openPosition(input: OpenPositionInput, deps: OpenPositionD
     entryTick: input.entryTick,
     openIdempotencyKey: `deploy:${input.tokenAddress}:${randomUUID()}`,
   };
-  const created = await deps.positions.create(createInput);
+  // P1-1/P1-2 fix: `createIfCapitalAllows` atomically (a) re-validates the
+  // capital cap against a FRESH, transaction-scoped read (never trusting
+  // the possibly-now-stale snapshot used several awaits ago to decide
+  // `entryUsdgRaw` and select this candidate's pool/range), and (b) can
+  // throw `DuplicateActiveTokenPositionError` if a real DB-level partial
+  // unique index rejects the insert because a non-closed position for this
+  // SAME token already exists (a second candidate for the same token that
+  // got this far concurrently with the first, past the earlier
+  // `duplicatePosition.ts` filter check). Both are DEFINITIVE, deterministic
+  // facts (no on-chain ambiguity involved -- nothing was ever attempted for
+  // THIS candidate), so both resolve as FAILED, never PENDING/resumable:
+  // there is no position row here to retry against, and `screeningCycle.ts`'s
+  // existing "try the next candidate on failure" policy already does the
+  // right thing with it.
+  let created: PositionRecord;
+  try {
+    const result = await deps.positions.createIfCapitalAllows(createInput, input.readOnChainUsdgBalance, input.capitalRules);
+    if (!result.ok) {
+      return { outcome: 'FAILED', reason: result.reason };
+    }
+    created = result.record;
+  } catch (err) {
+    if (err instanceof DuplicateActiveTokenPositionError) {
+      return { outcome: 'FAILED', reason: err.message };
+    }
+    throw err;
+  }
   return executeOpen(created, deps);
 }
 
@@ -134,19 +174,24 @@ async function executeOpen(position: PositionRecord, deps: OpenPositionDeps): Pr
   // tick's OPENING-resume pass). Losing the claim is NOT a failure --
   // another caller already owns this position right now; deferring to it
   // is the safe outcome, never a duplicate mint attempt.
-  const claimed = await deps.positions.claimForResume(position.id, 'OPENING', config.rules.execution.RESUME_CLAIM_FRESHNESS_MS);
-  if (!claimed) {
+  const claimToken = await deps.positions.claimForResume(position.id, 'OPENING', config.rules.execution.RESUME_CLAIM_FRESHNESS_MS);
+  if (claimToken === null) {
     return { outcome: 'PENDING', reason: 'position is already claimed by a concurrent open/resume attempt' };
   }
-  // Released unconditionally once this call's work is done (success,
-  // definitive failure, or ambiguous/PENDING) -- the claim's lifetime
-  // matches however long THIS attempt actually takes, not a fixed
-  // timeout, so a long-running mint doesn't stall a legitimate later
-  // resume once this call genuinely finishes.
+  // Released unconditionally (from THIS call's perspective) once this
+  // call's work is done (success, definitive failure, or ambiguous/
+  // PENDING) -- the claim's lifetime matches however long THIS attempt
+  // actually takes, not a fixed timeout, so a long-running mint doesn't
+  // stall a legitimate later resume once this call genuinely finishes.
+  // P0-1: passes back the EXACT token this call won -- releaseResumeClaim
+  // only clears the row if that token still matches, so a call that hangs
+  // past `RESUME_CLAIM_FRESHNESS_MS` (losing the claim to a second worker)
+  // can no longer release the SECOND worker's still-active claim when it
+  // finally reaches this `finally` block.
   try {
     return await executeOpenClaimed(position, deps);
   } finally {
-    await deps.positions.releaseResumeClaim(position.id);
+    await deps.positions.releaseResumeClaim(position.id, claimToken);
   }
 }
 

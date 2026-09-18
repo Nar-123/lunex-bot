@@ -32,9 +32,11 @@ export function createStuckRouter(deps: AppDeps): Router {
       {
         positions: deps.positions,
         txAttempts: deps.txAttempts,
+        exitStates: deps.exitStates,
         livePositionState: deps.livePositionState,
         ownedNftLister: deps.ownedNftLister,
         nftOwnerChecker: deps.nftOwnerChecker,
+        positionIdentityChecker: deps.positionIdentityChecker,
         walletAddress: deps.walletAddress,
       },
       { includeOrphanScan: false },

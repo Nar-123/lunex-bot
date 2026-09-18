@@ -122,47 +122,76 @@ export function buildSwapDeps(
     getReceiptIfAvailable: txSteps.getReceiptIfAvailable,
     verifyOnChain: async (confirmedTxHash) => {
       const exitState = await exitStates.getOrCreate(positionId);
-      let usdgIncreaseRaw: bigint;
-      if (exitState.swapVerifiedUsdgIncreaseRaw !== null) {
-        // An earlier call already accepted this attempt's balance increase
-        // (then failed only on the proceeds read below). Never re-read the
-        // live balance: concurrent wallet activity since then could push it
-        // below the baseline and falsely fail a swap that already filled.
-        usdgIncreaseRaw = exitState.swapVerifiedUsdgIncreaseRaw;
-      } else {
-        if (exitState.swapUsdgBalanceBeforeRaw === null) {
-          return { ok: false, reason: 'no swapUsdgBalanceBeforeRaw baseline recorded -- cannot verify (invariant violated: buildTransaction should have set this)' };
-        }
-        const minIncrease = exitState.swapMinOutputAmountRaw ?? 0n;
-        const usdgBalanceAfter = await readBalance(usdgAddress, wallet);
-        usdgIncreaseRaw = usdgBalanceAfter - exitState.swapUsdgBalanceBeforeRaw;
+      const minRequired = exitState.swapMinOutputAmountRaw ?? 0n;
 
-        // "Genuinely increased" (spec's literal requirement) when protection
-        // is off (minIncrease === 0n): usdgIncreaseRaw > 0n is required, NOT
-        // just >= 0n -- a swap that had zero effect must fail verification
-        // even though 0 >= 0 would trivially pass a naive >= check.
-        if (usdgIncreaseRaw <= 0n || usdgIncreaseRaw < minIncrease) {
-          return {
-            ok: false,
-            reason: `USDG balance increased by only ${usdgIncreaseRaw} (required > 0${minIncrease > 0n ? ` and >= ${minIncrease}` : ''})`,
-          };
-        }
-        await exitStates.update(positionId, { swapVerifiedUsdgIncreaseRaw: usdgIncreaseRaw });
-      }
-      // VALIDATION PHASE: realized proceeds from THIS swap's own confirmed
-      // receipt. The swap is already proven by the balance check above, so a
-      // failed proceeds read is `resumable: true` -- the attempt stays
-      // CONFIRMED, swapAttemptCount is never bumped, and the swap is never
-      // re-sent. (P1 fix: this used to return a plain `ok: false`, which the
-      // pipeline treats as a definitive VERIFICATION_FAILED.)
+      // P0-5 fix: PRIMARY proof is now the swap's OWN CONFIRMED RECEIPT,
+      // not a wallet-wide balance delta. `readUsdgTransfersTo` decodes
+      // ONLY the ERC20 `Transfer(... -> wallet)` events emitted inside
+      // THIS EXACT transaction hash's receipt (blockchain/erc20.ts) --
+      // scoped to (exact tx hash, expected token, expected recipient), the
+      // "at minimum" bar this fix requires. This closes the false-positive
+      // the old balance-delta-as-primary-proof allowed: a swap that
+      // genuinely paid 0 USDG, followed by an UNRELATED incoming USDG
+      // transfer to the same wallet before this check ran, used to read as
+      // a real balance increase and be accepted as VERIFIED. A receipt
+      // scoped to one already-mined transaction cannot be inflated by
+      // anything that happens in a DIFFERENT transaction, before or after.
+      //
+      // KNOWN LIMITATION (documented, not solved by this fix): if the
+      // swap's OWN transaction itself emits MULTIPLE separate
+      // `Transfer(...->wallet)` events of USDG (e.g. an unusual multi-hop
+      // router path with an intermediate pass-through), `readUsdgTransfersTo`
+      // sums all of them -- a full route/path-aware proof (validating the
+      // specific DEX/router emitted exactly the expected swap leg) is not
+      // implemented here; flagged for a follow-up rather than guessed at.
       let usdgProceedsRaw: bigint;
       try {
         usdgProceedsRaw = await readUsdgTransfersTo(confirmedTxHash, usdgAddress, wallet);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        return { ok: false, resumable: true, reason: `swap verified but proceeds could not be measured: ${message}` };
+        // The tx IS confirmed (we were handed its hash by the pipeline
+        // after waitForReceipt succeeded) -- a failure to READ/DECODE that
+        // receipt is a transport/parsing problem, never proof the swap
+        // failed. Resumable: never marks VERIFICATION_FAILED for a read we
+        // simply couldn't perform yet.
+        return { ok: false, resumable: true, reason: `could not read the swap's own confirmed receipt to measure proceeds: ${message}` };
       }
-      return { ok: true, data: { usdgIncreaseRaw, usdgProceedsRaw } };
+
+      // "Genuinely paid something" (spec's literal requirement) is
+      // `usdgProceedsRaw > 0n`, NOT just `>= 0n` -- a swap whose receipt
+      // shows zero USDG paid to the wallet must fail verification even
+      // though `0 >= 0` would trivially pass a naive `>=` check. Combined
+      // with the minimum-output enforcement (previously only checked
+      // against the balance delta, now checked against the receipt-scoped
+      // proof directly).
+      if (usdgProceedsRaw <= 0n || usdgProceedsRaw < minRequired) {
+        return {
+          ok: false,
+          reason: `swap's own confirmed receipt (tx ${confirmedTxHash}) shows only ${usdgProceedsRaw} USDG paid to the wallet (required > 0${minRequired > 0n ? ` and >= ${minRequired}` : ''})`,
+        };
+      }
+
+      // DEFENSE-IN-DEPTH ONLY, never the primary gate (P0-5's explicit
+      // requirement: "balance delta can only be defense-in-depth"). A
+      // wallet-wide balance-delta cross-check, kept purely for
+      // observability/anomaly-surfacing and to preserve
+      // `swapVerifiedUsdgIncreaseRaw`'s existing resume-safety role (a
+      // resumed call skips re-reading a balance concurrent activity may
+      // have since moved) -- its outcome can NEVER by itself flip
+      // verification from fail to pass, and a read failure here is
+      // swallowed rather than blocking an already receipt-proven success.
+      let usdgIncreaseRaw: bigint | null = exitState.swapVerifiedUsdgIncreaseRaw;
+      if (usdgIncreaseRaw === null && exitState.swapUsdgBalanceBeforeRaw !== null) {
+        try {
+          const usdgBalanceAfter = await readBalance(usdgAddress, wallet);
+          usdgIncreaseRaw = usdgBalanceAfter - exitState.swapUsdgBalanceBeforeRaw;
+          await exitStates.update(positionId, { swapVerifiedUsdgIncreaseRaw: usdgIncreaseRaw });
+        } catch {
+          // Best-effort only -- never blocks a receipt-proven verification.
+        }
+      }
+
+      return { ok: true, data: { usdgIncreaseRaw: usdgIncreaseRaw ?? 0n, usdgProceedsRaw } };
     },
   };
 }

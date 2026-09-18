@@ -63,12 +63,27 @@ describe('PRIORITY 1 -- HARD_STOP_LOSS (-6%)', () => {
     expect(decide({ metrics: metrics({ pnlPct: null }) }).decision.shouldClose).toBe(false);
   });
 
-  it('wins over an already-armed SAFETY_EXIT (explicit priority requirement)', () => {
-    // Armed AND recovered would normally be SAFETY_EXIT, but this PnL is
-    // through the stop, so the stop takes it.
+  it('P0-3 (changed from the original TIER 3 shipment): YIELDS to an already-armed SAFETY_EXIT instead of overriding it -- still underwater, so nothing closes yet, but the reason is NOT HARD_STOP_LOSS', () => {
+    // Before the P0-3 fix, this exact scenario asserted `{ shouldClose:
+    // true, reason: 'HARD_STOP_LOSS' }` -- Hard Stop unconditionally won
+    // over an armed Safety Exit. Per the operator's explicit resolution
+    // (see resolveExitDecision.ts's doc comment), Hard Stop now defers to
+    // an already-armed Safety Exit: since PnL (-9%) has not yet recovered
+    // to Safety Exit's TARGET_PCT (0%), NEITHER rule closes this tick --
+    // the position stays open, exactly matching Safety Exit's own
+    // documented "wait for recovery to breakeven" semantics.
     const armed = state({ safetyExitArmedAt: T0, maxDrawdownPnlPct: -0.09 });
     const { decision } = decide({ metrics: metrics({ pnlPct: -0.09 }), exitState: armed });
+    expect(decision).toEqual({ shouldClose: false });
+  });
+
+  it('P0-3: still fires normally for a drawdown in the -6%-to-(-8%) band that has NOT armed Safety Exit', () => {
+    // -7% alone (first crossing, nothing armed yet) is exactly the
+    // "ordinary smooth decline" case P0-3's fix does NOT change -- Hard
+    // Stop still wins here, since Safety Exit never got a chance to arm.
+    const { decision, nextExitState } = decide({ metrics: metrics({ pnlPct: -0.07 }) });
     expect(decision).toEqual({ shouldClose: true, reason: 'HARD_STOP_LOSS' });
+    expect(nextExitState.safetyExitArmedAt).toBeNull(); // -7% never reached the -8% arming threshold
   });
 });
 
@@ -134,8 +149,16 @@ describe('PRIORITY 2 -- SAFETY_EXIT (arm at max drawdown -8%, close on recovery 
     expect(afterRestart.decision).toEqual({ shouldClose: true, reason: 'SAFETY_EXIT' });
   });
 
-  it('tracks max drawdown even on a tick that closes for a different reason', () => {
-    const { nextExitState } = decide({ metrics: metrics({ pnlPct: -0.2 }) }); // default rules -> HARD_STOP_LOSS
+  it('tracks max drawdown even on a tick where Safety Exit arms same-tick and the position does NOT close', () => {
+    // P0-3: under default rules, a same-tick drop straight to -20% (a gap,
+    // not smooth decline) both crosses Hard Stop's -6% AND reaches Safety
+    // Exit's -8% arming threshold in the SAME reading -- Safety Exit arms
+    // and Hard Stop yields (see the PRIORITY 1 describe block above), so
+    // this tick does NOT close. maxDrawdown tracking is unconditional
+    // regardless of which branch (if any) the tick takes.
+    const { decision, nextExitState } = decide({ metrics: metrics({ pnlPct: -0.2 }) });
+    expect(decision).toEqual({ shouldClose: false });
+    expect(nextExitState.safetyExitArmedAt).toEqual(T0);
     expect(nextExitState.maxDrawdownPnlPct).toBeCloseTo(-0.2, 6);
   });
 });
@@ -432,7 +455,12 @@ describe('PRIORITY 8 -- OOR_TIMEOUT and INFRA_SAFETY_EXIT (pre-existing protecti
   });
 
   it('a strategy rule still wins over INFRA_SAFETY_EXIT when metrics ARE readable', () => {
-    const { decision } = decide({ metrics: metrics({ pnlPct: -0.09 }), infraSafetyExitTriggered: true });
+    // -7% (not -9%): stays in the -6%-to-(-8%) band that does NOT arm
+    // Safety Exit same-tick (see PRIORITY 1's P0-3 tests above), so Hard
+    // Stop fires normally -- keeps this test's actual intent (a real
+    // strategy rule beats INFRA_SAFETY_EXIT) independent of the P0-3
+    // arm/yield mechanics tested elsewhere.
+    const { decision } = decide({ metrics: metrics({ pnlPct: -0.07 }), infraSafetyExitTriggered: true });
     expect(decision).toEqual({ shouldClose: true, reason: 'HARD_STOP_LOSS' });
   });
 });
@@ -517,5 +545,90 @@ describe('data quality -- infrastructure failure is never a trading signal', () 
     const { nextExitState } = decide({ metrics: blind, exitState: existing });
     expect(nextExitState.maxDrawdownPnlPct).toBeCloseTo(-0.04, 6);
     expect(nextExitState.trailingPeakPnlPct).toBeCloseTo(0.09, 6);
+  });
+});
+
+describe('P1-14: risk-based triggers (HARD_STOP_LOSS, SAFETY_EXIT, TRAILING_TP, HARD_TP, OOR_PROFIT) decide purely off principal-only pnlPct, independent of fee/yield metrics -- confirmed by explicit operator decision to keep pnlPct and realizedUsdgRaw as two deliberately different numbers (see resolveExitDecision.ts\'s "P1-14" doc comment and executeExit.test.ts\'s matching boundary test for the realized-PnL side of this)', () => {
+  it('HARD_STOP_LOSS fires at exactly -6% pnlPct regardless of how high yieldPct (a fee-derived metric) reads -- fees never rescue or delay a principal-based stop', () => {
+    const lowYield = decide({ metrics: metrics({ pnlPct: -0.06, yieldPct: 0 }) });
+    const highYield = decide({ metrics: metrics({ pnlPct: -0.06, yieldPct: 1000 }) });
+    expect(lowYield.decision).toEqual({ shouldClose: true, reason: 'HARD_STOP_LOSS' });
+    expect(highYield.decision).toEqual({ shouldClose: true, reason: 'HARD_STOP_LOSS' });
+  });
+
+  it('a position 1bp above the HARD_STOP_LOSS line does not close no matter how negative yieldPct reads -- a bad fee reading cannot manufacture a stop-loss the principal-only pnlPct did not actually cross', () => {
+    const decision = decide({ metrics: metrics({ pnlPct: -0.0599, yieldPct: -1000 }) });
+    expect(decision.decision.shouldClose).toBe(false);
+  });
+
+  it('HARD_TP fires at exactly +25% pnlPct regardless of yieldPct -- profit-taking is principal-only too, not principal+fees', () => {
+    const decision = decide({ metrics: metrics({ pnlPct: 0.25, yieldPct: 0 }) });
+    expect(decision.decision).toEqual({ shouldClose: true, reason: 'HARD_TP' });
+  });
+
+  it('documents the divergence this enables: the pnlPct that fires HARD_STOP_LOSS here is NOT the same quantity as the realizedUsdgRaw persisted at close (see executeExit.ts\'s computeRealizedProceeds, which sums actual USDG received -- principal AND any fees collected in the same settlement -- with no reference to this trigger\'s pnlPct at all)', () => {
+    // This test asserts only the DECISION side of the divergence: nothing
+    // in ExitMetricsSnapshot or ExitRules ties pnlPct's definition to how
+    // realizedUsdgRaw will later be computed -- they are independent by
+    // construction, which is what makes the divergence in
+    // executeExit.test.ts's "P1-14" test legitimate rather than a bug.
+    const decision = decide({ metrics: metrics({ pnlPct: -0.06 }) });
+    expect(decision.decision).toEqual({ shouldClose: true, reason: 'HARD_STOP_LOSS' });
+  });
+});
+
+describe('P0-3 -- full state-transition path: normal -> safety armed -> recover -> close (default rules, no WIDE_STOP workaround)', () => {
+  it('a price GAP that jumps straight from normal to -9% in one tick arms Safety Exit instead of Hard Stop closing', () => {
+    // Tick 1: normal.
+    const tick1 = decide({ metrics: metrics({ pnlPct: 0.01 }) });
+    expect(tick1.decision).toEqual({ shouldClose: false });
+    expect(tick1.nextExitState.safetyExitArmedAt).toBeNull();
+
+    // Tick 2: a genuine gap -- price falls straight through both -6% and
+    // -8% between polls, landing at -9% in a single reading. Safety Exit
+    // arms; Hard Stop does NOT close (this is exactly the P0-3 fix).
+    const tick2 = decide({ metrics: metrics({ pnlPct: -0.09 }), exitState: tick1.nextExitState });
+    expect(tick2.decision).toEqual({ shouldClose: false });
+    expect(tick2.nextExitState.safetyExitArmedAt).toEqual(T0);
+    expect(tick2.nextExitState.maxDrawdownPnlPct).toBeCloseTo(-0.09, 6);
+
+    // Tick 3: still underwater at -3% -- stays open, waiting.
+    const tick3 = decide({ metrics: metrics({ pnlPct: -0.03 }), exitState: tick2.nextExitState });
+    expect(tick3.decision).toEqual({ shouldClose: false });
+    expect(tick3.nextExitState.safetyExitArmedAt).toEqual(T0); // still armed, sticky
+
+    // Tick 4: recovers to exactly the SAFETY_EXIT.TARGET_PCT (0%) -- closes via SAFETY_EXIT, never HARD_STOP_LOSS.
+    const tick4 = decide({ metrics: metrics({ pnlPct: 0 }), exitState: tick3.nextExitState });
+    expect(tick4.decision).toEqual({ shouldClose: true, reason: 'SAFETY_EXIT' });
+  });
+
+  it('a Hard-Stop close attempt that fails and reverts to ACTIVE lets a later, deeper reading arm Safety Exit instead of re-stopping', () => {
+    // Tick 1: -7% -- in the un-armed band, Hard Stop decides to close.
+    const tick1 = decide({ metrics: metrics({ pnlPct: -0.07 }) });
+    expect(tick1.decision).toEqual({ shouldClose: true, reason: 'HARD_STOP_LOSS' });
+
+    // Simulate executeExit's remove-liquidity leg failing DEFINITIVELY and
+    // markExitFailed reverting the position to ACTIVE (executeExit.ts) --
+    // from resolveExitDecision's point of view, the NEXT tick simply runs
+    // again with `tick1.nextExitState` (maxDrawdown already tracks -7%)
+    // and a now-deeper reading.
+    const tick2 = decide({ metrics: metrics({ pnlPct: -0.085 }), exitState: tick1.nextExitState });
+    expect(tick2.decision).toEqual({ shouldClose: false }); // armed, not yet recovered
+    expect(tick2.nextExitState.safetyExitArmedAt).toEqual(T0);
+
+    const tick3 = decide({ metrics: metrics({ pnlPct: 0.002 }), exitState: tick2.nextExitState });
+    expect(tick3.decision).toEqual({ shouldClose: true, reason: 'SAFETY_EXIT' });
+  });
+
+  it('threshold boundary: arming requires <= -8% exactly -- -7.999% does not arm, even combined with a Hard-Stop-qualifying reading', () => {
+    const { decision, nextExitState } = decide({ metrics: metrics({ pnlPct: -0.07999 }) });
+    expect(nextExitState.safetyExitArmedAt).toBeNull();
+    expect(decision).toEqual({ shouldClose: true, reason: 'HARD_STOP_LOSS' }); // still in the un-armed band -- Hard Stop fires normally
+  });
+
+  it('threshold boundary: recovery requires >= TARGET_PCT (0%) exactly -- -0.001% stays open even while armed', () => {
+    const armed = state({ safetyExitArmedAt: T0, maxDrawdownPnlPct: -0.09 });
+    const { decision } = decide({ metrics: metrics({ pnlPct: -0.00001 }), exitState: armed });
+    expect(decision).toEqual({ shouldClose: false });
   });
 });

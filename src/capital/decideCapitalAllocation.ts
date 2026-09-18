@@ -1,4 +1,5 @@
 import type { CapitalAllocationResult, CapitalRules, CapitalSnapshot } from './types';
+import { clampToHardCeilings } from './hardCeilings';
 
 /** Decimal digits of precision kept when converting a config decimal (e.g. 0.35) into bigint math. */
 const FRACTION_PRECISION = 1_000_000;
@@ -112,7 +113,17 @@ export function checkEthGasReserve(
  * (Module 2), a different concern (per-token) from this module's
  * aggregate sizing/exposure decisions.
  */
-export function decideCapitalAllocation(snapshot: CapitalSnapshot, rules: CapitalRules): CapitalAllocationResult {
+export function decideCapitalAllocation(snapshot: CapitalSnapshot, callerRules: CapitalRules): CapitalAllocationResult {
+  // P0-2 fix: the allocator independently enforces the strategy's hard
+  // ceilings (35% position size / 3 max positions / 95% global cap) on the
+  // RULES IT ACTUALLY USES, regardless of what the caller passed in. This
+  // is what makes it impossible for an authenticated `PATCH /settings`
+  // caller -- or a legacy DB row, or any future bug in a settings-merging
+  // call site -- to size a position beyond the documented strategy limits:
+  // even if `callerRules` is malformed/over-ceiling, every computation
+  // below uses the CLAMPED version. See `capital/hardCeilings.ts`.
+  const rules = clampToHardCeilings(callerRules);
+
   if (snapshot.activePositionsCount >= rules.MAX_ACTIVE_POSITIONS) {
     return {
       ok: false,

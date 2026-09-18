@@ -7,6 +7,7 @@ import type {
   TxFailureCode,
   TxRequest,
 } from './types';
+import { StaleTransactionAttemptWriteError } from './types';
 
 interface PrismaRow {
   id: string;
@@ -24,6 +25,7 @@ interface PrismaRow {
   failureCode: string | null;
   attemptCount: number;
   firstAttemptedAt: Date | null;
+  version: number;
 }
 
 function toRecord(row: PrismaRow): TransactionAttemptRecord {
@@ -43,6 +45,7 @@ function toRecord(row: PrismaRow): TransactionAttemptRecord {
     failureCode: row.failureCode as TxFailureCode | null,
     attemptCount: row.attemptCount,
     firstAttemptedAt: row.firstAttemptedAt,
+    version: row.version,
   };
 }
 
@@ -78,28 +81,46 @@ export class PrismaTransactionAttemptRepository implements TransactionAttemptRep
 
   async update(
     id: string,
-    patch: Partial<Omit<TransactionAttemptRecord, 'id' | 'idempotencyKey'>>,
+    patch: Partial<Omit<TransactionAttemptRecord, 'id' | 'idempotencyKey' | 'version'>>,
+    expectedVersion?: number,
   ): Promise<TransactionAttemptRecord> {
-    const row = await this.prisma.transactionAttempt.update({
-      where: { id },
-      data: {
-        ...(patch.purpose !== undefined && { purpose: patch.purpose }),
-        ...(patch.status !== undefined && { status: patch.status }),
-        ...(patch.txRequest !== undefined && { txRequest: JSON.stringify(patch.txRequest, jsonReplacer) }),
-        ...(patch.gasLimit !== undefined && { gasLimit: patch.gasLimit }),
-        ...(patch.gasPrice !== undefined && { gasPrice: patch.gasPrice }),
-        ...(patch.nonce !== undefined && { nonce: patch.nonce }),
-        ...(patch.rawTx !== undefined && { rawTx: patch.rawTx }),
-        ...(patch.txHash !== undefined && { txHash: patch.txHash }),
-        ...(patch.lastError !== undefined && { lastError: patch.lastError }),
-        ...(patch.verifyData !== undefined && {
-          verifyData: patch.verifyData === null ? null : JSON.stringify(patch.verifyData, jsonReplacer),
-        }),
-        ...(patch.failureCode !== undefined && { failureCode: patch.failureCode }),
-        ...(patch.attemptCount !== undefined && { attemptCount: patch.attemptCount }),
-        ...(patch.firstAttemptedAt !== undefined && { firstAttemptedAt: patch.firstAttemptedAt }),
-      },
+    const data = {
+      ...(patch.purpose !== undefined && { purpose: patch.purpose }),
+      ...(patch.status !== undefined && { status: patch.status }),
+      ...(patch.txRequest !== undefined && { txRequest: JSON.stringify(patch.txRequest, jsonReplacer) }),
+      ...(patch.gasLimit !== undefined && { gasLimit: patch.gasLimit }),
+      ...(patch.gasPrice !== undefined && { gasPrice: patch.gasPrice }),
+      ...(patch.nonce !== undefined && { nonce: patch.nonce }),
+      ...(patch.rawTx !== undefined && { rawTx: patch.rawTx }),
+      ...(patch.txHash !== undefined && { txHash: patch.txHash }),
+      ...(patch.lastError !== undefined && { lastError: patch.lastError }),
+      ...(patch.verifyData !== undefined && {
+        verifyData: patch.verifyData === null ? null : JSON.stringify(patch.verifyData, jsonReplacer),
+      }),
+      ...(patch.failureCode !== undefined && { failureCode: patch.failureCode }),
+      ...(patch.attemptCount !== undefined && { attemptCount: patch.attemptCount }),
+      ...(patch.firstAttemptedAt !== undefined && { firstAttemptedAt: patch.firstAttemptedAt }),
+    };
+
+    if (expectedVersion === undefined) {
+      // No prior read to pin against -- unconditional, same as before P1-5.
+      const row = await this.prisma.transactionAttempt.update({ where: { id }, data: { ...data, version: { increment: 1 } } });
+      return toRecord(row);
+    }
+
+    // P1-5 fix: a single conditional UPDATE -- the WHERE clause (id AND
+    // CURRENT version matches what the caller last read) and the SET
+    // (apply the patch AND bump version) are evaluated and applied by the
+    // database as one atomic operation, so a stale writer's conditional
+    // update simply matches ZERO rows instead of clobbering a newer one.
+    const result = await this.prisma.transactionAttempt.updateMany({
+      where: { id, version: expectedVersion },
+      data: { ...data, version: { increment: 1 } },
     });
+    if (result.count === 0) {
+      throw new StaleTransactionAttemptWriteError(id, expectedVersion);
+    }
+    const row = await this.prisma.transactionAttempt.findUniqueOrThrow({ where: { id } });
     return toRecord(row);
   }
 

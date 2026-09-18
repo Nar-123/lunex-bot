@@ -145,6 +145,7 @@ export function createFakeAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
     logger: createInMemoryLogger(),
     ownedNftLister: { listOwnedTokenIds: vi.fn(async () => []) },
     nftOwnerChecker: { checkOwner: vi.fn(async () => ({ status: 'FOUND' as const, owner: WALLET })) },
+    positionIdentityChecker: { checkIdentity: vi.fn(async () => ({ status: 'MATCH' as const })) },
     buildApproveDepsForOpen: vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(1000) })),
     buildMintDeps: vi.fn(() => fakeTxDeps({ positionTokenId: String(Math.floor(Math.random() * 100000)), liquidity: 500n })),
     buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(90) })),

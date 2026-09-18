@@ -75,7 +75,7 @@ async function resumeVerified<TVerifyData>(
     if (!reverify.ok) {
       return ambiguousFailure(`VERIFIED attempt's data could not be reconstructed yet: ${reverify.reason}`, attempt);
     }
-    const updated = await repo.update(attempt.id, { verifyData: reverify.data });
+    const updated = await repo.update(attempt.id, { verifyData: reverify.data }, attempt.version);
     return { ok: true, data: reverify.data, attempt: updated };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -136,15 +136,30 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
     return definitiveFailure(attempt.lastError ?? 'previously failed', attempt);
   }
 
-  attempt = await repo.update(attempt.id, {
-    attemptCount: attempt.attemptCount + 1,
-    firstAttemptedAt: attempt.firstAttemptedAt ?? new Date(),
-  });
+  // P1-5 fix: this update sits OUTSIDE the main try/catch below (by
+  // original design -- attemptCount/firstAttemptedAt bookkeeping isn't
+  // part of the pipeline proper), but it can now throw
+  // `StaleTransactionAttemptWriteError` (a concurrent writer -- a
+  // genuinely different process sharing this DB -- already advanced this
+  // attempt between the `find`/`create` above and here). Given its own
+  // try/catch, identical in spirit to the main one below: never let this
+  // bookkeeping write crash the caller or fabricate a FAILED verdict --
+  // treat it exactly like any other unexpected/ambiguous failure.
+  try {
+    attempt = await repo.update(attempt.id, {
+      attemptCount: attempt.attemptCount + 1,
+      firstAttemptedAt: attempt.firstAttemptedAt ?? new Date(),
+    }, attempt.version);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const latest = (await repo.find(idempotencyKey)) ?? attempt;
+    return ambiguousFailure(`unexpected error, resume required: ${message}`, latest);
+  }
 
   try {
     if (notYetReached(attempt.status, 'BUILT')) {
       const tx = await deps.buildTransaction();
-      attempt = await repo.update(attempt.id, { status: 'BUILT', txRequest: tx });
+      attempt = await repo.update(attempt.id, { status: 'BUILT', txRequest: tx }, attempt.version);
     }
     const tx = attempt.txRequest;
     if (!tx) {
@@ -158,10 +173,10 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
           status: 'FAILED',
           failureCode: 'SIMULATION_REJECTED',
           lastError: sim.reason,
-        });
+        }, attempt.version);
         return definitiveFailure(sim.reason, attempt);
       }
-      attempt = await repo.update(attempt.id, { status: 'SIMULATED' });
+      attempt = await repo.update(attempt.id, { status: 'SIMULATED' }, attempt.version);
     }
 
     if (notYetReached(attempt.status, 'GAS_CHECKED')) {
@@ -173,10 +188,10 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
           status: 'FAILED',
           failureCode: 'GAS_UNAFFORDABLE',
           lastError: gasCheck.reason,
-        });
+        }, attempt.version);
         return definitiveFailure(gasCheck.reason, attempt);
       }
-      attempt = await repo.update(attempt.id, { status: 'GAS_CHECKED', gasLimit, gasPrice });
+      attempt = await repo.update(attempt.id, { status: 'GAS_CHECKED', gasLimit, gasPrice }, attempt.version);
     }
     const gasLimit = attempt.gasLimit;
     const gasPrice = attempt.gasPrice;
@@ -198,7 +213,7 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
 
       if (notYetReached(attempt.status, 'NONCE_ASSIGNED')) {
         const nonce = await deps.getNonce();
-        attempt = await repo.update(attempt.id, { status: 'NONCE_ASSIGNED', nonce });
+        attempt = await repo.update(attempt.id, { status: 'NONCE_ASSIGNED', nonce }, attempt.version);
       }
       const lockedNonce = attempt.nonce;
       if (lockedNonce === null) {
@@ -207,7 +222,7 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
 
       if (notYetReached(attempt.status, 'SIGNED')) {
         const signed = await deps.signTransaction(tx, lockedNonce, gasLimit, gasPrice);
-        attempt = await repo.update(attempt.id, { status: 'SIGNED', rawTx: signed.raw, txHash: signed.hash });
+        attempt = await repo.update(attempt.id, { status: 'SIGNED', rawTx: signed.raw, txHash: signed.hash }, attempt.version);
       }
       const lockedRawTx = attempt.rawTx;
       const lockedTxHash = attempt.txHash;
@@ -218,20 +233,20 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       if (notYetReached(attempt.status, 'SENT')) {
         try {
           await deps.broadcastRaw(lockedRawTx);
-          attempt = await repo.update(attempt.id, { status: 'SENT' });
+          attempt = await repo.update(attempt.id, { status: 'SENT' }, attempt.version);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           const classification = classifyBroadcastError(message);
 
           if (classification.kind === 'ALREADY_KNOWN') {
             // Our exact payload is already in the mempool -- not a failure.
-            attempt = await repo.update(attempt.id, { status: 'SENT' });
+            attempt = await repo.update(attempt.id, { status: 'SENT' }, attempt.version);
           } else if (classification.kind === 'DEFINITIVE_REJECTED') {
             attempt = await repo.update(attempt.id, {
               status: 'FAILED',
               failureCode: 'BROADCAST_REJECTED',
               lastError: classification.reason,
-            });
+            }, attempt.version);
             return definitiveFailure(classification.reason, attempt);
           } else if (classification.kind === 'POSSIBLY_OURS') {
             // "nonce too low" / "replacement underpriced" -- could mean an
@@ -247,18 +262,18 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
               const checkMessage = checkErr instanceof Error ? checkErr.message : String(checkErr);
               attempt = await repo.update(attempt.id, {
                 lastError: `broadcast rejected (${message}); receipt check failed too: ${checkMessage}`,
-              });
+              }, attempt.version);
               return ambiguousFailure(`broadcast rejected, receipt check failed, resume required: ${message}`, attempt);
             }
             if (receipt) {
               // It's genuinely ours and already landed -- proceed normally.
-              attempt = await repo.update(attempt.id, { status: 'SENT' });
+              attempt = await repo.update(attempt.id, { status: 'SENT' }, attempt.version);
             } else {
               attempt = await repo.update(attempt.id, {
                 status: 'FAILED',
                 failureCode: 'BROADCAST_REJECTED',
                 lastError: `broadcast rejected (${message}) and no receipt found for our own tx hash -- this nonce/payload is dead`,
-              });
+              }, attempt.version);
               return definitiveFailure(`broadcast rejected: ${message}`, attempt);
             }
           } else {
@@ -277,14 +292,14 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
               receipt = await deps.getReceiptIfAvailable(lockedTxHash);
             } catch {
               // Couldn't even determine that much -- stay ambiguous, don't guess either way.
-              attempt = await repo.update(attempt.id, { lastError: `broadcast uncertain: ${message}` });
+              attempt = await repo.update(attempt.id, { lastError: `broadcast uncertain: ${message}` }, attempt.version);
               return ambiguousFailure(`broadcast uncertain, resume required: ${message}`, attempt);
             }
             if (receipt) {
               // It's actually mined -- proceed normally, never FAILED.
-              attempt = await repo.update(attempt.id, { status: 'SENT' });
+              attempt = await repo.update(attempt.id, { status: 'SENT' }, attempt.version);
             } else {
-              attempt = await repo.update(attempt.id, { lastError: `broadcast uncertain: ${message}` });
+              attempt = await repo.update(attempt.id, { lastError: `broadcast uncertain: ${message}` }, attempt.version);
               return ambiguousFailure(`broadcast uncertain, resume required: ${message}`, attempt);
             }
           }
@@ -306,10 +321,10 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
           status: 'FAILED',
           failureCode: 'REVERTED',
           lastError: 'transaction reverted on-chain',
-        });
+        }, attempt.version);
         return definitiveFailure('transaction reverted on-chain', attempt);
       }
-      attempt = await repo.update(attempt.id, { status: 'CONFIRMED' });
+      attempt = await repo.update(attempt.id, { status: 'CONFIRMED' }, attempt.version);
     }
 
     const verification = await deps.verifyOnChain(txHash);
@@ -321,20 +336,20 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
         // having happened (the exit flow would revert a burned LP to
         // ACTIVE, or retry an already-filled swap). Status stays CONFIRMED,
         // so the next call with this key skips straight back to this step.
-        attempt = await repo.update(attempt.id, { lastError: verification.reason });
+        attempt = await repo.update(attempt.id, { lastError: verification.reason }, attempt.version);
         return ambiguousFailure(`confirmed on-chain, verification incomplete, resume required: ${verification.reason}`, attempt);
       }
       attempt = await repo.update(attempt.id, {
         status: 'FAILED',
         failureCode: 'VERIFICATION_FAILED',
         lastError: verification.reason,
-      });
+      }, attempt.version);
       return definitiveFailure(verification.reason, attempt);
     }
     // Status and verifyData written together in ONE update call so a
     // crash between them is impossible -- the whole point of this fix
     // (see resumeVerified() above for why a status-only write was unsafe).
-    attempt = await repo.update(attempt.id, { status: 'VERIFIED', verifyData: verification.data });
+    attempt = await repo.update(attempt.id, { status: 'VERIFIED', verifyData: verification.data }, attempt.version);
     return { ok: true, data: verification.data, attempt };
   } catch (err) {
     // Any unexpected throw (RPC blip during simulate/estimateGas/wait, a

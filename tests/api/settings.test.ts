@@ -13,10 +13,11 @@ describe('PATCH /settings', () => {
 
   it('updates maxActivePositions as a plain integer (not a percent)', async () => {
     const { app, deps } = buildTestApp();
-    const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ maxActivePositions: 5 });
+    // P0-2: 5 exceeds the new hard ceiling (3) -- 2 is a legal, below-default value that still proves the update took effect.
+    const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ maxActivePositions: 2 });
     expect(res.status).toBe(200);
-    expect(res.body.maxActivePositions).toBe(5);
-    expect((await deps.settings.get()).maxActivePositions).toBe(5);
+    expect(res.body.maxActivePositions).toBe(2);
+    expect((await deps.settings.get()).maxActivePositions).toBe(2);
   });
 
   it('rejects an empty body', async () => {
@@ -52,6 +53,59 @@ describe('PATCH /settings', () => {
     expect(zero.status).toBe(400);
     const fractional = await request(app).patch('/settings').set('Authorization', authHeader()).send({ maxActivePositions: 2.5 });
     expect(fractional.status).toBe(400);
+  });
+
+  describe('P0-2: positionSizePct/maxActivePositions are HARD-CEILINGED at the strategy limit (35% / 3), never just the old wide 0-100% / 1-50 bounds', () => {
+    it('PATCH positionSizePct=36 (just above the 35% ceiling) is rejected', async () => {
+      const { app } = buildTestApp();
+      const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ positionSizePct: 36 });
+      expect(res.status).toBe(400);
+    });
+
+    it('PATCH positionSizePct=100 is rejected', async () => {
+      const { app } = buildTestApp();
+      const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ positionSizePct: 100 });
+      expect(res.status).toBe(400);
+    });
+
+    it('PATCH maxActivePositions=4 (just above the ceiling of 3) is rejected', async () => {
+      const { app } = buildTestApp();
+      const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ maxActivePositions: 4 });
+      expect(res.status).toBe(400);
+    });
+
+    it('PATCH maxActivePositions=50 is rejected', async () => {
+      const { app } = buildTestApp();
+      const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ maxActivePositions: 50 });
+      expect(res.status).toBe(400);
+    });
+
+    it('PATCH positionSizePct=35 (exactly the ceiling) is accepted', async () => {
+      const { app, deps } = buildTestApp();
+      const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ positionSizePct: 35 });
+      expect(res.status).toBe(200);
+      expect(res.body.positionSizePct).toBeCloseTo(35);
+      expect((await deps.settings.get()).positionSizePct).toBeCloseTo(0.35);
+    });
+
+    it('PATCH maxActivePositions=3 (exactly the ceiling) is accepted', async () => {
+      const { app, deps } = buildTestApp();
+      const res = await request(app).patch('/settings').set('Authorization', authHeader()).send({ maxActivePositions: 3 });
+      expect(res.status).toBe(200);
+      expect(res.body.maxActivePositions).toBe(3);
+      expect((await deps.settings.get()).maxActivePositions).toBe(3);
+    });
+
+    it('lower values remain freely settable below the ceiling', async () => {
+      const { app, deps } = buildTestApp();
+      const sizeRes = await request(app).patch('/settings').set('Authorization', authHeader()).send({ positionSizePct: 5 });
+      expect(sizeRes.status).toBe(200);
+      const posRes = await request(app).patch('/settings').set('Authorization', authHeader()).send({ maxActivePositions: 1 });
+      expect(posRes.status).toBe(200);
+      const stored = await deps.settings.get();
+      expect(stored.positionSizePct).toBeCloseTo(0.05);
+      expect(stored.maxActivePositions).toBe(1);
+    });
   });
 
   it('401s without a valid token', async () => {
@@ -127,11 +181,12 @@ describe('GET /settings (Module 12)', () => {
 
   it('reflects a value already changed via PATCH', async () => {
     const { app } = buildTestApp();
-    await request(app).patch('/settings').set('Authorization', authHeader()).send({ maxActivePositions: 7 });
+    // P0-2: 7 exceeds the new hard ceiling (3) -- 2 is a legal, below-default value.
+    await request(app).patch('/settings').set('Authorization', authHeader()).send({ maxActivePositions: 2 });
 
     const res = await request(app).get('/settings').set('Authorization', authHeader());
 
-    expect(res.body.maxActivePositions).toBe(7);
+    expect(res.body.maxActivePositions).toBe(2);
   });
 
   it('401s without a valid token', async () => {

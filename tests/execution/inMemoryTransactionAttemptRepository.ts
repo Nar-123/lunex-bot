@@ -1,4 +1,5 @@
 import type { TransactionAttemptRecord, TransactionAttemptRepository } from '../../src/execution/types';
+import { StaleTransactionAttemptWriteError } from '../../src/execution/types';
 
 /** In-memory test double -- fast, no DB -- so `executeCriticalTransaction`'s state machine can be tested in isolation. The real Prisma-backed repository has its own dedicated integration test. */
 export class InMemoryTransactionAttemptRepository implements TransactionAttemptRepository {
@@ -26,6 +27,7 @@ export class InMemoryTransactionAttemptRepository implements TransactionAttemptR
       failureCode: null,
       attemptCount: 0,
       firstAttemptedAt: null,
+      version: 1,
     };
     this.byKey.set(idempotencyKey, record);
     return record;
@@ -33,11 +35,19 @@ export class InMemoryTransactionAttemptRepository implements TransactionAttemptR
 
   async update(
     id: string,
-    patch: Partial<Omit<TransactionAttemptRecord, 'id' | 'idempotencyKey'>>,
+    patch: Partial<Omit<TransactionAttemptRecord, 'id' | 'idempotencyKey' | 'version'>>,
+    expectedVersion?: number,
   ): Promise<TransactionAttemptRecord> {
     for (const record of this.byKey.values()) {
       if (record.id === id) {
+        // P1-5 fix: mirrors the real repository's conditional-update
+        // semantics -- a stale `expectedVersion` throws instead of
+        // silently applying the patch over a newer state.
+        if (expectedVersion !== undefined && record.version !== expectedVersion) {
+          throw new StaleTransactionAttemptWriteError(id, expectedVersion);
+        }
         Object.assign(record, patch);
+        record.version += 1;
         return record;
       }
     }

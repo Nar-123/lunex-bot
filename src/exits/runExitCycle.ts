@@ -342,6 +342,22 @@ export async function runExitCycle(deps: RunExitCycleDeps): Promise<ExitCycleRes
  * is never reachable here regardless, since this function bails out the
  * moment it sees ANY attempt row, VERIFIED included.
  */
+/**
+ * P1 audit fix: this function used to check `removeAttempt !== null` (line
+ * below) and then, on a LATER `await`, unconditionally call `markExitFailed`
+ * -- a classic TOCTOU window. A concurrent `executeExit` call (a second
+ * worker/process, or the DECIDE pass earlier this same tick under a
+ * different code path) could create the FIRST `TransactionAttempt` for
+ * this position's remove-liquidity leg in the gap between this function's
+ * "no attempt exists yet" read and its revert write, so the revert would
+ * fire based on already-stale information -- reverting a position back to
+ * ACTIVE while a real remove-liquidity transaction is simultaneously being
+ * built/broadcast for it. Protected with the SAME ownership-token claim
+ * primitive `executeExit` itself uses (P0-1/P1-3): whichever caller wins
+ * the claim proceeds; the other sees a failed claim and does nothing here,
+ * falling through to its own `executeExit` call, which will also fail to
+ * claim and correctly defer (PENDING) rather than duplicate work.
+ */
 async function tryRecoverFromUnstartedSafetyExit(position: PositionRecord, deps: RunExitCycleDeps, now: Date): Promise<boolean> {
   const exitState = await deps.exitStates.getOrCreate(position.id);
   // TIER 3: keyed on the INFRASTRUCTURE exit specifically. Meridian's
@@ -351,27 +367,42 @@ async function tryRecoverFromUnstartedSafetyExit(position: PositionRecord, deps:
   if (exitState.pendingCloseReason !== 'INFRA_SAFETY_EXIT') return false;
   if (!position.closeIdempotencyKey) return false;
 
-  const removeKey = `${position.closeIdempotencyKey}:removeLiquidity`;
-  const removeAttempt = await deps.txAttempts.find(removeKey);
-  if (removeAttempt !== null) return false; // anything attempted at all -- never touch it here
-
-  let poolPriceState: PoolPriceState | null = null;
-  let metricsOk = false;
-  try {
-    const [live, price] = await Promise.all([deps.livePositionState.getLiveState(position), deps.poolPrice.getPriceState(position.pool)]);
-    poolPriceState = price;
-    metricsOk = computePositionMetrics(position, live, price).ok;
-  } catch {
-    metricsOk = false;
+  const claimToken = await deps.positions.claimForResume(position.id, 'CLOSING', config.rules.execution.RESUME_CLAIM_FRESHNESS_MS);
+  if (claimToken === null) {
+    // Another worker already owns this position right now -- possibly
+    // mid-flight on the very remove-liquidity attempt this function exists
+    // to check for. Never touch it; defer to whoever holds the claim.
+    return false;
   }
-  if (!metricsOk) return false; // still can't read -- stay CLOSING, retry next tick
+  try {
+    const removeKey = `${position.closeIdempotencyKey}:removeLiquidity`;
+    const removeAttempt = await deps.txAttempts.find(removeKey);
+    if (removeAttempt !== null) return false; // anything attempted at all -- never touch it here
 
-  if (poolPriceState !== null && isPoolPriceStructurallyInvalid(poolPriceState)) return false; // condition genuinely still holds
+    let poolPriceState: PoolPriceState | null = null;
+    let metricsOk = false;
+    try {
+      const [live, price] = await Promise.all([deps.livePositionState.getLiveState(position), deps.poolPrice.getPriceState(position.pool)]);
+      poolPriceState = price;
+      metricsOk = computePositionMetrics(position, live, price).ok;
+    } catch {
+      metricsOk = false;
+    }
+    if (!metricsOk) return false; // still can't read -- stay CLOSING, retry next tick
 
-  // Metrics read fine and the price is structurally valid -- the
-  // condition that triggered this SAFETY_EXIT has cleared, and nothing
-  // on-chain was ever attempted. Safe to revert.
-  await deps.positions.markExitFailed(position.id);
-  await deps.exitStates.update(position.id, { metricsFailureSince: null, pendingCloseReason: null });
-  return true;
+    if (poolPriceState !== null && isPoolPriceStructurallyInvalid(poolPriceState)) return false; // condition genuinely still holds
+
+    // Metrics read fine and the price is structurally valid -- the
+    // condition that triggered this SAFETY_EXIT has cleared, and nothing
+    // on-chain was ever attempted (re-checked under the claim, not stale).
+    // Safe to revert.
+    await deps.positions.markExitFailed(position.id);
+    await deps.exitStates.update(position.id, { metricsFailureSince: null, pendingCloseReason: null });
+    return true;
+  } finally {
+    // Released whether or not we reverted -- if we return `false` here,
+    // the caller falls through to `executeExit`, which claims again itself
+    // (a claim held across two separate acquisitions is never assumed).
+    await deps.positions.releaseResumeClaim(position.id, claimToken);
+  }
 }

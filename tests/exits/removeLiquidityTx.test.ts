@@ -36,6 +36,45 @@ describe('buildV4Position -- Phase 12G: USDG Token decimals must match config.qu
   });
 });
 
+describe('P1-11: remove-liquidity slippage is bounded (100 bps), never 100% tolerance', () => {
+  it('config.rules.exits.REMOVE_LIQUIDITY_SLIPPAGE_BPS is the tight, already-vetted 100 bps (1%) tier -- not 10_000 (100%)', () => {
+    expect(config.rules.exits.REMOVE_LIQUIDITY_SLIPPAGE_BPS).toBe(100);
+    expect(config.rules.exits.REMOVE_LIQUIDITY_SLIPPAGE_BPS).not.toBe(10_000);
+    expect(config.rules.exits.REMOVE_LIQUIDITY_SLIPPAGE_BPS).toBe(config.rules.exits.SLIPPAGE_TIERS_BPS[0]);
+  });
+
+  it('the calldata for a bounded (100 bps) burn genuinely differs from the OLD 100%-tolerance encoding, at the SAME deadline -- proves the bound has real teeth', async () => {
+    const { v4Sdk } = await import('../../src/blockchain/uniswapSdk');
+    const { Percent } = await import('@uniswap/sdk-core');
+    const position = buildV4Position(makeExitTestPosition(), 1_000_000n, sqrtAt(0), 0);
+    const deadline = Math.floor(Date.now() / 1000) + 10 * 60;
+
+    const bounded = v4Sdk.V4PositionManager.removeCallParameters(position, {
+      tokenId: '1',
+      liquidityPercentage: new Percent(1, 1),
+      burnToken: true,
+      slippageTolerance: new Percent(config.rules.exits.REMOVE_LIQUIDITY_SLIPPAGE_BPS, 10_000),
+      deadline,
+    });
+    const oldStyle = v4Sdk.V4PositionManager.removeCallParameters(position, {
+      tokenId: '1',
+      liquidityPercentage: new Percent(1, 1),
+      burnToken: true,
+      slippageTolerance: new Percent(1, 1),
+      deadline,
+    });
+
+    expect(bounded.calldata).not.toBe(oldStyle.calldata);
+  });
+
+  it('does not break the legitimate close flow -- buildRemoveLiquidityDeps.buildTransaction still succeeds end-to-end with the bounded slippage', async () => {
+    const getLiveState = vi.fn(async () => liveState(1_000_000n));
+    const deps = buildRemoveLiquidityDeps(makeExitTestPosition({ status: 'CLOSING' }), { getLiveState }, { getPriceState: vi.fn(async () => ({ sqrtPriceX96: sqrtAt(0), tickCurrent: 0 })) }, { walletAddress: WALLET });
+    const tx = await deps.buildTransaction();
+    expect(tx.data.length).toBeGreaterThan(10);
+  });
+});
+
 describe('buildRemoveLiquidityDeps.verifyOnChain -- P1: proceeds-read failure after a proven burn is resumable', () => {
   it('liquidity 0 and a readable receipt -> ok, with the exact measured proceeds', async () => {
     const { deps } = makeDeps(0n, vi.fn(async () => USDG(480)));

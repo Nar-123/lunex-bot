@@ -19,7 +19,7 @@ import { StateViewPoolPriceProvider } from '../pools/poolPriceProvider';
 import { PositionManagerLivePositionStateProvider } from '../monitoring/positionStateReader';
 import { PrismaPriceHistoryRepository } from '../monitoring/priceHistoryRepository';
 import { TradingApiSwapClient } from '../swap/tradingApiClient';
-import { PositionManagerLogNftLister, PositionManagerNftOwnerChecker } from '../reconciliation/nftReconciliationPorts';
+import { PositionManagerLogNftLister, PositionManagerNftOwnerChecker, PositionManagerIdentityChecker } from '../reconciliation/nftReconciliationPorts';
 import { createConsoleFileLogger } from './logger';
 import type { AppDeps } from './types';
 
@@ -60,5 +60,6 @@ export function createRealAppDeps(): AppDeps {
     logger: createConsoleFileLogger(),
     ownedNftLister: new PositionManagerLogNftLister(),
     nftOwnerChecker: new PositionManagerNftOwnerChecker(),
+    positionIdentityChecker: new PositionManagerIdentityChecker(),
   };
 }

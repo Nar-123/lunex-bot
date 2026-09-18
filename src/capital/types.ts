@@ -58,4 +58,13 @@ export type CapitalAllocationResult =
  */
 export interface CapitalSnapshotProvider {
   getSnapshot(): Promise<CapitalSnapshot>;
+  /**
+   * P1-1: the RAW on-chain USDG balance (no OPENING reservation subtracted)
+   * -- the only balance input `PositionRepository.createIfCapitalAllows`
+   * accepts, so its write-time re-check can derive free capital from the
+   * SAME row set it validates under `CapitalLock` (see
+   * `capital/freshCapitalSnapshot.ts`). Never pass `getSnapshot()`'s
+   * already-derived `freeUsdgBalance` there instead.
+   */
+  readOnChainUsdgBalance(): Promise<bigint>;
 }

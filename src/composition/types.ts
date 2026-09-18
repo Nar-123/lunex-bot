@@ -12,7 +12,7 @@ import type { RobinhoodStockClassifier } from '../discovery/robinhoodStockClassi
 import type { PoolDiscoveryPort, PoolStateProviderPort, PoolVolumeProviderPort } from '../pools/types';
 import type { LivePositionStateProvider, PoolPriceProvider, PriceHistoryProvider } from '../monitoring/types';
 import type { SwapExecutor, SwapQuote } from '../swap/types';
-import type { NftOwnerChecker, OwnedNftLister } from '../reconciliation/types';
+import type { NftOwnerChecker, OwnedNftLister, PositionIdentityChecker } from '../reconciliation/types';
 import type { ApproveVerifyData as OpenApproveVerifyData } from '../positions/approveTx';
 import type { MintInput, MintVerifyData } from '../positions/mintTx';
 import type { ApproveVerifyData as ExitApproveVerifyData } from '../exits/approveTx';
@@ -66,9 +66,10 @@ export interface AppDeps {
   readTokenDecimals: (tokenAddress: Address) => Promise<number>;
   walletAddress: Address;
   logger: Logger;
-  /** H5: on-chain <-> DB reconciliation ports -- see `reconciliation/runReconciliation.ts`. */
+  /** H5/P1-7: on-chain <-> DB reconciliation ports -- see `reconciliation/runReconciliation.ts`. */
   ownedNftLister: OwnedNftLister;
   nftOwnerChecker: NftOwnerChecker;
+  positionIdentityChecker: PositionIdentityChecker;
 
   /**
    * Optional overrides for the on-chain leg builders `openPosition`/

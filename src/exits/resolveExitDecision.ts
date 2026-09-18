@@ -34,7 +34,7 @@ export interface ResolveExitDecisionResult {
  * demonstrated correctness reason:
  *
  * ```
- * 1. HARD_STOP_LOSS      PnL <= -6%                      immediate, no confirmation
+ * 1. HARD_STOP_LOSS      PnL <= -6%  AND Safety Exit not (yet) armed     immediate, no confirmation
  * 2. SAFETY_EXIT         armed (max DD <= -8%) && PnL >= 0%
  * 3. OVEREXTENDED        %B >= 1.0 && PnL > 0
  * 4. TRAILING_TP         arm +6%, -3pp from peak, 15s confirm
@@ -45,12 +45,52 @@ export interface ResolveExitDecisionResult {
  * 8. INFRA_SAFETY_EXIT   infrastructure fault
  * ```
  *
+ * ## P0-2026 remediation — Hard Stop now YIELDS to an arming/armed Safety Exit
+ *
+ * PRIOR HISTORY, preserved for context (do not delete): the original TIER 3
+ * Meridian-alignment change (migration `20260912000000_tier3_meridian_exit_alignment`)
+ * deliberately made Hard Stop (-6%) TIGHTER than Safety Exit's arming point
+ * (-8%) and had it "win outright when both are true" -- see that migration
+ * and `settings.ts`'s doc comment for the removed cross-field validation
+ * this used to require. The practical effect: under smooth, continuous
+ * price decline, Hard Stop intercepts and closes the position the moment
+ * PnL first crosses -6%, so Safety Exit's arming condition (-8%) was, in
+ * practice, never reached -- Safety Exit's own documented "arm at -8%,
+ * wait for recovery to 0%" semantics were unreachable dead code along the
+ * ordinary path. Flagged as a P0 in a subsequent audit and confirmed with
+ * the operator (explicit choice among several possible fixes) rather than
+ * silently reinterpreted.
+ *
+ * FIX: Hard Stop's condition below now ALSO requires `safetyExitArmedAt ===
+ * null` (computed fresh THIS tick, using `maxDrawdownPnlPct` which already
+ * folds in the current reading -- see the arming block above rule 1). This
+ * does NOT make Safety Exit reachable via ordinary smooth decline (a
+ * tick-by-tick fall still crosses -6% strictly before -8% and Hard Stop
+ * still closes it there, exactly as before -- this is an accepted,
+ * understood limitation of a discrete 15s-tick check, not something this
+ * fix claims to solve). What it DOES fix: the two realistic paths where a
+ * position's drawdown reaches -8% WITHOUT first stopping out at exactly
+ * -6% -- (a) a genuine same-tick price gap/jump (volatility spike, a missed
+ * tick after a restart) that skips straight past -6% to -8%-or-deeper in
+ * one reading, and (b) Hard Stop's own close attempt failing/staying
+ * ambiguous (`executeExit` returns PENDING or reverts to ACTIVE) while
+ * price keeps falling, so a LATER tick's fresh reading is what actually
+ * reaches -8%. In both cases, Safety Exit now arms and takes over instead
+ * of Hard Stop force-closing at a price Safety Exit's own "wait for
+ * breakeven" logic was specifically designed to improve on. Once armed,
+ * `safetyExitArmedAt` is STICKY (never cleared) as it always was, so Hard
+ * Stop stays yielded to Safety Exit for the rest of this position's life,
+ * even if PnL bounces back above -6% and dips again.
+ *
  * WHY this order. (1) and (2) are capital protection and run before any
  * profit-taking: a stop that can be delayed by a yield check is not a
- * stop. (2) sits below (1) deliberately -- if a position is both armed for
- * recovery AND through the stop, the stop wins, because "wait for a
- * bounce" is not a decision you make at -9% when your own rule says cut at
- * -6%. (3) before (4) because Meridian measures over-extension as its best
+ * stop. (2) sits below (1) in EVALUATION ORDER, but (1) now explicitly
+ * defers to (2) once (2) has armed -- "wait for a bounce" IS the decision
+ * you make once Safety Exit's own deeper threshold has genuinely been
+ * reached, per the operator's explicit resolution of this contradiction;
+ * for any drawdown between -6% and -8% that Safety Exit has NOT armed for,
+ * Hard Stop still wins immediately, exactly as before. (3) before (4)
+ * because Meridian measures over-extension as its best
  * exit ("captures the peak almost exactly"), while trailing admits to
  * giving back ~5pp of the 3pp it promises -- when both fire, taking the
  * sharper one is strictly better. (5) after (4) because a position at +25%
@@ -74,6 +114,38 @@ export interface ResolveExitDecisionResult {
  * neither advanced nor cleared. The pre-Tier-3 orchestrator passed
  * `inRange ?? true`, which silently RESET a running 29-minute OOR timer on
  * any single failed metrics read.
+ *
+ * ## P1-14 — every `pnlPct` threshold above is principal-only, BY DESIGN,
+ * and is NOT expected to match the position's final `realizedUsdgRaw` once closed
+ *
+ * `metrics.pnlPct` (see `monitoring/types.ts`'s doc comment on
+ * `PositionMetrics.pnlPct`) is `(currentValue - entryValue) / entryValue`
+ * using LIVE, UNCOLLECTED-FEES-EXCLUDED position value -- every rule above
+ * (HARD_STOP_LOSS, SAFETY_EXIT, OVEREXTENDED, TRAILING_TP, HARD_TP,
+ * OOR_PROFIT) fires purely off this principal-only number. Separately,
+ * `executeExit.ts`'s `computeRealizedProceeds` sets the position's final
+ * `realizedUsdgRaw` to the RAW SUM of every USDG transfer actually received
+ * across the remove-liquidity and swap legs -- which, because Uniswap v4's
+ * `TAKE_PAIR` settlement pays out withdrawn principal and any
+ * accrued-but-uncollected fees TOGETHER in one settlement (see
+ * `removeLiquidityTx.ts`'s doc comment), is principal PLUS whatever fees
+ * happened to be collected in that same transaction, combined and never
+ * separately labeled.
+ *
+ * These are two DELIBERATELY DIFFERENT numbers, confirmed via explicit
+ * operator decision (same category of decision as the Hard-Stop-vs-
+ * Safety-Exit precedence fix documented above): a position that fires
+ * HARD_STOP_LOSS at exactly `pnlPct <= -6%` can legitimately show a
+ * smaller loss (or even a gain) in its persisted `realizedUsdgRaw -
+ * entryUsdgRaw` once accumulated fees are folded in at close -- this is
+ * NOT a bug, NOT something either number should be "corrected" to match,
+ * and NOT evidence the trigger threshold was computed wrong. `pnlPct`
+ * answers "should we exit, based on the position's own principal
+ * performance" (the risk question); `realizedUsdgRaw` answers "how much
+ * USDG did we actually get back" (the accounting question). Do not add
+ * logic anywhere that reconciles, cross-validates, or expects these two
+ * to converge -- see `tests/exits/resolveExitDecision.test.ts`'s "P1-14"
+ * boundary tests for worked examples of the divergence this documents.
  *
  * ## When a higher-priority trigger fires
  *
@@ -124,7 +196,10 @@ export function resolveExitDecision(input: ResolveExitDecisionInput, rules: Exit
   const baseState: ExitStateFields = { ...input.exitState, maxDrawdownPnlPct, safetyExitArmedAt };
 
   // ---- 1. HARD_STOP_LOSS -- immediate, no confirmation timer ----------
-  if (pnlPct !== null && pnlPct <= rules.HARD_STOP_LOSS_PCT) {
+  // P0-3 fix: yields to Safety Exit once armed (this tick or a prior one)
+  // -- see this function's doc comment for the full mechanism and the
+  // prior "Hard Stop always wins" history this changes.
+  if (pnlPct !== null && pnlPct <= rules.HARD_STOP_LOSS_PCT && safetyExitArmedAt === null) {
     return { decision: { shouldClose: true, reason: 'HARD_STOP_LOSS' }, nextExitState: baseState };
   }
 

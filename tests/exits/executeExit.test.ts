@@ -176,6 +176,47 @@ describe('executeExit -- C3 regression: swap already VERIFIED must never re-deri
     expect(reloaded?.realizedUsdgRaw).toBe(USDG(970)); // persisted atomically with the CLOSED transition
   });
 
+  it('P1-14: a HARD_STOP_LOSS close (a principal-only -6% trigger) can legitimately persist a realizedUsdgRaw showing a SMALLER loss than -6% once collected fees are folded in -- this is the intentional, operator-confirmed divergence documented in resolveExitDecision.ts, not a bug', async () => {
+    const positions = new InMemoryPositionRepository();
+    const exitStates = new InMemoryExitStateRepository();
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    // Entered at 500 USDG. The live pnlPct trigger that decided to close
+    // this position (computed upstream by resolveExitDecision.ts, not by
+    // executeExit.ts) was principal-only and crossed exactly -6% --
+    // principal-only value at that moment would have been ~470. This test
+    // starts from that already-CLOSING position (the trigger decision
+    // itself is resolveExitDecision.test.ts's concern) and shows what
+    // computeRealizedProceeds does next: it does NOT know or care what
+    // triggered the close, it only sums actual USDG received.
+    const position = await makeClosingPosition(positions, USDG(500));
+    exitStates.seed({ positionId: position.id, pendingCloseReason: 'HARD_STOP_LOSS', swapAttemptCount: 0, trailingPeakPnlPct: null, drawdownConfirmStartedAt: null, oorStartedAt: null, safetyExitArmedAt: null, maxDrawdownPnlPct: null, metricsFailureSince: null, swapUsdgBalanceBeforeRaw: null, swapMinOutputAmountRaw: null, swapVerifiedUsdgIncreaseRaw: null });
+
+    // Principal-only value at the -6% trigger would have been ~470, but the
+    // SAME remove-liquidity settlement also paid out accrued fees the live
+    // pnlPct never counted -- so the two legs together return 495, not 470.
+    const buildRemoveLiquidityDeps = vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(495) }));
+    const buildSwapDeps = vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: USDG(0), usdgProceedsRaw: USDG(0) }));
+
+    const outcome = await executeExit(position, {
+      positions,
+      exitStates,
+      txAttempts,
+      ...baseDeps({ buildRemoveLiquidityDeps, buildSwapDeps }),
+    });
+
+    expect(outcome.outcome).toBe('CLOSED');
+    const reloaded = await positions.findById(position.id);
+    expect(reloaded?.closeReason).toBe('HARD_STOP_LOSS');
+    // realizedUsdgRaw (495) - entryUsdgRaw (500) = -5 USDG = -1% realized,
+    // even though the trigger that closed this position fired at -6%
+    // principal-only. Neither number is wrong; they measure different
+    // things. See resolveExitDecision.ts's "P1-14" doc comment.
+    expect(reloaded?.realizedUsdgRaw).toBe(USDG(495));
+    const realizedPnlRaw = (reloaded?.realizedUsdgRaw ?? 0n) - position.entryUsdgRaw;
+    expect(realizedPnlRaw).toBe(-USDG(5));
+    expect(realizedPnlRaw).toBeGreaterThan((position.entryUsdgRaw * -6n) / 100n); // realized loss is SMALLER in magnitude than the -6% trigger that fired
+  });
+
   it('swap VERIFIED with TOKEN balance genuinely reading zero: reaches CLOSED, never throws the invariant violation', async () => {
     const positions = new InMemoryPositionRepository();
     const exitStates = new InMemoryExitStateRepository();
@@ -1028,7 +1069,7 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
     });
   });
 
-  it('throws if called on a position with no closeIdempotencyKey (not actually CLOSING)', async () => {
+  it('P1-3: a position that is not actually CLOSING (e.g. still ACTIVE) is rejected by the resume-claim guard BEFORE reaching any transaction work -- PENDING, never a throw, never a mutation', async () => {
     const positions = new InMemoryPositionRepository();
     const exitStates = new InMemoryExitStateRepository();
     const txAttempts = new InMemoryTransactionAttemptRepository();
@@ -1037,13 +1078,92 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
     const active = await positions.findById(created.id);
     if (!active) throw new Error('unreachable');
 
+    const buildRemoveLiquidityDeps = vi.fn(() => {
+      throw new Error('must never even attempt to build a transaction for a non-CLOSING position');
+    });
+    const outcome = await executeExit(active, {
+      positions,
+      exitStates,
+      txAttempts,
+      ...baseDeps({ buildRemoveLiquidityDeps, buildSwapDeps: successfulSwapDeps() }),
+    });
+    expect(outcome).toEqual({ outcome: 'PENDING', reason: 'position is already claimed by a concurrent exit/resume attempt' });
+    expect(buildRemoveLiquidityDeps).not.toHaveBeenCalled();
+    // The position itself is completely untouched -- still ACTIVE, no idempotency key was ever assigned.
+    const reloaded = await positions.findById(created.id);
+    expect(reloaded?.status).toBe('ACTIVE');
+  });
+
+  it('the internal closeIdempotencyKey guard still exists as defense-in-depth for a CLOSING position with a corrupted/missing key (a state the claim guard alone cannot rule out)', async () => {
+    const positions = new InMemoryPositionRepository();
+    const exitStates = new InMemoryExitStateRepository();
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const created = await positions.create(makeCreateInput());
+    await positions.markActive(created.id, '1', new Date());
+    await positions.markClosing(created.id, `exit:${created.id}:attempt-1`);
+    const closing = await positions.findById(created.id);
+    if (!closing) throw new Error('unreachable');
+    // Simulate data corruption: CLOSING status but a null closeIdempotencyKey -- structurally shouldn't happen via the real repo API, but the guard exists precisely because "shouldn't happen" is not "provably cannot happen."
+    const corrupted = { ...closing, closeIdempotencyKey: null };
+
     await expect(
-      executeExit(active, {
+      executeExit(corrupted, {
         positions,
         exitStates,
         txAttempts,
         ...baseDeps({ buildRemoveLiquidityDeps: successfulRemoveDeps(), buildSwapDeps: successfulSwapDeps() }),
       }),
     ).rejects.toThrow(/closeIdempotencyKey/);
+  });
+
+  describe('P1-3: CLOSING claim protection -- no duplicate close execution under concurrent workers', () => {
+    it('two genuinely concurrent executeExit calls for the SAME CLOSING position: only one actually builds a transaction, the other defers as PENDING', async () => {
+      const positions = new InMemoryPositionRepository();
+      const exitStates = new InMemoryExitStateRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+      const position = await makeClosingPosition(positions, USDG(500));
+
+      let buildCalls = 0;
+      let releaseBuildGate: () => void = () => {};
+      const buildGate = new Promise<void>((resolve) => {
+        releaseBuildGate = resolve;
+      });
+      const buildRemoveLiquidityDeps = vi.fn(() =>
+        fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n }, {
+          buildTransaction: vi.fn(async () => {
+            buildCalls += 1;
+            // Hold the FIRST caller inside its critical section until both
+            // concurrent calls have been dispatched, proving the second
+            // call's claim attempt genuinely races against the first
+            // call's IN-PROGRESS (not yet finished) work -- not just "ran
+            // strictly before/after" by accident of scheduling.
+            await buildGate;
+            return { to: '0x1111111111111111111111111111111111111111' as const, data: '0x' as const, value: 0n };
+          }),
+        }),
+      );
+      const buildSwapDeps = successfulSwapDeps();
+
+      const depsShared = { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps, buildSwapDeps }) };
+
+      const call1 = executeExit(position, depsShared);
+      // Let call1 actually reach and claim the row (its claimForResume/first
+      // buildTransaction invocation) before dispatching call2 -- both are
+      // still concurrent in the sense that call1 has NOT finished (it's
+      // blocked on buildGate) when call2 starts.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const call2 = executeExit(position, depsShared);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      releaseBuildGate();
+      const [result1, result2] = await Promise.all([call1, call2]);
+
+      // Exactly one of the two calls actually did transaction work; the
+      // other deferred immediately via the claim guard.
+      const outcomes = [result1, result2];
+      const pending = outcomes.filter((o) => o.outcome === 'PENDING' && 'reason' in o && o.reason.includes('already claimed'));
+      expect(pending).toHaveLength(1);
+      expect(buildCalls).toBe(1); // never built twice for the same close
+    });
   });
 });

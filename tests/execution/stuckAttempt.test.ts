@@ -19,6 +19,7 @@ function baseAttempt(overrides: Partial<TransactionAttemptRecord> = {}): Transac
     failureCode: null,
     attemptCount: 1,
     firstAttemptedAt: new Date(),
+    version: 1,
     ...overrides,
   };
 }

@@ -10,6 +10,7 @@
  * explicit, clearly-named disabled default rather than a guessed value.
  */
 import { env } from './env';
+import { CAPITAL_HARD_CEILINGS } from '../capital/hardCeilings';
 
 // ---------------------------------------------------------------------------
 // 1. Candidate Discovery
@@ -221,22 +222,48 @@ export const LP_STRATEGY = {
   // partial (two-sided) fill caused by price movement between quote and
   // execution. See strategies/ module notes for the rounding implementation.
   UPPER_TICK_ROUNDING: 'DOWN_STRICT' as const,
+
+  /**
+   * P1-10 fix: `positions/mintTx.ts`'s `addCallParameters` previously used
+   * `slippageTolerance: new Percent(1, 1)` -- 100%, i.e. NO minimum-input
+   * protection at all. The prior judgment call ("the SIMULATED checkpoint
+   * catches an outright-broken mint before broadcast either way") is still
+   * true but incomplete: simulation only catches a mint that would revert
+   * outright, not one that succeeds after unfavorable price movement
+   * between build and mine (the same class of risk `slippageTolerance`
+   * exists for on every other DEX interaction). Bounded to the SAME
+   * tightest, already-vetted tier `EXITS.SLIPPAGE_TIERS_BPS`'s first entry
+   * uses for the swap leg (100 bps = 1%) -- not an invented number: reusing
+   * the one slippage figure this strategy has already measured/accepted
+   * elsewhere, rather than guessing a mint-specific one.
+   */
+  MINT_SLIPPAGE_BPS: 100,
 } as const;
 
 // ---------------------------------------------------------------------------
 // 5. Capital Management
 // ---------------------------------------------------------------------------
 export const CAPITAL = {
+  // P0-2: these three defaults ARE the strategy's hard safety ceilings --
+  // sourced from `capital/hardCeilings.ts`'s `CAPITAL_HARD_CEILINGS`
+  // rather than re-typing the numbers here, so the "default equals
+  // ceiling" relationship can never silently drift. Live settings
+  // (`BotSettings`/`PATCH /settings`) may only ever move these DOWN --
+  // enforced at the API layer (`api/routes/settingsSchema.ts`) and,
+  // independently, inside `decideCapitalAllocation` itself via
+  // `clampToHardCeilings` (defense-in-depth: no caller, legacy DB row, or
+  // future bug can ever produce a position beyond these limits).
+  //
   // Position size = 35% of FREE/AVAILABLE USDG balance at deployment time
   // (not 35% of the original/starting balance).
-  POSITION_SIZE_PCT_OF_FREE_BALANCE: 0.35,
-  MAX_ACTIVE_POSITIONS: 3,
+  POSITION_SIZE_PCT_OF_FREE_BALANCE: CAPITAL_HARD_CEILINGS.MAX_POSITION_SIZE_PCT,
+  MAX_ACTIVE_POSITIONS: CAPITAL_HARD_CEILINGS.MAX_ACTIVE_POSITIONS,
   // Global exposure hard cap. Each entry TARGETS 35% of free balance, but
   // is truncated to whatever remaining capacity is left under this cap --
   // see `decideCapitalAllocation.ts`'s doc comment for the exact formula.
   // 90% -> 95%: an explicit operator policy update, not a relaxation of
   // the per-entry 35% target, which is unchanged.
-  MAX_TOTAL_DEPLOYED_PCT_OF_PORTFOLIO: 0.95, // hard cap
+  MAX_TOTAL_DEPLOYED_PCT_OF_PORTFOLIO: CAPITAL_HARD_CEILINGS.MAX_TOTAL_DEPLOYED_PCT, // hard cap
   ONE_POSITION_PER_TOKEN: true,
 
   /**
@@ -298,7 +325,7 @@ export const MONITORING = {
  * Evaluated strictly in this order, per position, per 15s tick (see
  * `exits/resolveExitDecision.ts` -- the order is the policy):
  *
- *   1. HARD_STOP_LOSS      PnL <= -6%
+ *   1. HARD_STOP_LOSS      PnL <= -6%, AND Safety Exit not (yet) armed
  *   2. SAFETY_EXIT         armed at max-drawdown <= -8%, closes on recovery to >= 0%
  *   3. OVEREXTENDED        Bollinger %B >= 1.0 AND PnL > 0
  *   4. TRAILING_TP         arm at +6%, close on -3pp from peak, 15s confirm
@@ -327,18 +354,26 @@ export const EXITS = {
    * numbers but only RETARGETED Trailing TP's arm threshold instead of
    * closing -- a strictly weaker expression of the same intent.
    *
-   * Note the interaction with Priority 1: with the stop at -6% and this
-   * arming at -8%, any PnL reading that arms this rule is also at or below
-   * the stop on that SAME tick, and the stop wins (Priority 1). A price gap
-   * between polls does not change that: max drawdown only moves on an
-   * actual PnL reading, and that reading is the one the stop evaluates.
-   * Under the shipped defaults this rule therefore only produces a close
-   * when (a) the stop is live-widened past -8% via
-   * `BotSettings.hardStopLossPct`, or (b) a stop-triggered exit failed
-   * definitively and reverted the position to ACTIVE (`executeExit.ts`),
-   * and the next PnL reading has already recovered to the target. That is
-   * Meridian's own arrangement, kept deliberately -- documentation only,
-   * no behaviour is implied or changed by this note.
+   * P0-2026 UPDATE -- interaction with Priority 1: previously (the
+   * original Meridian-ladder shipment), with the stop at -6% and this
+   * arming at -8%, any PnL reading that armed this rule was also at or
+   * below the stop on that SAME tick, and the stop won unconditionally
+   * (Priority 1) -- making this rule's own "wait for recovery" semantics
+   * unreachable under ordinary smooth decline. Confirmed with the operator
+   * and changed: `exits/resolveExitDecision.ts` now has HARD_STOP_LOSS
+   * itself check `safetyExitArmedAt === null` before closing, so once this
+   * rule arms (this tick or a prior one) Priority 1 yields to it instead
+   * of overriding it. This does NOT make smooth continuous decline reach
+   * -8% (a tick-by-tick fall still crosses -6% first and stops out there,
+   * same as before -- an accepted limitation of a discrete 15s-tick check,
+   * not something this fix claims to solve). What it fixes: (a) a genuine
+   * same-tick price gap/jump that skips straight past -6% to -8%-or-deeper
+   * in one reading, (b) a stop-triggered exit that failed definitively and
+   * reverted the position to ACTIVE (`executeExit.ts`), where the NEXT
+   * reading has fallen further and now reaches -8% directly, and (c) the
+   * stop being live-widened past -8% via `BotSettings.hardStopLossPct`
+   * (unaffected by this fix -- always worked). See
+   * `exits/resolveExitDecision.ts`'s doc comment for the full mechanism.
    */
   SAFETY_EXIT: {
     ENABLED: true,
@@ -537,6 +572,21 @@ export const EXITS = {
    * balance is never abandoned.
    */
   SLIPPAGE_TIERS_BPS: [100, 200, 300] as readonly number[],
+
+  /**
+   * P1-11 fix: `exits/removeLiquidityTx.ts`'s `removeCallParameters`
+   * previously used `slippageTolerance: new Percent(1, 1)` -- 100%, no
+   * minimum-output protection on the remove-liquidity leg. Bounded to the
+   * SAME tightest tier as `SLIPPAGE_TIERS_BPS[0]` (100 bps = 1%) for the
+   * same reason as `LP_STRATEGY.MINT_SLIPPAGE_BPS` -- reusing an
+   * already-vetted number rather than inventing a new one. Deliberately
+   * NOT the swap leg's escalating ladder: remove-liquidity is a single
+   * burn-to-both-sides operation (no retry-tier concept), and a legitimate
+   * close must not be blocked by a tight bound -- 1% is loose enough that
+   * normal confirmation-time price movement does not spuriously revert it,
+   * while still catching a genuinely broken/manipulated execution.
+   */
+  REMOVE_LIQUIDITY_SLIPPAGE_BPS: 100,
 } as const;
 
 // ---------------------------------------------------------------------------

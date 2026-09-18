@@ -70,58 +70,119 @@ describe('buildSwapDeps -- takes an already-fetched quote, builds calldata for i
   });
 });
 
-describe('buildSwapDeps -- verifyOnChain requires a genuine USDG increase', () => {
-  it('fails verification when the balance did not increase at all, even with no minimum configured (protection OFF)', async () => {
+describe('buildSwapDeps -- P0-5: verifyOnChain requires genuine RECEIPT-SCOPED USDG proceeds (primary proof), never a wallet balance delta alone', () => {
+  const HASH = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`;
+
+  it('fails verification when the swap\'s OWN receipt shows zero USDG paid, even with no minimum configured (protection OFF)', async () => {
     const exitStates = new InMemoryExitStateRepository();
     await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: 0n });
     const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() };
 
     const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, {
-      readBalance: vi.fn(async () => USDG(1000)), // unchanged -- swap had zero effect
+      readBalance: vi.fn(async () => USDG(1000)),
+      readUsdgTransfersTo: vi.fn(async () => USDG(0)), // the swap's own confirmed receipt paid nothing
       walletAddress: WALLET,
     });
 
-    const result = await deps.verifyOnChain('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`);
+    const result = await deps.verifyOnChain(HASH);
     expect(result.ok).toBe(false);
   });
 
-  it('passes verification once the balance genuinely increased (protection OFF, no minimum enforced beyond "> 0")', async () => {
+  it('acceptance #2: swap output = 0, PLUS an unrelated wallet balance increase -> NOT VERIFIED (the exact false-positive P0-5 fixes)', async () => {
+    const exitStates = new InMemoryExitStateRepository();
+    await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: 0n });
+    const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() };
+
+    const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, {
+      // The wallet balance DID increase by 500 -- but from an UNRELATED
+      // incoming transfer (a deposit, another position's exit, anything
+      // outside THIS swap's own transaction), not from this swap, which
+      // genuinely paid 0. Under the OLD balance-delta-as-primary-proof
+      // logic, this would have been falsely accepted as VERIFIED.
+      readBalance: vi.fn(async () => USDG(1500)),
+      readUsdgTransfersTo: vi.fn(async () => USDG(0)), // THIS swap's own receipt: paid nothing
+      walletAddress: WALLET,
+    });
+
+    const result = await deps.verifyOnChain(HASH);
+    expect(result.ok).toBe(false); // NOT VERIFIED, despite the wallet balance genuinely being higher
+  });
+
+  it('acceptance #1: passes verification when the swap\'s own receipt shows genuine proceeds (protection OFF, minimum is "> 0")', async () => {
     const exitStates = new InMemoryExitStateRepository();
     await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: 0n });
     const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() };
 
     const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, {
       readBalance: vi.fn(async () => USDG(1050)),
-      readUsdgTransfersTo: vi.fn(async () => USDG(50)), // the swap's own receipt paid out exactly the increase
+      readUsdgTransfersTo: vi.fn(async () => USDG(50)), // the swap's own receipt paid out exactly this
       walletAddress: WALLET,
     });
 
-    const result = await deps.verifyOnChain('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`);
+    const result = await deps.verifyOnChain(HASH);
     expect(result).toEqual({ ok: true, data: { usdgIncreaseRaw: USDG(50), usdgProceedsRaw: USDG(50) } });
   });
 
-  it('fails verification when the increase is genuinely positive but below a configured minimum (protection ON)', async () => {
+  it('acceptance #5: receipt-scoped proceeds EXACTLY at the configured minimum -> VERIFIED (inclusive boundary)', async () => {
+    const exitStates = new InMemoryExitStateRepository();
+    await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: USDG(100) });
+    const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() }, exitStates, {
+      readBalance: vi.fn(async () => USDG(1100)),
+      readUsdgTransfersTo: vi.fn(async () => USDG(100)), // exactly the minimum
+      walletAddress: WALLET,
+    });
+
+    const result = await deps.verifyOnChain(HASH);
+    expect(result.ok).toBe(true);
+  });
+
+  it('acceptance #7 (partial output): receipt-scoped proceeds genuinely positive but below a configured minimum (protection ON) -> NOT VERIFIED', async () => {
     const exitStates = new InMemoryExitStateRepository();
     await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: USDG(100) });
     const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() };
 
     const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, {
-      readBalance: vi.fn(async () => USDG(1050)), // increased by 50, but the minimum required is 100
+      readBalance: vi.fn(async () => USDG(1050)),
+      readUsdgTransfersTo: vi.fn(async () => USDG(50)), // the swap's own receipt: 50, but the minimum required is 100
       walletAddress: WALLET,
     });
 
-    const result = await deps.verifyOnChain('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`);
+    const result = await deps.verifyOnChain(HASH);
     expect(result.ok).toBe(false);
   });
 
-  it('fails loudly (does not silently pass) when no baseline was ever recorded -- an invariant violation, not a valid state', async () => {
-    const exitStates = new InMemoryExitStateRepository();
+  it('receipt-scoped proceeds ALONE are sufficient even when no balance baseline was ever recorded -- the primary proof no longer depends on it', async () => {
+    const exitStates = new InMemoryExitStateRepository(); // no swapUsdgBalanceBeforeRaw seeded at all
     const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() };
-    const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, { readBalance: vi.fn(async () => USDG(1000)), walletAddress: WALLET });
+    const readBalance = vi.fn(async () => USDG(1000));
+    const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), swapExecutor, exitStates, {
+      readBalance,
+      readUsdgTransfersTo: vi.fn(async () => USDG(75)),
+      walletAddress: WALLET,
+    });
 
-    const result = await deps.verifyOnChain('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`);
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toMatch(/swapUsdgBalanceBeforeRaw/);
+    const result = await deps.verifyOnChain(HASH);
+    expect(result).toEqual({ ok: true, data: { usdgIncreaseRaw: USDG(0), usdgProceedsRaw: USDG(75) } });
+    expect(readBalance).not.toHaveBeenCalled(); // no baseline to compare against -- defense-in-depth check is skipped, never blocks
+  });
+
+  it('acceptance #6 regression: multiple Transfer events inside the SAME confirmed receipt sum together (documented limitation, not a false negative)', async () => {
+    // readUsdgTransfersTo already sums every Transfer(...->wallet) event
+    // inside ONE confirmed tx (blockchain/erc20.ts) -- this proves that
+    // behavior is what buildSwapDeps actually consumes as its proceeds
+    // figure, and that it is still scoped to the ONE tx hash (never a
+    // wallet-wide window).
+    const exitStates = new InMemoryExitStateRepository();
+    const readUsdgTransfersTo = vi.fn(async () => USDG(30) + USDG(20)); // two legs of the same swap tx, already summed by the receipt decoder
+    const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn() }, exitStates, {
+      readBalance: vi.fn(async () => USDG(1050)),
+      readUsdgTransfersTo,
+      walletAddress: WALLET,
+    });
+
+    const result = await deps.verifyOnChain(HASH);
+    expect(result.ok).toBe(true);
+    expect(readUsdgTransfersTo).toHaveBeenCalledWith(HASH, expect.any(String), WALLET); // exact tx hash, exact expected token, exact expected recipient
   });
 });
 
@@ -129,11 +190,12 @@ describe('buildSwapDeps -- P1: a failed proceeds read after the balance check pa
   const HASH = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`;
   const noopExecutor = (): SwapExecutor => ({ getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn(async () => SWAP_TX) });
 
-  it('returns resumable:true and persists the accepted USDG increase', async () => {
+  it('P0-5: a failed RECEIPT read is resumable immediately -- the balance-delta defense-in-depth is never even reached (receipt is now the primary, first-checked proof)', async () => {
     const exitStates = new InMemoryExitStateRepository();
     await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: 0n });
+    const readBalance = vi.fn(async () => USDG(1050));
     const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), noopExecutor(), exitStates, {
-      readBalance: vi.fn(async () => USDG(1050)),
+      readBalance,
       readUsdgTransfersTo: vi.fn(async () => { throw new Error('RPC timeout'); }),
       walletAddress: WALLET,
     });
@@ -143,9 +205,10 @@ describe('buildSwapDeps -- P1: a failed proceeds read after the balance check pa
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.resumable).toBe(true);
-      expect(result.reason).toMatch(/proceeds could not be measured/);
+      expect(result.reason).toMatch(/could not read the swap's own confirmed receipt/);
     }
-    expect((await exitStates.getOrCreate('pos-1')).swapVerifiedUsdgIncreaseRaw).toBe(USDG(50));
+    expect(readBalance).not.toHaveBeenCalled(); // never reached -- the primary (receipt) check failed first
+    expect((await exitStates.getOrCreate('pos-1')).swapVerifiedUsdgIncreaseRaw).toBeNull();
   });
 
   it('a resumed verify reuses the persisted increase and never re-reads the live balance -- a concurrent USDG outflow cannot falsely fail an already-filled swap', async () => {
@@ -164,12 +227,13 @@ describe('buildSwapDeps -- P1: a failed proceeds read after the balance check pa
     expect(readBalance).not.toHaveBeenCalled();
   });
 
-  it('a failed BALANCE check stays definitive (no resumable flag) and persists nothing', async () => {
+  it('P0-5: a failed RECEIPT check (zero proceeds) stays definitive (no resumable flag), and the balance-delta defense-in-depth is never even reached', async () => {
     const exitStates = new InMemoryExitStateRepository();
     await exitStates.update('pos-1', { swapUsdgBalanceBeforeRaw: USDG(1000), swapMinOutputAmountRaw: 0n });
     const readUsdgTransfersTo = vi.fn(async () => USDG(0));
+    const readBalance = vi.fn(async () => USDG(1000));
     const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), noopExecutor(), exitStates, {
-      readBalance: vi.fn(async () => USDG(1000)),
+      readBalance,
       readUsdgTransfersTo,
       walletAddress: WALLET,
     });
@@ -178,7 +242,8 @@ describe('buildSwapDeps -- P1: a failed proceeds read after the balance check pa
 
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.resumable).toBeUndefined();
-    expect(readUsdgTransfersTo).not.toHaveBeenCalled();
+    expect(readUsdgTransfersTo).toHaveBeenCalled(); // now the FIRST, primary check
+    expect(readBalance).not.toHaveBeenCalled(); // defense-in-depth check never reached -- the primary check already failed definitively
     expect((await exitStates.getOrCreate('pos-1')).swapVerifiedUsdgIncreaseRaw).toBeNull();
   });
 

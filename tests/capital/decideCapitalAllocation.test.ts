@@ -280,3 +280,54 @@ describe('checkEthGasReserve -- tested directly since the config toggle cannot b
     expect(checkEthGasReserve(0n, true, 0)).toEqual({ ok: true });
   });
 });
+
+describe('decideCapitalAllocation -- P0-2: independently enforces the hard ceilings even when the CALLER passes malformed/above-ceiling rules', () => {
+  it('a malformed 100% positionSizePct is clamped to the 35% ceiling -- the resulting position is exactly the SAME size a legal 35% caller would get', () => {
+    const malformed: CapitalRules = { ...RULES, POSITION_SIZE_PCT_OF_FREE_BALANCE: 1.0 };
+    const legal: CapitalRules = { ...RULES, POSITION_SIZE_PCT_OF_FREE_BALANCE: 0.35 };
+    const malformedResult = decideCapitalAllocation(baseSnapshot(), malformed);
+    const legalResult = decideCapitalAllocation(baseSnapshot(), legal);
+    expect(malformedResult).toEqual(legalResult);
+    if (malformedResult.ok) {
+      expect(malformedResult.positionSizeUsdgRaw).toBe(targetOf(USDG(1000))); // 350 USDG, NOT 1000
+    }
+  });
+
+  it('a malformed MAX_ACTIVE_POSITIONS=50 is clamped to the ceiling of 3 -- the 4th position is still rejected', () => {
+    const malformed: CapitalRules = { ...RULES, MAX_ACTIVE_POSITIONS: 50 };
+    const result = decideCapitalAllocation(baseSnapshot({ activePositionsCount: 3, totalDeployedUsdg: capOf(USDG(1000)) - 1n }), malformed);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/max active positions reached \(3\/3\)/);
+  });
+
+  it('a malformed 100% MAX_TOTAL_DEPLOYED_PCT_OF_PORTFOLIO is clamped to the 95% global cap', () => {
+    const malformed: CapitalRules = { ...RULES, MAX_TOTAL_DEPLOYED_PCT_OF_PORTFOLIO: 1.0 };
+    // basePortfolioBalance stays 1000 (free + deployed); already deployed
+    // exactly at the REAL 95% cap (950) -- a malformed 100% cap would
+    // (incorrectly) still allow more room; the clamp must reject here
+    // exactly as the legal 95% rule would.
+    const deployed = capOf(USDG(1000));
+    const result = decideCapitalAllocation(baseSnapshot({ freeUsdgBalance: USDG(1000) - deployed, totalDeployedUsdg: deployed }), malformed);
+    expect(result.ok).toBe(false);
+  });
+
+  it('a value already at or below the ceiling passes through completely unchanged (the clamp is one-directional, never a floor)', () => {
+    const tighter: CapitalRules = { ...RULES, POSITION_SIZE_PCT_OF_FREE_BALANCE: 0.1, MAX_ACTIVE_POSITIONS: 1 };
+    const result = decideCapitalAllocation(baseSnapshot(), tighter);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.positionSizeUsdgRaw).toBe(USDG(100)); // 10% of 1000, not clamped up to 35%
+  });
+
+  it('acceptance #9/#10: the SAME ceilings are enforced regardless of caller -- a screeningCycle-shaped rules object built from a malformed settings row can never bypass them', () => {
+    // Mirrors exactly how screeningCycle.ts builds CapitalRules from live settings.
+    const maliciousSettingsShapedRules: CapitalRules = {
+      ...config.rules.capital,
+      MAX_ACTIVE_POSITIONS: 4, // above ceiling, e.g. a legacy DB row from before P0-2
+      POSITION_SIZE_PCT_OF_FREE_BALANCE: 0.36, // above ceiling
+    };
+    const result = decideCapitalAllocation(baseSnapshot({ activePositionsCount: 3 }), maliciousSettingsShapedRules);
+    // 3 active positions against the CLAMPED ceiling of 3 -> rejected, never allowed to reach a 4th.
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/max active positions reached \(3\/3\)/);
+  });
+});

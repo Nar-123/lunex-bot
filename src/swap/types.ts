@@ -1,7 +1,28 @@
 import type { Address } from 'viem';
 import type { TxRequest } from '../execution/types';
 
-/** A quote for TOKEN -> USDG, before any calldata has been built for it. */
+/**
+ * A quote for TOKEN -> USDG, before any calldata has been built for it.
+ *
+ * P1-12 (quote freshness/expiry): checked directly against the real,
+ * confirmed Trading API response shape this type is mapped from
+ * (`swap/tradingApiMapper.ts`'s `parseQuoteResponse`) -- there is NO
+ * timestamp, quote id, TTL, or expiry field anywhere in the actual API
+ * response, and none is invented here. This is not an oversight: the ONLY
+ * other price source in this codebase (`pools/poolStateProvider.ts`'s live
+ * `StateView` reads, used for entry decisions, monitoring, and exit
+ * triggers) has no such concept either, because a live `eth_call` result is
+ * truth at the moment it's read, not a cached object that can go stale
+ * before use. Freshness for THIS quote is instead enforced procedurally,
+ * not via any API-native mechanism: `getQuote` is always called
+ * immediately before `buildSwapTx` and a quote is never cached or reused
+ * across ticks (see `exits/swapTx.ts` and `exits/executeExit.ts` -- a
+ * retried/escalated swap always re-quotes fresh, never resends an old
+ * quote's numbers). If the Trading API ever adds a real expiry field, wire
+ * it in then; until it exists on the wire, adding one here would be
+ * exactly the kind of invented-field risk `tradingApiMapper.ts`'s own doc
+ * comment already warns against (see its `allowanceTarget` history, C5).
+ */
 export interface SwapQuote {
   amountInRaw: bigint;
   expectedAmountOutRaw: bigint;

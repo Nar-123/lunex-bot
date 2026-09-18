@@ -79,11 +79,12 @@ export function buildV4Position(position: PositionRecord, liquidity: bigint, sqr
  * call, not two -- a deliberate flow-steps-to-transactions mapping
  * decision, not a shortcut.
  *
- * `slippageTolerance` is set to 100% (no minimum) for
- * `amount0Min`/`amount1Min` -- consistent with the "no minimum-received
- * protection anywhere in the exit flow" intent, though the spec's OFF
- * instruction technically named only the swap leg (flagged as a judgment
- * call in the module plan).
+ * `slippageTolerance` is `config.rules.exits.REMOVE_LIQUIDITY_SLIPPAGE_BPS`
+ * (P1-11 fix -- was 100%/no minimum `amount0Min`/`amount1Min` at all; see
+ * that constant's doc comment for why 100 bps, not an invented number).
+ * `liquidityPercentage` below is UNRELATED and unchanged -- it means
+ * "remove 100% of this position's liquidity" (a full close), not a
+ * slippage bound.
  *
  * `verifyOnChain` re-reads live position state and confirms liquidity is
  * genuinely 0 -- proving the burn actually happened on-chain, not just
@@ -115,7 +116,7 @@ export function buildRemoveLiquidityDeps(
         tokenId: position.positionTokenId,
         liquidityPercentage: new Percent(1, 1),
         burnToken: true,
-        slippageTolerance: new Percent(1, 1),
+        slippageTolerance: new Percent(config.rules.exits.REMOVE_LIQUIDITY_SLIPPAGE_BPS, 10_000),
         deadline,
       });
       return { to: positionManagerAddress, data: calldata as `0x${string}`, value: BigInt(value) };

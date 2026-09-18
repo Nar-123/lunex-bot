@@ -99,6 +99,14 @@ model TransactionAttempt {
   /// older than 10 minutes" -- without any push notification (Telegram
   /// stays on-demand-only per spec).
   firstAttemptedAt DateTime?
+  /// P1-5 fix: optimistic-concurrency version, incremented by exactly 1 on
+  /// every successful `update()`. `update()`'s optional `expectedVersion`
+  /// parameter makes the write a compare-and-swap (`WHERE id = ? AND
+  /// version = ?`) -- see `execution/types.ts`'s doc comment on `update()`
+  /// for why this exists: without it, a stale worker (a second process, or
+  /// a crashed-and-resumed call racing a newer one) could silently
+  /// overwrite newer pipeline progress with an older snapshot.
+  version          Int       @default(1)
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -177,11 +185,31 @@ model Position {
   /// screening cycle's `openPosition()` and the 15s exit cycle's
   /// OPENING-resume pass both discovering the same brand-new position).
   resumeClaimedAt DateTime?
+  /// P0-1 fix: a random per-claim ownership token, set atomically together
+  /// with `resumeClaimedAt` by `claimForResume()`. `releaseResumeClaim()`
+  /// now requires the CALLER's own token to match this column (`UPDATE ...
+  /// WHERE id = ? AND resumeClaimToken = ?`) before it clears the claim --
+  /// closing the race where a worker that hung past claim expiry (so a
+  /// second worker legitimately re-claimed the same row) later returns and
+  /// unconditionally releases, deleting the SECOND worker's still-active
+  /// claim out from under it. NULL = unclaimed, same as `resumeClaimedAt`.
+  resumeClaimToken String?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
   @@index([status])
   @@index([tokenAddress, status])
+  // P1-2 fix: a partial UNIQUE index -- `Position_tokenAddress_active_unique`
+  // ON ("tokenAddress") WHERE "status" IN ('OPENING','ACTIVE','CLOSING') --
+  // is applied via raw SQL in migration
+  // `20260916000002_add_position_token_active_unique_index`, NOT expressed
+  // here, because Prisma's declarative `@@unique` cannot express a WHERE
+  // condition. This is what makes "1 token = 1 non-closed position" a
+  // DB-atomic invariant (a concurrent `create()` for the same token while
+  // one is already OPENING/ACTIVE/CLOSING fails at the database level)
+  // rather than a racy application-level check-then-create. Do NOT remove
+  // this index by "fixing" apparent schema drift -- it is intentionally
+  // absent from the declarative model above.
 }
 
 /// Persistent state for exits/'s stateful exit triggers (Module 8) — Trailing
@@ -291,6 +319,43 @@ model PoolPriceSample {
   @@index([observedAt])
 }
 
+/// P1-1 fix: singleton advisory-lock row for
+/// `PositionRepository.createIfCapitalAllows()`'s capital-reservation
+/// critical section. That method's `$transaction` touches this row (a real
+/// WRITE) as its FIRST statement, before doing any reads -- this is what
+/// forces SQLite to escalate the (otherwise-deferred) transaction's lock to
+/// a genuine RESERVED write lock immediately, rather than only at the final
+/// `position.create()`. Without this, two concurrent callers could both
+/// complete their `findMany`/`count` reads (a SHARED lock, which SQLite
+/// lets multiple readers hold at once) before either takes the write lock,
+/// each computing "fits under the cap" from the SAME stale totals and then
+/// both writing -- exactly the race this method must prevent, and the one
+/// a Prisma `{ isolationLevel: 'Serializable' }` option does NOT prevent:
+/// verified empirically (see git history on this file) that Prisma's
+/// better-sqlite3 driver adapter's `startTransaction()` always issues a
+/// plain `BEGIN` regardless of the requested isolation level. This matters
+/// most ACROSS SEPARATE PROCESSES -- each has its own independent Prisma
+/// driver adapter and its own in-process JS mutex (see
+/// `@prisma/adapter-better-sqlite3`'s `PrismaBetterSqlite3Adapter#mutex`),
+/// which does NOT coordinate with any other process; only a real SQLite
+/// file-level write lock does. This row is never read for its data --
+/// touched and thrown away every time.
+///
+/// `id` deliberately has NO `@default`: the single row is seeded (with an
+/// explicit id) by migration `20260916000003_add_capital_lock`, and the only
+/// runtime access is `update({ where: { id: 'singleton' } })` -- nothing
+/// ever inserts via Prisma. Declaring `@default("singleton")` here (as an
+/// earlier revision did) made the schema claim a SQL `DEFAULT 'singleton'`
+/// the migration never created, so `prisma migrate diff`/`migrate dev`
+/// reported drift and would have generated a gratuitous table-rebuild
+/// migration. Keeping the schema aligned with the migration avoids that
+/// with no database change at all. If the row is ever missing, the
+/// `update` throws and `createIfCapitalAllows` fails closed (no reservation).
+model CapitalLock {
+  id        String   @id
+  touchedAt DateTime @updatedAt
+}
+
 /// Live, operator-editable parameters (Module 10) -- singleton row (`id`
 /// always "singleton", exactly one bot instance). Defaults below match
 /// today's frozen `config.rules.*` constants exactly, so behavior is
@@ -311,11 +376,16 @@ model BotSettings {
   maxActivePositions   Int      @default(3)
   /// Fraction, always negative -- replaces EXITS.HARD_STOP_LOSS_PCT.
   /// TIER 3: default -0.15 -> -0.06, Meridian's measured stop. No longer
-  /// cross-validated against the Safety Exit trigger: under the Meridian
-  /// ladder the stop is deliberately TIGHTER than the -8% arming point
-  /// and wins outright when both are true (see resolveExitDecision.ts),
-  /// so the old "must be looser than -8%" rule encoded a policy that no
-  /// longer exists.
+  /// cross-validated against the Safety Exit trigger at the settings-range
+  /// level: under the Meridian ladder the stop is deliberately TIGHTER
+  /// than the -8% arming point, so the old "must be looser than -8%"
+  /// range rule encoded a policy that no longer exists (removed).
+  /// P0-3: this does NOT mean Hard Stop always overrides Safety Exit --
+  /// `exits/resolveExitDecision.ts` now has Hard Stop YIELD once Safety
+  /// Exit has armed (this tick or a prior one), so Safety Exit's own
+  /// "arm at -8%, wait for recovery to 0%" semantics are genuinely
+  /// reachable via a price gap or a failed/retried Hard Stop close --
+  /// see that file's doc comment for the full mechanism and history.
   hardStopLossPct      Float    @default(-0.06)
   /// Fraction, always positive -- replaces EXITS.TRAILING_TP.TRIGGER_PEAK_PNL_PCT.
   /// TIER 3: default 0.05 -> 0.06, Meridian's measured trailing arm.

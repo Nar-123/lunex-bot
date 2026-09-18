@@ -16,10 +16,17 @@ import { settingsPatchSchema } from './settingsSchema';
  * Protection. Still read-only and never settable via `PATCH`; it is
  * exposed so the settings UI can SHOW an operator the fixed threshold
  * their editable stop-loss sits next to, without hardcoding a second copy
- * of the number in browser code. It is no longer used for a client-side
- * cross-field check -- under the Meridian ladder the stop is deliberately
- * TIGHTER than this value (see `validateSettingsPatch`'s deletion note in
- * the Tier 3 report).
+ * of the number in browser code.
+ *
+ * P0-3 UPDATE: still no client-side cross-field REJECTION of a
+ * `hardStopLossPct` looser than -8% -- an operator may still set
+ * `hardStopLossPct` to -6% (tighter than Safety Exit's -8% arming point)
+ * and this remains a legal PATCH. What changed is `exits/resolveExitDecision.ts`'s
+ * own precedence: Hard Stop no longer unconditionally "wins outright" over
+ * an armed Safety Exit -- once Safety Exit has armed (this tick or a prior
+ * one), Hard Stop yields to it. See that file's doc comment for the full
+ * mechanism. This field stays exposed read-only for the same UI reason as
+ * before.
  */
 function toSettingsResponse(s: { paused: boolean; positionSizePct: number; maxActivePositions: number; hardStopLossPct: number; trailingTpTriggerPct: number; updatedAt: Date }) {
   return {
@@ -45,10 +52,17 @@ function toSettingsResponse(s: { paused: boolean; positionSizePct: number; maxAc
  *
  * TIER 3 removed the second, cross-field layer (`validateSettingsPatch`),
  * which required `hardStopLossPct` to be at or below the -8% PNL
- * Protection threshold. The Meridian ladder inverts that relationship on
- * purpose -- the stop is -6%, TIGHTER than the -8% Safety Exit arming
- * point, and wins outright when both are true -- so the old rule would now
- * reject the system's own default. The policy it encoded no longer exists.
+ * Protection threshold -- the Meridian ladder's -6% default is deliberately
+ * TIGHTER than that, so the old rule would have rejected the system's own
+ * default. That per-field-range removal stays correct and is NOT
+ * reinstated here.
+ *
+ * P0-3: what DID change (in `exits/resolveExitDecision.ts`, not here) is
+ * that Hard Stop no longer unconditionally wins when both it and Safety
+ * Exit would apply -- it now yields once Safety Exit has armed. This file
+ * needs no change for that fix: `hardStopLossPct`'s valid RANGE is
+ * unaffected, only the exit resolver's PRECEDENCE between two already-legal
+ * values.
  */
 export function createSettingsRouter(deps: AppDeps): Router {
   const router = Router();

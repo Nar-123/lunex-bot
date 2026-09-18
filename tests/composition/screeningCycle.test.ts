@@ -33,7 +33,7 @@ describe('runScreeningCycle', () => {
     const candidate = makeCandidate();
     const deps = createFakeAppDeps({
       discoveryService: { discoverTopCandidates: vi.fn(async () => [candidate]) } as never,
-      capitalSnapshot: { getSnapshot: vi.fn(async () => ({ freeUsdgBalance: 0n, activePositionsCount: 3, totalDeployedUsdg: USDG(1000) })) },
+      capitalSnapshot: { getSnapshot: vi.fn(async () => ({ freeUsdgBalance: 0n, activePositionsCount: 3, totalDeployedUsdg: USDG(1000) })), readOnChainUsdgBalance: vi.fn(async () => 0n) },
     });
 
     const summary = await runScreeningCycle(deps);
@@ -231,7 +231,7 @@ describe('runScreeningCycle', () => {
       const candidate = makeCandidate();
       const deps = createFakeAppDeps({
         discoveryService: { discoverTopCandidates: vi.fn(async () => [candidate]) } as never,
-        capitalSnapshot: { getSnapshot: vi.fn(async () => ({ freeUsdgBalance: USDG(1000), activePositionsCount: 1, totalDeployedUsdg: USDG(0) })) },
+        capitalSnapshot: { getSnapshot: vi.fn(async () => ({ freeUsdgBalance: USDG(1000), activePositionsCount: 1, totalDeployedUsdg: USDG(0) })), readOnChainUsdgBalance: vi.fn(async () => USDG(1000)) },
       });
       await deps.settings.update({ maxActivePositions: 1 }); // frozen config default is 3 -- 1 active position would normally still be allowed
 

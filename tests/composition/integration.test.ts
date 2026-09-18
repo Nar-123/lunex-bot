@@ -1,8 +1,53 @@
 import { describe, expect, it, vi } from 'vitest';
+import { getAddress } from 'viem';
+import { Token } from '@uniswap/sdk-core';
 import { startApp } from '../../src/composition/app';
 import { createFakeAppDeps, fakeTxDeps, makeCandidate, POOL_REF, USDG } from './fakeAppDeps';
 import type { createInMemoryLogger } from '../../src/composition/logger';
 import type { AppDeps } from '../../src/composition/types';
+import type { PositionRecord } from '../../src/positions/types';
+import { v3TickMathUtils, v4Sdk } from '../../src/blockchain/uniswapSdk';
+import { config } from '../../src/config';
+
+const { TickMath } = v3TickMathUtils;
+/** Exact sqrtPriceX96 for a given tick -- a hand-approximated ratio is NOT
+ * good enough (computePositionMetrics's Pool construction needs a
+ * genuinely consistent sqrtPriceX96/tickCurrent pair, or its internal math
+ * silently produces garbage/failing reads). */
+function sqrtAt(tick: number): bigint {
+  return BigInt(TickMath.getSqrtRatioAtTick(tick).toString());
+}
+
+/**
+ * P0-3: a REAL, price-consistent liquidity derivation for a given
+ * position, computed from that position's OWN recorded entry data (not a
+ * fixed, price-independent placeholder). `fakeAppDeps.ts`'s default
+ * `getLiveState` returns a hardcoded `liquidity: 500n` completely
+ * decoupled from the real `entryUsdgRaw` a live capital-allocation cycle
+ * decides -- harmless while HARD_STOP_LOSS fired almost immediately
+ * regardless (the old ladder), but under the P0-3 fix a decoupled
+ * liquidity value makes `computePositionMetrics` read a permanent,
+ * price-independent ~-100% PnL that can never "recover" no matter what
+ * price is fed in, since it isn't actually driven by price at all. Mirrors
+ * `tests/exits/positionFixture.ts`'s `deriveEntryLiquidity` exactly, just
+ * computed per-position (from whatever the real screening cycle actually
+ * decided) instead of hardcoded per-test-file.
+ */
+function deriveRealisticLiquidity(position: PositionRecord): bigint {
+  const usdgAddress = getAddress(config.quoteAsset.ADDRESS);
+  const currency0 = getAddress(position.pool.currency0);
+  const usdgIsCurrency0 = currency0 === usdgAddress;
+  const usdgToken = new Token(config.chain.chainId, usdgAddress, config.quoteAsset.DECIMALS, 'USDG');
+  const otherToken = new Token(config.chain.chainId, usdgIsCurrency0 ? getAddress(position.pool.currency1) : currency0, position.tokenDecimals, position.tokenSymbol);
+  const currency0Token = usdgIsCurrency0 ? usdgToken : otherToken;
+  const currency1Token = usdgIsCurrency0 ? otherToken : usdgToken;
+  // Entry price -- this test's pre-crash getPriceState always returns tick 0.
+  const poolAtEntry = new v4Sdk.Pool(currency0Token, currency1Token, position.pool.fee, position.pool.tickSpacing, position.pool.hooks, (2n ** 96n).toString(), '0', 0);
+  const derived = usdgIsCurrency0
+    ? v4Sdk.Position.fromAmount0({ pool: poolAtEntry, tickLower: position.tickLower, tickUpper: position.tickUpper, amount0: position.entryUsdgRaw.toString(), useFullPrecision: true })
+    : v4Sdk.Position.fromAmount1({ pool: poolAtEntry, tickLower: position.tickLower, tickUpper: position.tickUpper, amount1: position.entryUsdgRaw.toString() });
+  return BigInt(derived.liquidity.toString());
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -36,17 +81,32 @@ describe('composition root integration: all three cycles running concurrently', 
           return ticksElapsed === 0 ? [candidate] : [];
         }),
       } as never,
-      // Price crashes hard after a few monitoring/exit ticks -- simulates
-      // a real HARD_STOP_LOSS trigger arriving mid-run, not a scripted
-      // "call runExitCycle directly" shortcut.
+      // Price crashes after a few monitoring/exit ticks -- simulates a
+      // real HARD_STOP_LOSS trigger arriving mid-run, not a scripted "call
+      // runExitCycle directly" shortcut. P0-3 note: kept deliberately
+      // SHALLOW (not a -29%-shaped crash) so it lands in the -6%-to-(-8%)
+      // band that does NOT arm SAFETY_EXIT same-tick (see
+      // resolveExitDecision.ts) -- this test is about proving the three
+      // cycles coexist end-to-end, not about the P0-3 arm/yield mechanism
+      // itself (covered exhaustively in resolveExitDecision.test.ts and
+      // runExitCycle.test.ts), so a clean, unambiguous close is what it needs.
       poolPrice: {
         getPriceState: vi.fn(async () => {
           ticksElapsed++;
           const crashed = ticksElapsed > 6;
-          return crashed ? { sqrtPriceX96: (2n ** 96n * 6n) / 10n, tickCurrent: -5000 } : { sqrtPriceX96: 2n ** 96n, tickCurrent: 0 };
+          // -3000 -> pnlPct ~ -6.4% for this range shape: in the un-armed
+          // Hard-Stop band (see P0-3 in resolveExitDecision.ts), so this
+          // stays a clean, unambiguous HARD_STOP_LOSS close -- this test
+          // is about proving the three cycles coexist end-to-end, not
+          // about the P0-3 arm/yield mechanism itself.
+          return crashed ? { sqrtPriceX96: sqrtAt(-3000), tickCurrent: -3000 } : { sqrtPriceX96: 2n ** 96n, tickCurrent: 0 };
         }),
       },
-      livePositionState: { getLiveState: vi.fn(async () => ({ liquidity: 500n, tokensOwed0: 0n, tokensOwed1: 0n })) },
+      // P0-3: liquidity genuinely derived from each position's own real
+      // entry data (see deriveRealisticLiquidity above), not a fixed
+      // placeholder decoupled from price -- otherwise PnL never actually
+      // tracks the simulated crash/recovery below.
+      livePositionState: { getLiveState: vi.fn(async (position: PositionRecord) => ({ liquidity: deriveRealisticLiquidity(position), tokensOwed0: 0n, tokensOwed1: 0n })) },
     });
 
     // Track whether `activePositionChecker` actually reflects deployed state, mirroring the real port's contract (Revision 8-proven elsewhere) rather than always returning false.

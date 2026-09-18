@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { runMonitoringCycle } from '../../monitoring/monitorPositions';
 import type { PositionMetricsResult } from '../../monitoring/types';
+import { backfillRealizedPnl } from '../../exits/realizedPnlBackfill';
 import { config } from '../../config';
 import type { AppDeps } from '../../composition/types';
 
@@ -124,6 +125,22 @@ export function createPositionsRouter(deps: AppDeps): Router {
     }
     const payload = await getActivePositionsPayload(deps);
     res.status(200).json({ positions: payload });
+  });
+
+  /**
+   * P1-13: `POST /positions/backfill-realized-pnl` -- on-demand, operator-
+   * triggered backfill of `realizedUsdgRaw` for CLOSED positions that
+   * still lack it (legacy rows, or a close that happened before the
+   * proceeds fields existed). Deliberately NOT wired into any automatic
+   * cycle/startup hook -- this only ever touches already-CLOSED
+   * (terminal) rows and is idempotent/safe to call repeatedly, but per
+   * this task's scope stays an explicit operator action rather than new
+   * automatic behavior in the live trading loops. See
+   * `exits/realizedPnlBackfill.ts` for the no-double-counting guarantees.
+   */
+  router.post('/backfill-realized-pnl', async (_req, res) => {
+    const result = await backfillRealizedPnl({ positions: deps.positions, txAttempts: deps.txAttempts, exitStates: deps.exitStates });
+    res.status(200).json(result);
   });
 
   return router;

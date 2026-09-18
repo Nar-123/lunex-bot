@@ -9,6 +9,16 @@ import { InMemoryPositionRepository } from './inMemoryPositionRepository';
 import { PositionActivePositionChecker } from '../../src/positions/activePositionChecker';
 import { PositionCapitalSnapshotProvider } from '../../src/positions/capitalSnapshotProvider';
 import { POOL } from './fixtures';
+import type { CapitalRules } from '../../src/capital/types';
+
+/** Matches the canonical base=1000/target=350 worked example used throughout this project's capital tests -- generous enough that P1-1's write-time re-check never spuriously rejects an unrelated mint/approve-state-machine test. */
+const CAPITAL_RULES: CapitalRules = {
+  MAX_ACTIVE_POSITIONS: 3,
+  POSITION_SIZE_PCT_OF_FREE_BALANCE: 0.35,
+  MAX_TOTAL_DEPLOYED_PCT_OF_PORTFOLIO: 0.95,
+  ETH_GAS_RESERVE_ENABLED: false,
+  ETH_GAS_RESERVE_MIN: 0,
+};
 
 const TX: TxRequest = { to: '0x1111111111111111111111111111111111111111', data: '0xabcdef', value: 0n };
 const WALLET = '0x9999999999999999999999999999999999999999' as Address;
@@ -67,6 +77,8 @@ function makeInput(overrides: Partial<OpenPositionInput> = {}): OpenPositionInpu
     entryUsdgRaw: USDG(350),
     entryTick: 0,
     entrySqrtPriceX96: 2n ** 96n,
+    readOnChainUsdgBalance: async () => USDG(1000), // raw on-chain balance: base=1000 -> target=350, matches entryUsdgRaw exactly, per the canonical worked example
+    capitalRules: CAPITAL_RULES,
     ...overrides,
   };
 }
@@ -509,6 +521,61 @@ describe('openPosition / resumeOpenPosition -- the open-side state machine', () 
 
       expect(outcome.outcome).toBe('ACTIVE');
       expect(buildApproveDeps).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('P1-2: DB-atomic "1 token = 1 non-closed position" -- openPosition() surfaces the conflict as a clean FAILED outcome', () => {
+    it('a second openPosition() call for a token that ALREADY has a non-closed position fails cleanly (FAILED, not a thrown exception), and never touches any transaction machinery', async () => {
+      const positions = new InMemoryPositionRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+      const buildMintDeps = successfulMintDeps();
+
+      const first = await openPosition(makeInput(), { positions, txAttempts, ...baseDeps({ buildMintDeps, readAllowance: vi.fn(async () => USDG(500)) }) });
+      expect(first.outcome).toBe('ACTIVE');
+
+      const second = await openPosition(makeInput(), { positions, txAttempts, ...baseDeps({ buildMintDeps, readAllowance: vi.fn(async () => USDG(500)) }) });
+      expect(second.outcome).toBe('FAILED');
+      if (second.outcome === 'FAILED') expect(second.reason).toMatch(/non-closed.*position.*already exists/i);
+
+      // The second call never even reached the mint machinery -- still called only once (for the first, successful attempt).
+      expect(buildMintDeps).toHaveBeenCalledTimes(1);
+      // Exactly one Position row exists for this token.
+      const active = await positions.findActiveByToken(TOKEN);
+      expect(active?.status).toBe('ACTIVE');
+    });
+
+    it('concurrency: two genuinely concurrent openPosition() calls for the SAME token -- only one reaches ACTIVE, the other gets a clean FAILED', async () => {
+      const positions = new InMemoryPositionRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+      const buildMintDeps = successfulMintDeps();
+      const deps1 = { positions, txAttempts, ...baseDeps({ buildMintDeps, readAllowance: vi.fn(async () => USDG(500)) }) };
+      const deps2 = { positions, txAttempts, ...baseDeps({ buildMintDeps, readAllowance: vi.fn(async () => USDG(500)) }) };
+
+      const [r1, r2] = await Promise.all([openPosition(makeInput(), deps1), openPosition(makeInput(), deps2)]);
+      const outcomes = [r1.outcome, r2.outcome].sort();
+      expect(outcomes).toEqual(['ACTIVE', 'FAILED']);
+
+      const allForToken = (await positions.findAllActive()).filter((p) => p.tokenAddress === TOKEN.toLowerCase());
+      expect(allForToken).toHaveLength(1); // never two active positions for the same token
+    });
+
+    it('a token whose PRIOR position reached FAILED is free to open a brand new one', async () => {
+      const positions = new InMemoryPositionRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+
+      const failedOutcome = await openPosition(makeInput(), {
+        positions,
+        txAttempts,
+        ...baseDeps({ buildMintDeps: definitivelyFailingMintDeps(), readAllowance: vi.fn(async () => USDG(500)) }),
+      });
+      expect(failedOutcome.outcome).toBe('FAILED');
+
+      const retryOutcome = await openPosition(makeInput(), {
+        positions,
+        txAttempts,
+        ...baseDeps({ buildMintDeps: successfulMintDeps(), readAllowance: vi.fn(async () => USDG(500)) }),
+      });
+      expect(retryOutcome.outcome).toBe('ACTIVE'); // not blocked by the earlier FAILED attempt for the same token
     });
   });
 });

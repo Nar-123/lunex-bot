@@ -7,6 +7,7 @@ import { selectPool } from '../pools/selectPool';
 import { computeLpRange } from '../strategies/computeLpRange';
 import { decideCapitalAllocation } from '../capital/decideCapitalAllocation';
 import type { CapitalRules } from '../capital/types';
+import { exceedsHardCeilings } from '../capital/hardCeilings';
 import { applyCanaryPositionCap, canaryAllowsNewEntry } from '../capital/canary';
 import type { CanaryRules } from '../capital/canary';
 import { openPosition } from '../positions/openPosition';
@@ -98,6 +99,21 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
     MAX_ACTIVE_POSITIONS: settings.maxActivePositions,
     POSITION_SIZE_PCT_OF_FREE_BALANCE: settings.positionSizePct,
   };
+  // P0-2: `PATCH /settings` rejects an above-ceiling value at the API
+  // layer (api/routes/settingsSchema.ts), so this should be unreachable in
+  // normal operation -- but a legacy DB row from before that fix, or a
+  // direct DB edit, is still possible. `decideCapitalAllocation` itself
+  // independently clamps (see `capital/hardCeilings.ts`), so a stale
+  // over-ceiling value here can never actually size an over-limit
+  // position -- this is purely a loud, one-time-per-cycle warning so the
+  // condition is visible in logs/observability, never silent.
+  if (exceedsHardCeilings(capitalRules)) {
+    deps.logger.warn('settings_exceed_hard_ceiling', {
+      positionSizePct: capitalRules.POSITION_SIZE_PCT_OF_FREE_BALANCE,
+      maxActivePositions: capitalRules.MAX_ACTIVE_POSITIONS,
+      message: 'live settings exceed the strategy hard ceiling -- decideCapitalAllocation will clamp, but the stored settings row should be corrected',
+    });
+  }
 
   // ASSET_TYPE (see `config/constants.ts`'s `FILTERS.ASSET_TYPE` doc
   // comment) is back to fail-closed (`ENABLED: true`) now that
@@ -239,6 +255,13 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
         entryUsdgRaw: positionSizeUsdgRaw,
         entryTick: priceState.tickCurrent,
         entrySqrtPriceX96: priceState.sqrtPriceX96,
+        // P1-1 fix: the RAW balance READER (never `snapshot.freeUsdgBalance`,
+        // which is already net of the OPENING rows that existed when this
+        // iteration sized the candidate) -- openPosition ->
+        // createIfCapitalAllows re-derives free/deployed/count from one
+        // consistent fresh state under CapitalLock.
+        readOnChainUsdgBalance: () => deps.capitalSnapshot.readOnChainUsdgBalance(),
+        capitalRules,
       },
       {
         positions: deps.positions,

@@ -730,3 +730,59 @@ describe('executeCriticalTransaction -- C1 regression: VERIFIED short-circuit mu
     }
   });
 });
+
+describe('executeCriticalTransaction -- P1-5: a stale-write conflict (StaleTransactionAttemptWriteError) is treated as ambiguous/resumable, exactly like any other unexpected throw', () => {
+  it('a version conflict on the VERY FIRST update (attemptCount bump) never crashes the caller, never marks FAILED, and is resumable', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    // Simulate a concurrent writer having already advanced this attempt's
+    // version between executeCriticalTransaction's initial find/create and
+    // its first update -- realistic for a genuinely different PROCESS
+    // sharing the same DB-backed repository (the in-memory double's own
+    // version-check mirrors the real Prisma repository's CAS exactly).
+    const created = await repo.create('p1-5-a', 'p');
+    const realUpdate = repo.update.bind(repo);
+    let firstCallIntercepted = false;
+    repo.update = async (id, patch, expectedVersion) => {
+      if (!firstCallIntercepted) {
+        firstCallIntercepted = true;
+        // A "concurrent" writer bumps the version out from under us, using the REAL update path (unconditional, as a different process would via its own untouched version).
+        await realUpdate(id, { lastError: 'a concurrent writer touched this attempt first' });
+      }
+      return realUpdate(id, patch, expectedVersion);
+    };
+
+    const result = await executeCriticalTransaction('p1-5-a', 'p', makeDeps(), repo);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.resumable).toBe(true); // never a crash, never a silent FAILED
+    }
+    // The position was never advanced past PENDING by the LOSING (stale) call -- the concurrent writer's own change is what's actually persisted.
+    const reloaded = await repo.find('p1-5-a');
+    expect(reloaded?.status).toBe('PENDING');
+    expect(reloaded?.lastError).toBe('a concurrent writer touched this attempt first');
+    void created;
+  });
+
+  it('resuming after a stale-write conflict succeeds normally on the next call (re-reads fresh state, no corruption)', async () => {
+    const repo = new InMemoryTransactionAttemptRepository();
+    await repo.create('p1-5-b', 'p');
+    const realUpdate = repo.update.bind(repo);
+    let firstCallIntercepted = false;
+    repo.update = async (id, patch, expectedVersion) => {
+      if (!firstCallIntercepted) {
+        firstCallIntercepted = true;
+        await realUpdate(id, {});
+      }
+      return realUpdate(id, patch, expectedVersion);
+    };
+
+    const first = await executeCriticalTransaction('p1-5-b', 'p', makeDeps(), repo);
+    expect(first.ok).toBe(false);
+
+    // Second call: repo.update is no longer intercepted (firstCallIntercepted stays true), so this proceeds normally against the now-correct version.
+    const second = await executeCriticalTransaction('p1-5-b', 'p', makeDeps(), repo);
+    expect(second.ok).toBe(true);
+    if (second.ok) expect(second.attempt.status).toBe('VERIFIED');
+  });
+});

@@ -2,8 +2,11 @@ import type { Address, Log } from 'viem';
 import { decodeEventLog, getAddress, zeroAddress } from 'viem';
 import { getPublicClient } from '../blockchain/viemClient';
 import { ERC721_TRANSFER_EVENT, ownerOfNft } from '../blockchain/erc721';
+import { V4_POSITION_MANAGER_ABI } from '../blockchain/abis/v4PositionManager';
+import { checkMintedPoolIdentity } from '../positions/mintTx';
+import type { PositionPoolContext } from '../positions/types';
 import { config } from '../config';
-import type { NftOwnerChecker, OwnedNftLister, OwnerCheckResult } from './types';
+import type { NftOwnerChecker, OwnedNftLister, OwnerCheckResult, PositionIdentityChecker, PositionIdentityCheckResult } from './types';
 
 /** Same rationale/limits as `pools/poolDiscovery.ts`'s identical constant -- most public RPC providers cap the block range of a single `eth_getLogs` call. */
 const LOG_SCAN_CHUNK_BLOCKS = 5_000n;
@@ -84,6 +87,34 @@ export class PositionManagerNftOwnerChecker implements NftOwnerChecker {
       const owner = await ownerOfNft(positionManager, BigInt(tokenId));
       if (owner === null || owner === zeroAddress) return { status: 'NOT_FOUND_CONFIRMED' };
       return { status: 'FOUND', owner };
+    } catch {
+      return { status: 'RPC_UNAVAILABLE' };
+    }
+  }
+}
+
+/**
+ * P1-7/P1-9: real `PositionIdentityChecker` -- reads the tokenId's actual
+ * on-chain PoolKey (`PositionManager.getPoolAndPositionInfo`, the exact
+ * same ABI entry `positions/mintTx.ts`'s `verifyOnChain` uses for a NEW
+ * mint) and reuses that file's `checkMintedPoolIdentity` pure comparison,
+ * so a legacy/corrupted row is judged by the IDENTICAL rule a fresh mint
+ * is. Any RPC failure is `RPC_UNAVAILABLE`, never treated as a mismatch --
+ * same fail-safe discipline as `PositionManagerNftOwnerChecker` above.
+ */
+export class PositionManagerIdentityChecker implements PositionIdentityChecker {
+  async checkIdentity(tokenId: string, expectedPool: PositionPoolContext): Promise<PositionIdentityCheckResult> {
+    const positionManager = config.uniswap.v4.positionManager as Address;
+    try {
+      const client = getPublicClient();
+      const [onChainPoolKey] = await client.readContract({
+        address: positionManager,
+        abi: V4_POSITION_MANAGER_ABI,
+        functionName: 'getPoolAndPositionInfo',
+        args: [BigInt(tokenId)],
+      });
+      const check = checkMintedPoolIdentity(onChainPoolKey, expectedPool);
+      return check.ok ? { status: 'MATCH' } : { status: 'MISMATCH', reason: check.reason };
     } catch {
       return { status: 'RPC_UNAVAILABLE' };
     }

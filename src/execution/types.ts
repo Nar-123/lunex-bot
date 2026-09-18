@@ -73,12 +73,58 @@ export interface TransactionAttemptRecord {
   attemptCount: number;
   /** Set on the first non-short-circuited call -- see `stuckAttempt.ts`. */
   firstAttemptedAt: Date | null;
+  /**
+   * P1-5 fix: optimistic-concurrency version, incremented by exactly 1 on
+   * every successful `update()`. Starts at 1 on `create()`. Read by
+   * `executeCriticalTransaction.ts` and passed back as `expectedVersion` on
+   * every subsequent `update()` call for the SAME in-flight attempt -- see
+   * `update()`'s doc comment below for what a mismatch means.
+   */
+  version: number;
+}
+
+/**
+ * P1-5 fix: thrown by `update()` when `expectedVersion` was provided and no
+ * longer matches the row's current version -- i.e. a DIFFERENT writer
+ * (another process, or a stale in-memory `attempt` snapshot within this
+ * one) has already advanced this attempt since the caller last read it.
+ * Deliberately a distinct, catchable error type rather than a generic
+ * throw: `executeCriticalTransaction.ts` doesn't need to special-case it at
+ * all (a plain throw already gets treated as "ambiguous, resume required"
+ * by its existing outer catch, which is exactly the correct, safe
+ * response), but future callers that DO want to distinguish "genuinely
+ * stale" from "some other failure" can catch this specifically.
+ */
+export class StaleTransactionAttemptWriteError extends Error {
+  constructor(id: string, expectedVersion: number) {
+    super(`TransactionAttempt ${id} was not at expected version ${expectedVersion} -- a different writer has since updated it`);
+    this.name = 'StaleTransactionAttemptWriteError';
+  }
 }
 
 export interface TransactionAttemptRepository {
   find(idempotencyKey: string): Promise<TransactionAttemptRecord | null>;
   create(idempotencyKey: string, purpose: string): Promise<TransactionAttemptRecord>;
-  update(id: string, patch: Partial<Omit<TransactionAttemptRecord, 'id' | 'idempotencyKey'>>): Promise<TransactionAttemptRecord>;
+  /**
+   * P1-5 fix: `expectedVersion`, when provided, makes this a
+   * compare-and-swap: the write is applied ONLY if the row's CURRENT
+   * `version` still equals `expectedVersion` (i.e. nobody else has written
+   * to this attempt since the caller last read it), and the row's
+   * `version` is incremented by 1 on success. If the row has since moved
+   * to a different version, throws `StaleTransactionAttemptWriteError`
+   * instead of silently overwriting a newer state -- this is what prevents
+   * a stale worker (a crashed-and-resumed call, a second process) from
+   * clobbering progress a NEWER call already persisted (e.g. regressing
+   * status from VERIFIED back to an earlier checkpoint, or overwriting a
+   * newer `txHash`/`rawTx`). Omitting `expectedVersion` keeps the old
+   * unconditional behavior (used only by call sites that have no prior
+   * read to pin against, e.g. a one-shot admin/reporting write).
+   */
+  update(
+    id: string,
+    patch: Partial<Omit<TransactionAttemptRecord, 'id' | 'idempotencyKey' | 'version'>>,
+    expectedVersion?: number,
+  ): Promise<TransactionAttemptRecord>;
   /** Every attempt not yet at a terminal status (VERIFIED/FAILED) -- the basis for stuck-attempt queries (e.g. a future `/status` command). */
   findNonTerminal(): Promise<TransactionAttemptRecord[]>;
 }

@@ -1,6 +1,7 @@
 import type { Address } from 'viem';
 import type { CapitalSnapshot, CapitalSnapshotProvider } from '../capital/types';
 import { readUsdgBalance } from '../capital/usdgBalanceReader';
+import { deriveCapitalSnapshot } from '../capital/freshCapitalSnapshot';
 import type { PositionRepository } from './types';
 
 /**
@@ -90,16 +91,18 @@ export class PositionCapitalSnapshotProvider implements CapitalSnapshotProvider 
       this.positions.countNonClosed(),
     ]);
 
-    const totalDeployedUsdg = deployedPositions.reduce((sum, p) => sum + p.entryUsdgRaw, 0n);
-    const reservedForOpening = deployedPositions
-      .filter((p) => p.status === 'OPENING')
-      .reduce((sum, p) => sum + p.entryUsdgRaw, 0n);
-    const freeUsdgBalance = onChainBalance > reservedForOpening ? onChainBalance - reservedForOpening : 0n;
+    // Same formula as always, now shared with createIfCapitalAllows's
+    // write-time re-check (P1-1) via capital/freshCapitalSnapshot.ts.
+    const { freeUsdgBalance, totalDeployedUsdg } = deriveCapitalSnapshot(onChainBalance, deployedPositions);
 
     return {
       freeUsdgBalance,
       activePositionsCount,
       totalDeployedUsdg,
     };
+  }
+
+  readOnChainUsdgBalance(): Promise<bigint> {
+    return this.readBalance(this.walletAddress);
   }
 }

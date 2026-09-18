@@ -1,15 +1,18 @@
 import type { Address } from 'viem';
 import type { PositionRepository } from '../positions/types';
 import type { TransactionAttemptRepository } from '../execution/types';
+import type { ExitStateRepository } from '../exits/types';
 import type { LivePositionStateProvider } from '../monitoring/types';
-import type { NftOwnerChecker, OwnedNftLister, ReconciliationFinding, ReconciliationReport } from './types';
+import type { NftOwnerChecker, OwnedNftLister, PositionIdentityChecker, ReconciliationFinding, ReconciliationReport } from './types';
 
 export interface RunReconciliationDeps {
   positions: PositionRepository;
   txAttempts: TransactionAttemptRepository;
+  exitStates: ExitStateRepository;
   livePositionState: LivePositionStateProvider;
   ownedNftLister: OwnedNftLister;
   nftOwnerChecker: NftOwnerChecker;
+  positionIdentityChecker: PositionIdentityChecker;
   walletAddress: Address;
 }
 
@@ -82,6 +85,7 @@ export async function runReconciliation(deps: RunReconciliationDeps, options: Ru
   }
 
   // 3. OPENING but the mint already reached VERIFIED on-chain.
+  // 7 (P1-7). OPENING but the mint DEFINITIVELY FAILED and was never marked FAILED.
   const opening = await deps.positions.findAllOpening();
   for (const position of opening) {
     const mintAttempt = await deps.txAttempts.find(`${position.openIdempotencyKey}:mint`);
@@ -91,10 +95,18 @@ export async function runReconciliation(deps: RunReconciliationDeps, options: Ru
         positionId: position.id,
         detail: `mint TransactionAttempt for position ${position.id} is VERIFIED but the Position row is still OPENING -- should self-heal on the next open-resume tick (see C1/C7); flagged here as an independent cross-check`,
       });
+    } else if (mintAttempt?.status === 'FAILED') {
+      findings.push({
+        kind: 'FAILED_MINT_STUCK',
+        positionId: position.id,
+        detail: `mint TransactionAttempt for position ${position.id} is definitively FAILED but the Position row is still OPENING (never transitioned to FAILED) -- capital/token-slot reservations may still be held for a position that will never open`,
+      });
     }
   }
 
   // 4. CLOSING but liquidity is already genuinely gone on-chain.
+  // 8 (P1-7). CLOSING but the remove-liquidity leg DEFINITIVELY FAILED and was never reverted to ACTIVE.
+  // 6 (P1-7). CLOSING but the SWAP leg already reached VERIFIED on-chain.
   const closing = await deps.positions.findAllClosing();
   for (const position of closing) {
     if (!position.closeIdempotencyKey) continue;
@@ -105,24 +117,67 @@ export async function runReconciliation(deps: RunReconciliationDeps, options: Ru
         positionId: position.id,
         detail: `remove-liquidity TransactionAttempt for position ${position.id} is VERIFIED but the Position row is still CLOSING -- should self-heal on the next exit-cycle tick (see C3); flagged here as an independent cross-check`,
       });
+    } else if (removeAttempt?.status === 'FAILED') {
+      findings.push({
+        kind: 'FAILED_REMOVE_STUCK',
+        positionId: position.id,
+        detail: `remove-liquidity TransactionAttempt for position ${position.id} is definitively FAILED but the Position row is still CLOSING (never reverted to ACTIVE via markExitFailed)`,
+      });
+    } else if (position.positionTokenId) {
+      try {
+        const live = await deps.livePositionState.getLiveState(position);
+        if (live.liquidity === 0n && removeAttempt === null) {
+          // Liquidity already reads 0 on-chain but NO TransactionAttempt was
+          // ever created for the remove-liquidity leg -- something removed
+          // it outside this bot's own tracked flow, or a genuine data gap.
+          findings.push({
+            kind: 'CLOSING_ALREADY_REMOVED',
+            positionId: position.id,
+            tokenId: position.positionTokenId,
+            detail: `Position ${position.id} is CLOSING and its on-chain liquidity already reads 0, but no removeLiquidity TransactionAttempt exists in the DB -- surfaced as stuck/orphaned, needs manual review`,
+          });
+        }
+      } catch {
+        rpcHealthy = false;
+      }
+    }
+
+    // P1-7: the SWAP leg is a SEPARATE TransactionAttempt from remove-liquidity
+    // (see executeExit.ts's C3 short-circuit) -- checked independently of
+    // whichever branch above fired, using the SAME current-attempt key
+    // `executeExit.ts` itself derives from `ExitState.swapAttemptCount`.
+    const exitState = await deps.exitStates.getOrCreate(position.id);
+    const swapKey = `${position.closeIdempotencyKey}:swap:${exitState.swapAttemptCount}`;
+    const swapAttempt = await deps.txAttempts.find(swapKey);
+    if (swapAttempt?.status === 'VERIFIED') {
+      findings.push({
+        kind: 'VERIFIED_SWAP_NOT_CLOSED',
+        positionId: position.id,
+        detail: `swap TransactionAttempt for position ${position.id} is VERIFIED but the Position row is still CLOSING -- should self-heal on the next exit-cycle tick (see executeExit.ts's C3 short-circuit); flagged here as an independent cross-check`,
+      });
+    }
+  }
+
+  // 9 (P1-7/P1-9). ACTIVE/CLOSING positions with a minted tokenId: does the
+  // DB's recorded pool identity match the tokenId's REAL on-chain PoolKey?
+  // Read-only historical/corruption check -- a NEW mint can never reach
+  // ACTIVE with a mismatch (mintTx.ts's verifyOnChain already prevents
+  // that), so this exists for rows written before that fix, or by any
+  // other path.
+  for (const position of nonClosed) {
+    if (position.status === 'OPENING' || !position.positionTokenId) continue;
+    const identity = await deps.positionIdentityChecker.checkIdentity(position.positionTokenId, position.pool);
+    if (identity.status === 'RPC_UNAVAILABLE') {
+      rpcHealthy = false;
       continue;
     }
-    if (!position.positionTokenId) continue;
-    try {
-      const live = await deps.livePositionState.getLiveState(position);
-      if (live.liquidity === 0n && removeAttempt === null) {
-        // Liquidity already reads 0 on-chain but NO TransactionAttempt was
-        // ever created for the remove-liquidity leg -- something removed
-        // it outside this bot's own tracked flow, or a genuine data gap.
-        findings.push({
-          kind: 'CLOSING_ALREADY_REMOVED',
-          positionId: position.id,
-          tokenId: position.positionTokenId,
-          detail: `Position ${position.id} is CLOSING and its on-chain liquidity already reads 0, but no removeLiquidity TransactionAttempt exists in the DB -- surfaced as stuck/orphaned, needs manual review`,
-        });
-      }
-    } catch {
-      rpcHealthy = false;
+    if (identity.status === 'MISMATCH') {
+      findings.push({
+        kind: 'IDENTITY_MISMATCH',
+        positionId: position.id,
+        tokenId: position.positionTokenId,
+        detail: `Position ${position.id}'s recorded pool identity does not match its NFT #${position.positionTokenId}'s real on-chain PoolKey: ${identity.reason}`,
+      });
     }
   }
 

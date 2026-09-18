@@ -1,4 +1,5 @@
 import type { Address } from 'viem';
+import type { CapitalRules } from '../capital/types';
 
 export type PositionStatus = 'OPENING' | 'ACTIVE' | 'CLOSING' | 'CLOSED' | 'FAILED';
 
@@ -53,8 +54,67 @@ export interface CreatePositionInput {
   openIdempotencyKey: string;
 }
 
+/**
+ * P1-2 fix: thrown by `create()` when a real DB-level partial unique index
+ * (`Position_tokenAddress_active_unique` -- see `prisma/schema.prisma`'s
+ * doc comment on the `Position` model) rejects the insert because a
+ * non-closed (OPENING/ACTIVE/CLOSING) position for this SAME token already
+ * exists. This is what makes "1 token = 1 non-closed position" atomic:
+ * before this fix, `filters/rules/duplicatePosition.ts`'s `findActiveByToken`
+ * check and the eventual `create()` call were two separate reads/writes
+ * with an unguarded gap between them (pool selection, range computation)
+ * that two concurrent candidates for the same token could both pass. Now,
+ * even if both candidates get this far, only the FIRST `create()` can
+ * succeed -- the second fails with this specific, catchable error instead
+ * of silently creating a second row for the same token.
+ */
+export class DuplicateActiveTokenPositionError extends Error {
+  constructor(public readonly tokenAddress: Address) {
+    super(`a non-closed (OPENING/ACTIVE/CLOSING) position for token ${tokenAddress} already exists`);
+    this.name = 'DuplicateActiveTokenPositionError';
+  }
+}
+
+export type CreateIfCapitalAllowsResult =
+  | { ok: true; record: PositionRecord }
+  | { ok: false; reason: string };
+
 export interface PositionRepository {
+  /** Throws `DuplicateActiveTokenPositionError` (P1-2) if a non-closed position for `input.tokenAddress` already exists -- see that error's doc comment. Never silently creates a second row for the same token. */
   create(input: CreatePositionInput): Promise<PositionRecord>;
+  /**
+   * P1-1 fix: atomically re-validates the capital cap AGAINST A FRESH
+   * READ of `totalDeployedUsdg`/`activePositionsCount` (taken inside the
+   * SAME database transaction as the insert, not the possibly-now-stale
+   * values `screeningCycle.ts` used minutes/steps earlier to size this
+   * candidate and select its pool/range) before actually creating the row.
+   *
+   * P1-1 cross-process hardening: the caller supplies a READER for the
+   * RAW on-chain USDG balance (`CapitalSnapshotProvider.readOnChainUsdgBalance`),
+   * never a pre-derived `freeUsdgBalance`. This method reads the
+   * non-closed rows, THEN the raw balance, then -- holding `CapitalLock`
+   * -- re-reads the rows, verifies via `checkCapitalStateConsistent` that
+   * nothing which could have moved the balance changed in between (fails
+   * closed otherwise), and derives free/deployed/count from that ONE fresh
+   * row set via `deriveCapitalSnapshot` (both in
+   * `capital/freshCapitalSnapshot.ts`). The earlier version paired a
+   * caller-supplied free balance (already net of the OPENING rows that
+   * existed at sizing time) with a fresh deployed sum, double-counting any
+   * OPENING row created by another process in between -- see that file's
+   * doc comment. Lock contention (SQLITE_BUSY / transaction timeout) and a
+   * failed balance read both return `{ok: false}` with nothing written.
+   *
+   * Reuses `capital/decideCapitalAllocation` itself (never duplicates its
+   * cap logic) against the freshly-read snapshot; if the ALREADY-DECIDED
+   * `input.entryUsdgRaw` no longer fits the freshly-recomputed remaining
+   * capacity (a concurrent reservation ate it in the meantime) OR the
+   * active-position count has since reached its cap, this returns `{ok:
+   * false}` and creates NOTHING -- it deliberately does not try to
+   * re-negotiate a smaller size, since the pool/range this candidate was
+   * already matched to was chosen for the ORIGINAL size and resizing here
+   * would silently invalidate that earlier decision.
+   */
+  createIfCapitalAllows(input: CreatePositionInput, readOnChainUsdgBalance: () => Promise<bigint>, rules: CapitalRules): Promise<CreateIfCapitalAllowsResult>;
   findById(id: string): Promise<PositionRecord | null>;
   /** The "1 coin = 1 active position" check -- OPENING/ACTIVE/CLOSING all count, CLOSED doesn't. */
   findActiveByToken(tokenAddress: Address): Promise<PositionRecord | null>;
@@ -147,6 +207,22 @@ export interface PositionRepository {
    */
   markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null): Promise<PositionRecord>;
   /**
+   * P1-13 fix: idempotently backfills `realizedUsdgRaw` for a position
+   * that is ALREADY CLOSED and whose value is still null (a legacy row,
+   * or a close that happened before the proceeds fields existed) --
+   * status is never touched, only this one field. A DB-level CONDITIONAL
+   * update (`WHERE id = ? AND status = 'CLOSED' AND realizedUsdgRaw IS
+   * NULL`), so it is safe to call repeatedly or from a concurrent worker:
+   * once a value has been written (by this method OR by the original
+   * `markClosed`), every later call is a no-op that changes nothing --
+   * there is no double-counting path, because a non-null value can never
+   * be overwritten by this method. Returns `null` (not an error) when the
+   * condition didn't hold -- either the position isn't CLOSED, or its
+   * `realizedUsdgRaw` was already set (by this method or `markClosed`) --
+   * the caller should treat that as "nothing to do," not a failure.
+   */
+  backfillRealizedUsdgRaw(id: string, realizedUsdgRaw: bigint): Promise<PositionRecord | null>;
+  /**
    * Terminal, non-consuming status for an OPENING position whose deploy
    * transaction ended in a DEFINITIVE (`resumable: false`) failure from
    * `executeCriticalTransaction` -- the row never became ACTIVE and never
@@ -197,30 +273,54 @@ export interface PositionRepository {
    */
   markExitFailed(id: string): Promise<PositionRecord>;
   /**
-   * C7 concurrency fix: atomic compare-and-swap claim -- succeeds (`true`)
-   * ONLY if `id` is currently at `expectedStatus` AND was not claimed
-   * within the last `freshnessMs`. Implemented as a single conditional
-   * `UPDATE ... WHERE id = ? AND status = ? AND (claim expired)` so the
-   * check-and-set is one atomic database operation, never a racy
-   * read-then-write. Callers that fail to claim MUST NOT proceed with any
-   * transaction-executing logic for this position this tick -- another
-   * cycle already owns it (or owned it moments ago and the claim hasn't
-   * expired yet). This is what makes it safe for the 30-minute screening
-   * cycle's `openPosition()` and the 15-second exit cycle's OPENING-resume
-   * pass to run on independent, unsynchronized schedules (see
-   * `composition/app.ts`) without both ever executing a transaction for
-   * the SAME position at once.
+   * C7 concurrency fix, P0-1 hardened: atomic compare-and-swap claim --
+   * succeeds ONLY if `id` is currently at `expectedStatus` AND was not
+   * claimed within the last `freshnessMs`. Implemented as a single
+   * conditional `UPDATE ... WHERE id = ? AND status = ? AND (claim
+   * expired) SET resumeClaimedAt = now, resumeClaimToken = <fresh random
+   * token>` so the check-and-set is one atomic database operation, never a
+   * racy read-then-write. Callers that fail to claim (return `null`) MUST
+   * NOT proceed with any transaction-executing logic for this position
+   * this tick -- another cycle already owns it (or owned it moments ago
+   * and the claim hasn't expired yet). This is what makes it safe for the
+   * 30-minute screening cycle's `openPosition()` and the 15-second exit
+   * cycle's OPENING-resume pass to run on independent, unsynchronized
+   * schedules (see `composition/app.ts`) without both ever executing a
+   * transaction for the SAME position at once.
+   *
+   * P0-1: returns the winning caller's own claim TOKEN (a fresh random
+   * string, unique per call) instead of a plain boolean. The caller MUST
+   * hold onto this token and pass the EXACT SAME value to
+   * `releaseResumeClaim` -- this is what lets `releaseResumeClaim` verify
+   * "am I still the owner of this claim" before clearing it, closing the
+   * race a plain boolean claim could not: worker A claims, hangs past
+   * `freshnessMs`, worker B legitimately re-claims the now-expired row,
+   * THEN worker A finally wakes up and would (under the old unconditional
+   * release) delete B's still-active claim out from under it, letting a
+   * third worker C claim while B is still mid-flight. Returns `null` if
+   * the claim was not won.
    */
-  claimForResume(id: string, expectedStatus: 'OPENING' | 'CLOSING', freshnessMs: number): Promise<boolean>;
+  claimForResume(id: string, expectedStatus: 'OPENING' | 'CLOSING', freshnessMs: number): Promise<string | null>;
   /**
    * Releases a claim taken by `claimForResume` -- called unconditionally
-   * (success, definitive failure, OR ambiguous/PENDING outcome) once the
-   * claiming call's work is done, so the claim's lifetime matches the
-   * ACTUAL duration of the in-flight work (however long a mint/exit takes
-   * to mine) rather than a fixed timeout that could otherwise stall a
-   * legitimate next attempt. The `freshnessMs` window in `claimForResume`
-   * exists purely to recover from the one case this can't cover: the
-   * claiming process crashing before ever reaching this release.
+   * from the CALLER's perspective (success, definitive failure, OR
+   * ambiguous/PENDING outcome) once the claiming call's work is done, so
+   * the claim's lifetime matches the ACTUAL duration of the in-flight work
+   * (however long a mint/exit takes to mine) rather than a fixed timeout
+   * that could otherwise stall a legitimate next attempt. The
+   * `freshnessMs` window in `claimForResume` exists purely to recover from
+   * the one case this can't cover: the claiming process crashing before
+   * ever reaching this release.
+   *
+   * P0-1: requires the exact `token` returned by the `claimForResume` call
+   * that took this claim (`UPDATE ... WHERE id = ? AND resumeClaimToken =
+   * ?`). If the token no longer matches -- because the claim already
+   * expired and was won by a different worker, or was already released --
+   * this is a SAFE NO-OP (returns `false`), never an error and never a
+   * mutation of someone else's claim. Callers should not treat a `false`
+   * return as a failure to handle; it simply means "there was nothing of
+   * mine left to release," which is the correct outcome after losing a
+   * claim to expiry.
    */
-  releaseResumeClaim(id: string): Promise<void>;
+  releaseResumeClaim(id: string, token: string): Promise<boolean>;
 }

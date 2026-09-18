@@ -66,7 +66,10 @@ describe('runExitCycle -- C4 regression: pendingCloseReason is written BEFORE ma
   it('a crash simulated exactly at markClosing still leaves pendingCloseReason recorded -- CLOSING+null is now unreachable', async () => {
     const deps = await makeDeps({
       livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
-      poolPrice: { getPriceState: vi.fn(async () => livePriceState(-7000)) }, // triggers HARD_STOP_LOSS
+      // -3000 -> pnlPct ~ -6.4%: in the un-armed Hard-Stop band (between
+      // -6% and Safety Exit's -8% arming threshold, see P0-3), so Hard
+      // Stop fires cleanly without Safety Exit arming same-tick.
+      poolPrice: { getPriceState: vi.fn(async () => livePriceState(-3000)) }, // triggers HARD_STOP_LOSS
     });
     const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
     await deps.positions.markActive(created.id, '1', new Date());
@@ -104,14 +107,59 @@ describe('runExitCycle', () => {
   });
 
   describe('priority wiring: a real deep price crash that is BOTH well past HARD_STOP_LOSS AND already past the 30-min OOR grace window', () => {
-    it('closes for HARD_STOP_LOSS, not OOR, and executes the full exit through to CLOSED', async () => {
+    it('P0-3: a deep same-tick crash arms SAFETY_EXIT instead of HARD_STOP_LOSS closing at the crash price', async () => {
+      // For THIS position's range geometry, by the time price has moved
+      // far enough to be genuinely out of range, PnL has already fallen
+      // well past Safety Exit's -8% arming threshold too -- there is no
+      // tick where this position is simultaneously "out of range" and
+      // "only -6%-to-8% down." Under the P0-3 fix, a crash this deep arms
+      // SAFETY_EXIT same-tick rather than HARD_STOP_LOSS closing
+      // immediately at the crash price -- see resolveExitDecision.ts's
+      // doc comment. No OOR timer pre-seeded here (that interaction is
+      // covered, and deliberately left as pre-existing/out-of-scope
+      // behavior, in the test below).
       const deps = await makeDeps({
         livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
         poolPrice: { getPriceState: vi.fn(async () => livePriceState(-7000)) }, // pnlPct ~ -0.29 (past -15%), inRange: false
       });
       const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
       await deps.positions.markActive(created.id, '1', new Date());
-      // OOR has already been "running" for 40 minutes as of this tick -- would independently trigger OOR on its own.
+
+      const results = await runExitCycle(deps);
+
+      expect(results).toHaveLength(1);
+      expect(results[0]?.action).toBe('NONE'); // armed, not closed -- waiting for recovery to breakeven
+
+      const reloaded = await deps.positions.findById(created.id);
+      expect(reloaded?.status).toBe('ACTIVE'); // NOT stopped out at the crash price
+      const exitState = await deps.exitStates.getOrCreate(created.id);
+      expect(exitState.safetyExitArmedAt).not.toBeNull(); // SAFETY_EXIT armed instead
+    });
+
+    it('KNOWN, PRE-EXISTING, OUT-OF-P0-3-SCOPE interaction: an armed-but-not-yet-recovered Safety Exit does NOT block a lower-priority rule (e.g. OOR_TIMEOUT) that independently qualifies the SAME tick -- this is how the ladder already worked for any armed-without-closing state (e.g. under a widened hardStopLossPct) and is unchanged by P0-3', async () => {
+      const deps = await makeDeps({
+        livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
+        poolPrice: { getPriceState: vi.fn(async () => livePriceState(-7000)) }, // pnlPct ~ -0.29, inRange: false
+      });
+      const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000010' }));
+      await deps.positions.markActive(created.id, '1', new Date());
+      await deps.exitStates.update(created.id, { oorStartedAt: new Date(Date.now() - 40 * 60 * 1000) });
+
+      const results = await runExitCycle(deps);
+      expect(results[0]?.action).toBe('CLOSE_STARTED');
+      const reloaded = await deps.positions.findById(created.id);
+      expect(reloaded?.closeReason).toBe('OOR_TIMEOUT');
+    });
+
+    it('a shallower drop (-6.4%, still in-range) that is ALSO past the OOR grace window still closes for HARD_STOP_LOSS, not OOR', async () => {
+      // Complements the test above: proves rule-1's priority over OOR is
+      // still intact for the band that does NOT arm Safety Exit.
+      const deps = await makeDeps({
+        livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
+        poolPrice: { getPriceState: vi.fn(async () => livePriceState(-3000)) }, // pnlPct ~ -6.4%, inRange: true
+      });
+      const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000009' }));
+      await deps.positions.markActive(created.id, '1', new Date());
       await deps.exitStates.update(created.id, { oorStartedAt: new Date(Date.now() - 40 * 60 * 1000) });
 
       const results = await runExitCycle(deps);
@@ -122,7 +170,7 @@ describe('runExitCycle', () => {
 
       const reloaded = await deps.positions.findById(created.id);
       expect(reloaded?.status).toBe('CLOSED');
-      expect(reloaded?.closeReason).toBe('HARD_STOP_LOSS'); // NOT 'OOR', despite OOR's own timer having independently elapsed
+      expect(reloaded?.closeReason).toBe('HARD_STOP_LOSS');
     });
   });
 
@@ -289,6 +337,70 @@ describe('runExitCycle', () => {
       expect(exitState.metricsFailureSince).toBeNull();
     });
 
+    it('Scenario E (P1 audit fix): tryRecoverFromUnstartedSafetyExit is claim-protected -- two concurrent workers racing the SAME recoverable position never both act', async () => {
+      const positions = new InMemoryPositionRepository();
+      const exitStates = new InMemoryExitStateRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+      const created = await positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000024' }));
+      await positions.markActive(created.id, '1', new Date());
+      await positions.markClosing(created.id, `exit:${created.id}:1`);
+      await exitStates.update(created.id, { pendingCloseReason: 'INFRA_SAFETY_EXIT', metricsFailureSince: FIVE_MIN_AGO });
+
+      // Wrap claimForResume so the FIRST caller to win the claim is held
+      // inside its critical section (via a gate) until the SECOND caller
+      // has already been dispatched -- proving the second caller's claim
+      // attempt genuinely races against the first's IN-PROGRESS (not yet
+      // released) claim, not just "ran strictly before/after" by luck of
+      // scheduling. Mirrors the P1-3 executeExit concurrency test's gate
+      // pattern exactly.
+      let releaseGate: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      let winnerHeldClaim = false;
+      const realClaim = positions.claimForResume.bind(positions);
+      positions.claimForResume = async (id, status, freshnessMs) => {
+        const token = await realClaim(id, status, freshnessMs);
+        if (token !== null && !winnerHeldClaim) {
+          winnerHeldClaim = true;
+          await gate; // the winner pauses here, still holding the claim
+        }
+        return token;
+      };
+
+      const deps = {
+        positions,
+        exitStates,
+        txAttempts,
+        livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
+        poolPrice: { getPriceState: vi.fn(async () => livePriceState(ENTRY_TICK)) },
+        swapExecutor: fakeSwapExecutor,
+        settings: new InMemorySettingsRepository(),
+      };
+
+      const call1 = runExitCycle(deps);
+      await new Promise((resolve) => setTimeout(resolve, 5)); // let call1 win the claim and enter the gate
+      const call2 = runExitCycle(deps);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      releaseGate();
+      const [results1, results2] = await Promise.all([call1, call2]);
+
+      // Exactly one of the two ticks actually reverted the position -- the
+      // other found it already gone from findAllClosing() (recovered) or
+      // failed to claim and deferred, never both reverting/racing on it.
+      const reloaded = await positions.findById(created.id);
+      expect(reloaded?.status).toBe('ACTIVE'); // recovered exactly once, not corrupted by a double-write
+      expect(reloaded?.closeIdempotencyKey).toBeNull();
+
+      const allOutcomes = [...results1, ...results2].filter((r) => r.positionId === created.id);
+      // At most one NONE (the actual recovery); anything else is either
+      // absent (position already gone from findAllClosing by the time
+      // that tick's own snapshot ran) or a deferred PENDING -- never a
+      // second definitive action on the same position.
+      const noneCount = allOutcomes.filter((r) => r.action === 'NONE').length;
+      expect(noneCount).toBeLessThanOrEqual(1);
+    });
+
     it('Scenario D: CLOSING for INFRA_SAFETY_EXIT but remove-liquidity is ALREADY VERIFIED -- NEVER reverted to ACTIVE, regardless of current metrics', async () => {
       const positions = new InMemoryPositionRepository();
       const exitStates = new InMemoryExitStateRepository();
@@ -353,7 +465,8 @@ describe('runExitCycle', () => {
         exitStates,
         txAttempts,
         livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
-        poolPrice: { getPriceState: vi.fn(async () => livePriceState(-7000)) }, // triggers HARD_STOP_LOSS immediately
+        // -3000 -> pnlPct ~ -6.4%, in the un-armed Hard-Stop band (see P0-3) -- fires HARD_STOP_LOSS cleanly, same as before this constant needed adjusting.
+        poolPrice: { getPriceState: vi.fn(async () => livePriceState(-3000)) }, // triggers HARD_STOP_LOSS immediately
         swapExecutor: fakeSwapExecutor,
         settings: new InMemorySettingsRepository(),
         buildRemoveLiquidityDeps,

@@ -157,7 +157,35 @@ export interface ExecuteExitDeps {
  * counter-proof of what "stuck forever" would look like if the same key
  * were reused instead of a fresh one.
  */
+/**
+ * P1-3 fix: claims ownership of this position's CLOSING processing before
+ * any transaction-executing work runs, using the EXACT SAME primitive
+ * `positions/openPosition.ts`'s `executeOpen` uses for OPENING
+ * (`PositionRepository.claimForResume`/`releaseResumeClaim`, P0-1
+ * ownership-token hardened). Without this, `runExitCycle`'s DECIDE pass
+ * (which calls `executeExit` immediately after `markClosing`) and the very
+ * next 15-second tick's RESUME pass (which re-discovers the same still-
+ * CLOSING row via `findAllClosing()`) could both call `executeExit` for the
+ * same position concurrently if the first call's on-chain work (remove-
+ * liquidity mining + swap) takes longer than one tick -- duplicating real
+ * gas spend and racing on `ExitState`/`TransactionAttempt` writes. Losing
+ * the claim is NOT a failure -- another caller already owns this position
+ * right now; deferring to it (PENDING) is the safe outcome, exactly
+ * mirroring `executeOpen`'s reasoning.
+ */
 export async function executeExit(position: PositionRecord, deps: ExecuteExitDeps): Promise<ExitExecutionOutcome> {
+  const claimToken = await deps.positions.claimForResume(position.id, 'CLOSING', config.rules.execution.RESUME_CLAIM_FRESHNESS_MS);
+  if (claimToken === null) {
+    return { outcome: 'PENDING', reason: 'position is already claimed by a concurrent exit/resume attempt' };
+  }
+  try {
+    return await executeExitClaimed(position, deps);
+  } finally {
+    await deps.positions.releaseResumeClaim(position.id, claimToken);
+  }
+}
+
+async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDeps): Promise<ExitExecutionOutcome> {
   if (!position.closeIdempotencyKey) {
     throw new Error(`cannot execute exit for position ${position.id}: status is ${position.status} but closeIdempotencyKey is null`);
   }
@@ -318,8 +346,23 @@ async function settleSwapLeg(
  * attempt verified by an older build, or a legacy row) or cannot be read:
  * half a measurement is not a measurement, and under-counting realized
  * proceeds would silently overstate the position's loss.
+ *
+ * P1-14: this sum is principal PLUS whatever LP fees the remove-liquidity
+ * leg's `TAKE_PAIR` settlement happened to pay out together with it --
+ * NOT the same quantity as the principal-only `pnlPct` that decided this
+ * position should close (see `resolveExitDecision.ts`'s "P1-14" doc
+ * comment section for the full explanation and why this divergence is
+ * intentional, confirmed by explicit operator decision, and never to be
+ * reconciled).
+ *
+ * P1-13: exported so `exits/realizedPnlBackfill.ts` can reuse this EXACT
+ * computation for already-CLOSED positions whose `realizedUsdgRaw` is
+ * still null (a legacy row, or a close that happened before the proceeds
+ * fields existed) -- one single source of truth for "how realized
+ * proceeds are computed," never a second, potentially-divergent
+ * implementation.
  */
-function computeRealizedProceeds(
+export function computeRealizedProceeds(
   deps: Pick<ExecuteExitDeps, 'txAttempts'>,
   removeKey: string,
   swapKey: string,
