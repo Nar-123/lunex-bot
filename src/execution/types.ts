@@ -40,6 +40,10 @@ export type TxFailureCode =
   | 'BROADCAST_REJECTED'
   | 'REVERTED'
   | 'VERIFICATION_FAILED'
+  // Stuck-transaction incident: the LOCAL signer threw. Signing is pure
+  // computation (no network), so the throw is deterministic and nothing
+  // was produced, persisted or broadcast -- a definitive pre-broadcast fact.
+  | 'SIGN_TRANSACTION_FAILED'
   /**
    * H3: written ONLY by `PositionRepository.expireStaleOpening` onto an
    * OPENING position's mint attempt that provably never reached SIGNED

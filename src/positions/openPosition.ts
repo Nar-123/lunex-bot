@@ -218,6 +218,19 @@ async function executeOpenClaimed(position: PositionRecord, deps: OpenPositionDe
     }
   }
 
+  // Stuck-transaction audit: the approve leg can take a long time (or, as in
+  // the incident, many ticks). If the position left OPENING meanwhile -- H3
+  // expiry, or any other writer -- a mint must never be started for it. The
+  // mint fence already stops a mint whose attempt row exists; this also
+  // covers a lifecycle that was failed without one.
+  const current = await deps.positions.findById(position.id);
+  if (current?.status !== 'OPENING') {
+    const now = current?.status ?? 'missing';
+    return now === 'FAILED'
+      ? { outcome: 'FAILED', reason: 'position was failed while its approve leg ran -- mint not started' }
+      : { outcome: 'PENDING', reason: `position is no longer OPENING (now ${now}) -- mint not started` };
+  }
+
   const mintKey = openMintAttemptKey(position.openIdempotencyKey);
   const mintInput: MintInput = {
     tokenAddress: position.tokenAddress,

@@ -568,15 +568,37 @@ export class PrismaPositionRepository implements PositionRepository {
       const mint = await tx.transactionAttempt.findUnique({ where: { idempotencyKey: mintKey }, select: { id: true, status: true, version: true } });
       const lastError = `OPENING expired after ${ageMs}ms (max ${maxAgeMs}ms) with no broadcast mint -- reservation released`;
 
+      // Stuck-transaction audit: this lifecycle's USDG approve. One that may
+      // have been broadcast (SIGNED is persisted BEFORE broadcasting) blocks
+      // the expiry exactly like a possibly-broadcast mint -- never FAILED
+      // while it could still land (it would leave an unwanted allowance for
+      // a FAILED position). One still before SIGNED is fenced FAILED below,
+      // in this same transaction, with a version CAS -- executeCriticalTransaction
+      // re-reads the row inside the executor lock and stops on FAILED, so it
+      // can never be signed or broadcast afterwards.
+      const approveKey = `${row.openIdempotencyKey}:approve`;
+      const approve = await tx.transactionAttempt.findUnique({ where: { idempotencyKey: approveKey }, select: { id: true, status: true, version: true } });
+      if (mint?.status === 'VERIFIED') return { outcome: 'MINT_VERIFIED' as const };
+      if (mint && MINT_POSSIBLY_BROADCAST.has(mint.status)) return { outcome: 'BLOCKED_UNRESOLVED_TX' as const, mintStatus: mint.status };
+      if (approve && MINT_POSSIBLY_BROADCAST.has(approve.status)) {
+        return { outcome: 'BLOCKED_UNRESOLVED_TX' as const, mintStatus: mint?.status ?? 'NONE', approveStatus: approve.status };
+      }
+      if (approve && approve.status !== 'FAILED' && approve.status !== 'VERIFIED') {
+        const fencedApprove = await tx.transactionAttempt.updateMany({
+          where: { id: approve.id, version: approve.version, status: approve.status },
+          data: { status: 'FAILED', failureCode: 'OPENING_TIMEOUT', lastError: `OPENING expired after ${ageMs}ms (max ${maxAgeMs}ms) before this approve was signed -- fenced`, version: { increment: 1 } },
+        });
+        if (fencedApprove.count !== 1) {
+          // Unreachable under the write lock; never release on a failed fence.
+          return { outcome: 'BLOCKED_UNRESOLVED_TX' as const, mintStatus: mint?.status ?? 'NONE', approveStatus: approve.status };
+        }
+      }
+
       if (mint === null) {
         // Fence the key: a worker that has not created its mint attempt yet
         // (e.g. still on the approve leg) will find this FAILED row -- or
         // collide with it on the unique key -- and can never build a mint.
         await tx.transactionAttempt.create({ data: { idempotencyKey: mintKey, purpose: 'deploy:mint', status: 'FAILED', failureCode: 'OPENING_TIMEOUT', lastError } });
-      } else if (mint.status === 'VERIFIED') {
-        return { outcome: 'MINT_VERIFIED' as const };
-      } else if (MINT_POSSIBLY_BROADCAST.has(mint.status)) {
-        return { outcome: 'BLOCKED_UNRESOLVED_TX' as const, mintStatus: mint.status };
       } else if (mint.status !== 'FAILED') {
         // Before SIGNED: nothing was ever broadcast. CAS on version so an
         // in-flight worker's next checkpoint write (SIGNED is written

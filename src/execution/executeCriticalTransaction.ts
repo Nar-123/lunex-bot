@@ -6,9 +6,80 @@ import type {
   TxAttemptStatus,
   TxSafetyDeps,
 } from './types';
+import { config } from '../config';
 import { classifyBroadcastError } from './classifyBroadcastError';
 import { isStuckAttempt } from './stuckAttempt';
-import { withExecutorLock } from './executorMutex';
+import { ExecutorLockTimeoutError, withExecutorLock } from './executorMutex';
+
+/**
+ * Stuck-transaction incident: which pipeline step an unexpected failure
+ * came from. Before this, every throw after NONCE_ASSIGNED fell into one
+ * generic catch that neither logged nor persisted the error -- the
+ * production attempt sat at NONCE_ASSIGNED with `lastError = null` while
+ * being retried every 15s.
+ */
+export type CriticalStepCode =
+  | 'ATTEMPT_BOOKKEEPING_CONFLICT'
+  | 'BUILD_FAILED'
+  | 'SIMULATE_FAILED'
+  | 'GAS_CHECK_FAILED'
+  | 'EXECUTOR_BUSY'
+  | 'NONCE_FAILED'
+  | 'SIGN_TRANSACTION_FAILED'
+  | 'SIGNED_CHECKPOINT_PERSIST_FAILED'
+  | 'BROADCAST_FAILED'
+  | 'BROADCAST_AMBIGUOUS'
+  | 'RECEIPT_WAIT_FAILED'
+  | 'VERIFICATION_FAILED'
+  | 'CHECKPOINT_PERSIST_FAILED';
+
+type Checkpoint = 'BUILD' | 'SIMULATE' | 'GAS_CHECK' | 'EXECUTOR_LOCK' | 'NONCE' | 'SIGN' | 'SIGNED_PERSIST' | 'BROADCAST' | 'RECEIPT_WAIT' | 'VERIFY' | 'PERSIST';
+
+const CHECKPOINT_CODE: Record<Checkpoint, CriticalStepCode> = {
+  BUILD: 'BUILD_FAILED',
+  SIMULATE: 'SIMULATE_FAILED',
+  GAS_CHECK: 'GAS_CHECK_FAILED',
+  EXECUTOR_LOCK: 'EXECUTOR_BUSY',
+  NONCE: 'NONCE_FAILED',
+  SIGN: 'SIGN_TRANSACTION_FAILED',
+  SIGNED_PERSIST: 'SIGNED_CHECKPOINT_PERSIST_FAILED',
+  BROADCAST: 'BROADCAST_AMBIGUOUS',
+  RECEIPT_WAIT: 'RECEIPT_WAIT_FAILED',
+  VERIFY: 'VERIFICATION_FAILED',
+  PERSIST: 'CHECKPOINT_PERSIST_FAILED',
+};
+
+export type CriticalTxLog = (event: string, data: Record<string, unknown>) => void;
+
+export interface ExecuteCriticalTransactionOptions {
+  /** Structured warning sink. Defaults to a JSON line on stderr in the app's log format (lands in the service journal). */
+  log?: CriticalTxLog;
+  /** How long to wait for the executor lock before giving up for this tick. Defaults to `RESUME_CLAIM_FRESHNESS_MS`. */
+  lockWaitMs?: number;
+}
+
+const defaultLog: CriticalTxLog = (event, data) => {
+  console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', event, ...data }));
+};
+
+const MAX_ERROR_LENGTH = 500;
+
+/**
+ * Bounded, secret-safe error text for persistence/logging. RPC errors from
+ * viem embed the request URL (the provider API key lives in its path) and
+ * the request body (for a broadcast: the signed payload) -- neither may be
+ * written to the database or the journal.
+ */
+export function safeErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  return raw
+    .replace(/(https?:\/\/[^/\s"'`]+)[^\s"'`]*/gi, '$1/<redacted>')
+    .replace(/Request body:[\s\S]*$/i, 'Request body: <redacted>')
+    .replace(/0x[0-9a-fA-F]{130,}/g, (m) => `0x<redacted ${(m.length - 2) / 2} bytes>`)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_ERROR_LENGTH);
+}
 
 function statusIndex(status: TxAttemptStatus): number {
   const idx = (TX_ATTEMPT_STATUS_ORDER as readonly string[]).indexOf(status);
@@ -121,7 +192,24 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
   purpose: string,
   deps: TxSafetyDeps<TVerifyData>,
   repo: TransactionAttemptRepository,
+  options: ExecuteCriticalTransactionOptions = {},
 ): Promise<ExecutionResult<TVerifyData>> {
+  const log = options.log ?? defaultLog;
+  const lockWaitMs = options.lockWaitMs ?? config.rules.execution.RESUME_CLAIM_FRESHNESS_MS;
+  let checkpoint: Checkpoint = 'BUILD';
+  const report = (code: CriticalStepCode, message: string, a: TransactionAttemptRecord | null, extra: Record<string, unknown> = {}): void => {
+    log('critical_tx_step_failed', { idempotencyKey, purpose, status: a?.status ?? null, checkpoint, code, error: message, ...extra });
+  };
+  /** Best-effort: persist `[CODE] message` as lastError without ever throwing (a stale/unreachable DB must not mask the original failure). */
+  const persistLastError = async (code: CriticalStepCode, message: string): Promise<TransactionAttemptRecord | null> => {
+    try {
+      const latest = await repo.find(idempotencyKey);
+      if (!latest || latest.status === 'FAILED' || latest.status === 'VERIFIED') return latest;
+      return await repo.update(latest.id, { lastError: `[${code}] ${message}`.slice(0, MAX_ERROR_LENGTH) }, latest.version);
+    } catch {
+      return null;
+    }
+  };
   // Explicitly typed non-null (rather than inferred from `repo.find`'s
   // nullable return) so TypeScript doesn't re-widen `attempt` to include
   // `null` inside the nested `withExecutorLock` closure below -- a `let`
@@ -151,12 +239,16 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       firstAttemptedAt: attempt.firstAttemptedAt ?? new Date(),
     }, attempt.version);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = safeErrorMessage(err);
     const latest = (await repo.find(idempotencyKey)) ?? attempt;
+    // A concurrent writer advanced this attempt -- a concurrency signal, not
+    // a step failure: logged, not persisted (the row belongs to that writer).
+    report('ATTEMPT_BOOKKEEPING_CONFLICT', message, latest);
     return ambiguousFailure(`unexpected error, resume required: ${message}`, latest);
   }
 
   try {
+    checkpoint = 'BUILD';
     if (notYetReached(attempt.status, 'BUILT')) {
       const tx = await deps.buildTransaction();
       attempt = await repo.update(attempt.id, { status: 'BUILT', txRequest: tx }, attempt.version);
@@ -166,6 +258,7 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       throw new Error('invariant violated: status is past BUILT but txRequest is missing');
     }
 
+    checkpoint = 'SIMULATE';
     if (notYetReached(attempt.status, 'SIMULATED')) {
       const sim = await deps.simulate(tx);
       if (!sim.ok) {
@@ -179,6 +272,7 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       attempt = await repo.update(attempt.id, { status: 'SIMULATED' }, attempt.version);
     }
 
+    checkpoint = 'GAS_CHECK';
     if (notYetReached(attempt.status, 'GAS_CHECKED')) {
       const gasLimit = await deps.estimateGas(tx);
       const gasPrice = await deps.getGasPrice();
@@ -208,9 +302,25 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
     // concurrent call for the SAME idempotencyKey that queued behind the
     // lock would act on a stale in-memory snapshot and redundantly
     // re-assign a nonce/re-sign, clobbering the first call's progress.
+    checkpoint = 'EXECUTOR_LOCK';
     const lockOutcome = await withExecutorLock(async (): Promise<ExecutionResult<TVerifyData> | null> => {
       attempt = (await repo.find(attempt.idempotencyKey)) ?? attempt;
 
+      // Fence re-check (stuck-transaction incident audit): this re-read can
+      // observe a TERMINAL row written by another writer while this worker
+      // queued for the lock -- above all H3's OPENING_TIMEOUT fence
+      // (`expireStaleOpening`). `statusIndex('FAILED')` is -1, so without
+      // this check every "not yet reached" test below was TRUE for a FAILED
+      // row: a fenced attempt was resurrected -- fresh nonce, signed,
+      // broadcast -- for a position already FAILED. Terminal rows are final.
+      if (attempt.status === 'FAILED') {
+        return definitiveFailure(attempt.lastError ?? 'attempt was finalized FAILED by another writer -- not proceeding', attempt);
+      }
+      if (attempt.status === 'VERIFIED') {
+        return resumeVerified(attempt, deps, repo);
+      }
+
+      checkpoint = 'NONCE';
       if (notYetReached(attempt.status, 'NONCE_ASSIGNED')) {
         const nonce = await deps.getNonce();
         attempt = await repo.update(attempt.id, { status: 'NONCE_ASSIGNED', nonce }, attempt.version);
@@ -221,7 +331,31 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       }
 
       if (notYetReached(attempt.status, 'SIGNED')) {
-        const signed = await deps.signTransaction(tx, lockedNonce, gasLimit, gasPrice);
+        checkpoint = 'SIGN';
+        let signed: { raw: `0x${string}`; hash: `0x${string}` };
+        try {
+          signed = await deps.signTransaction(tx, lockedNonce, gasLimit, gasPrice);
+        } catch (err) {
+          // Signing is LOCAL computation (viemTxSteps.signTx -- no network):
+          // a throw is deterministic, retrying the same inputs cannot help,
+          // and no payload was produced or persisted, so nothing can have
+          // been broadcast. That is a definitive pre-broadcast fact -- FAILED,
+          // with the exact error recorded (the incident retried this forever
+          // with lastError = null). The assigned nonce was never used.
+          const message = safeErrorMessage(err);
+          report('SIGN_TRANSACTION_FAILED', message, attempt, { nonce: lockedNonce });
+          attempt = await repo.update(attempt.id, {
+            status: 'FAILED',
+            failureCode: 'SIGN_TRANSACTION_FAILED',
+            lastError: `[SIGN_TRANSACTION_FAILED] ${message}`.slice(0, MAX_ERROR_LENGTH),
+          }, attempt.version);
+          return definitiveFailure(`signing failed: ${message}`, attempt);
+        }
+        // A throw here (stale CAS -- another writer moved the row -- or a DB
+        // error) loses only an UNPERSISTED signed payload, which therefore
+        // was never broadcast: resumable (outer catch). The resume re-signs
+        // under the SAME persisted nonce (never a new one).
+        checkpoint = 'SIGNED_PERSIST';
         attempt = await repo.update(attempt.id, { status: 'SIGNED', rawTx: signed.raw, txHash: signed.hash }, attempt.version);
       }
       const lockedRawTx = attempt.rawTx;
@@ -231,21 +365,23 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       }
 
       if (notYetReached(attempt.status, 'SENT')) {
+        checkpoint = 'BROADCAST';
         try {
           await deps.broadcastRaw(lockedRawTx);
           attempt = await repo.update(attempt.id, { status: 'SENT' }, attempt.version);
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          const classification = classifyBroadcastError(message);
+          const message = safeErrorMessage(err);
+          const classification = classifyBroadcastError(err instanceof Error ? err.message : String(err));
 
           if (classification.kind === 'ALREADY_KNOWN') {
             // Our exact payload is already in the mempool -- not a failure.
             attempt = await repo.update(attempt.id, { status: 'SENT' }, attempt.version);
           } else if (classification.kind === 'DEFINITIVE_REJECTED') {
+            report('BROADCAST_FAILED', message, attempt, { txHash: lockedTxHash });
             attempt = await repo.update(attempt.id, {
               status: 'FAILED',
               failureCode: 'BROADCAST_REJECTED',
-              lastError: classification.reason,
+              lastError: safeErrorMessage(classification.reason),
             }, attempt.version);
             return definitiveFailure(classification.reason, attempt);
           } else if (classification.kind === 'POSSIBLY_OURS') {
@@ -259,9 +395,10 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
             } catch (checkErr) {
               // Couldn't even determine that much -- stay ambiguous, don't
               // guess either way.
-              const checkMessage = checkErr instanceof Error ? checkErr.message : String(checkErr);
+              const checkMessage = safeErrorMessage(checkErr);
+              report('BROADCAST_AMBIGUOUS', `${message}; receipt check failed: ${checkMessage}`, attempt, { txHash: lockedTxHash });
               attempt = await repo.update(attempt.id, {
-                lastError: `broadcast rejected (${message}); receipt check failed too: ${checkMessage}`,
+                lastError: `[BROADCAST_AMBIGUOUS] broadcast rejected (${message}); receipt check failed too: ${checkMessage}`.slice(0, MAX_ERROR_LENGTH),
               }, attempt.version);
               return ambiguousFailure(`broadcast rejected, receipt check failed, resume required: ${message}`, attempt);
             }
@@ -269,10 +406,11 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
               // It's genuinely ours and already landed -- proceed normally.
               attempt = await repo.update(attempt.id, { status: 'SENT' }, attempt.version);
             } else {
+              report('BROADCAST_FAILED', message, attempt, { txHash: lockedTxHash });
               attempt = await repo.update(attempt.id, {
                 status: 'FAILED',
                 failureCode: 'BROADCAST_REJECTED',
-                lastError: `broadcast rejected (${message}) and no receipt found for our own tx hash -- this nonce/payload is dead`,
+                lastError: `broadcast rejected (${message}) and no receipt found for our own tx hash -- this nonce/payload is dead`.slice(0, MAX_ERROR_LENGTH),
               }, attempt.version);
               return definitiveFailure(`broadcast rejected: ${message}`, attempt);
             }
@@ -292,21 +430,23 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
               receipt = await deps.getReceiptIfAvailable(lockedTxHash);
             } catch {
               // Couldn't even determine that much -- stay ambiguous, don't guess either way.
-              attempt = await repo.update(attempt.id, { lastError: `broadcast uncertain: ${message}` }, attempt.version);
+              report('BROADCAST_AMBIGUOUS', message, attempt, { txHash: lockedTxHash });
+              attempt = await repo.update(attempt.id, { lastError: `[BROADCAST_AMBIGUOUS] broadcast uncertain: ${message}`.slice(0, MAX_ERROR_LENGTH) }, attempt.version);
               return ambiguousFailure(`broadcast uncertain, resume required: ${message}`, attempt);
             }
             if (receipt) {
               // It's actually mined -- proceed normally, never FAILED.
               attempt = await repo.update(attempt.id, { status: 'SENT' }, attempt.version);
             } else {
-              attempt = await repo.update(attempt.id, { lastError: `broadcast uncertain: ${message}` }, attempt.version);
+              report('BROADCAST_AMBIGUOUS', message, attempt, { txHash: lockedTxHash });
+              attempt = await repo.update(attempt.id, { lastError: `[BROADCAST_AMBIGUOUS] broadcast uncertain: ${message}`.slice(0, MAX_ERROR_LENGTH) }, attempt.version);
               return ambiguousFailure(`broadcast uncertain, resume required: ${message}`, attempt);
             }
           }
         }
       }
       return null;
-    });
+    }, { label: idempotencyKey, maxWaitMs: lockWaitMs });
     if (lockOutcome) return lockOutcome;
 
     const txHash = attempt.txHash;
@@ -314,6 +454,7 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       throw new Error('invariant violated: status is past SIGNED but txHash is missing');
     }
 
+    checkpoint = 'RECEIPT_WAIT';
     if (notYetReached(attempt.status, 'CONFIRMED')) {
       const receipt = await deps.waitForReceipt(txHash);
       if (receipt.status === 'reverted') {
@@ -327,6 +468,7 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       attempt = await repo.update(attempt.id, { status: 'CONFIRMED' }, attempt.version);
     }
 
+    checkpoint = 'VERIFY';
     const verification = await deps.verifyOnChain(txHash, attempt);
     if (!verification.ok) {
       if (verification.resumable === true) {
@@ -336,9 +478,11 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
         // having happened (the exit flow would revert a burned LP to
         // ACTIVE, or retry an already-filled swap). Status stays CONFIRMED,
         // so the next call with this key skips straight back to this step.
+        report('VERIFICATION_FAILED', safeErrorMessage(verification.reason), attempt, { resumable: true });
         attempt = await repo.update(attempt.id, { lastError: verification.reason }, attempt.version);
         return ambiguousFailure(`confirmed on-chain, verification incomplete, resume required: ${verification.reason}`, attempt);
       }
+      report('VERIFICATION_FAILED', safeErrorMessage(verification.reason), attempt, { resumable: false });
       attempt = await repo.update(attempt.id, {
         status: 'FAILED',
         failureCode: 'VERIFICATION_FAILED',
@@ -357,9 +501,16 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
     // "definitively did not happen" without on-chain evidence. Status
     // stays at the last successfully persisted checkpoint; calling this
     // again with the same idempotencyKey resumes.
-    const message = err instanceof Error ? err.message : String(err);
-    const latest = (await repo.find(idempotencyKey)) ?? attempt;
-    return ambiguousFailure(`unexpected error, resume required: ${message}`, latest);
+    // Stuck-transaction incident: the failing step is now named, logged and
+    // persisted (best-effort) instead of vanishing. Status is still NOT
+    // advanced or failed -- every step reaching here is either pre-broadcast
+    // and transient, or post-broadcast and therefore ambiguous on-chain.
+    const message = safeErrorMessage(err);
+    const code: CriticalStepCode = err instanceof ExecutorLockTimeoutError ? 'EXECUTOR_BUSY' : CHECKPOINT_CODE[checkpoint];
+    const persisted = await persistLastError(code, message);
+    const latest = persisted ?? (await repo.find(idempotencyKey).catch(() => null)) ?? attempt;
+    report(code, message, latest, err instanceof ExecutorLockTimeoutError ? { lockHolder: err.holder?.label ?? null } : {});
+    return ambiguousFailure(`[${code}] unexpected error, resume required: ${message}`, latest);
   }
 }
 

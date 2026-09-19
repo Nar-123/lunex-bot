@@ -220,8 +220,11 @@ describe('H3: OPENING has a bounded lifetime -- released only when its entry pro
   it('FENCE: no mint attempt yet (the worker is still on the approve leg) -> the mint key is created FAILED, so the resumed open can only fail, never mint', async () => {
     const ctx = setup();
     const txAttempts = ctx.txAttempts;
-    // Force the approve leg to stay ambiguous so no mint attempt is ever created.
-    const approveDeps = vi.fn(() => fakeTxDeps({ allowanceRaw: 0n }, { broadcastRaw: vi.fn(async () => { throw new Error('ECONNRESET'); }) }));
+    // Force the approve leg to stay pending BEFORE signing (a transient gas-estimate
+    // failure) so no mint attempt is ever created. (An approve that is SIGNED --
+    // possibly broadcast -- now BLOCKS the expiry instead: see
+    // tests/execution/criticalTxLiveness.test.ts, case H.)
+    const approveDeps = vi.fn(() => fakeTxDeps({ allowanceRaw: 0n }, { estimateGas: vi.fn(async () => { throw new Error('ECONNRESET'); }) }));
     const deps = { ...ctx.deps(vi.fn(() => fakeTxDeps(MINTED))), readAllowance: vi.fn(async () => 0n), buildApproveDeps: approveDeps };
     expect((await openPosition(input(), deps)).outcome).toBe('PENDING');
     const [row] = await ctx.positions.findAllOpening();

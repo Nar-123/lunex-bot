@@ -96,7 +96,8 @@ export type OpeningExpiryResult =
   | { outcome: 'EXPIRED'; mintStatusBefore: string | null }
   | { outcome: 'NOT_OPENING' }
   | { outcome: 'TOO_YOUNG'; ageMs: number }
-  | { outcome: 'BLOCKED_UNRESOLVED_TX'; mintStatus: string }
+  /** `approveStatus` is set when an approve that may have been broadcast (SIGNED/SENT/CONFIRMED) is what blocks the expiry -- an approve landing after FAILED would leave an unwanted allowance. */
+  | { outcome: 'BLOCKED_UNRESOLVED_TX'; mintStatus: string; approveStatus?: string }
   | { outcome: 'MINT_VERIFIED' };
 
 export type CreateIfCapitalAllowsResult =

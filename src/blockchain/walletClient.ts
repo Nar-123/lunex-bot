@@ -30,6 +30,16 @@ export function getWalletClient(): WalletClient {
   return cachedClient;
 }
 
+/**
+ * The executor's LOCAL private-key account. Signing MUST go through this
+ * object: viem treats an address STRING passed as `account` as a JSON-RPC
+ * account and asks the RPC node to sign (`eth_signTransaction`), which a
+ * hosted RPC cannot do -- see `execution/viemTxSteps.ts`'s `signTx`.
+ */
+export function getExecutorAccount(): PrivateKeyAccount {
+  return getAccount();
+}
+
 export function getExecutorAddress(): `0x${string}` {
   return getAccount().address;
 }

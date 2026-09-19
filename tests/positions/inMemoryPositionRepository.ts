@@ -302,15 +302,19 @@ export class InMemoryPositionRepository implements PositionRepository {
 
     const mintKey = openMintAttemptKey(row.openIdempotencyKey);
     const mint = await this.txAttempts.find(mintKey);
+    const approve = await this.txAttempts.find(`${row.openIdempotencyKey}:approve`);
     if (row.status !== 'OPENING') return { outcome: 'NOT_OPENING' }; // re-check after the await
     const lastError = `OPENING expired after ${ageMs}ms (max ${maxAgeMs}ms) with no broadcast mint -- reservation released`;
+    const possiblyBroadcast = (s: string) => s === 'SIGNED' || s === 'SENT' || s === 'CONFIRMED';
+    if (mint?.status === 'VERIFIED') return { outcome: 'MINT_VERIFIED' };
+    if (mint && possiblyBroadcast(mint.status)) return { outcome: 'BLOCKED_UNRESOLVED_TX', mintStatus: mint.status };
+    if (approve && possiblyBroadcast(approve.status)) return { outcome: 'BLOCKED_UNRESOLVED_TX', mintStatus: mint?.status ?? 'NONE', approveStatus: approve.status };
+    if (approve && approve.status !== 'FAILED' && approve.status !== 'VERIFIED') {
+      await this.txAttempts.update(approve.id, { status: 'FAILED', failureCode: 'OPENING_TIMEOUT', lastError: `OPENING expired after ${ageMs}ms (max ${maxAgeMs}ms) before this approve was signed -- fenced` }, approve.version);
+    }
     if (mint === null) {
       const created = await this.txAttempts.create(mintKey, 'deploy:mint');
       await this.txAttempts.update(created.id, { status: 'FAILED', failureCode: 'OPENING_TIMEOUT', lastError }, created.version);
-    } else if (mint.status === 'VERIFIED') {
-      return { outcome: 'MINT_VERIFIED' };
-    } else if (mint.status === 'SIGNED' || mint.status === 'SENT' || mint.status === 'CONFIRMED') {
-      return { outcome: 'BLOCKED_UNRESOLVED_TX', mintStatus: mint.status };
     } else if (mint.status !== 'FAILED') {
       await this.txAttempts.update(mint.id, { status: 'FAILED', failureCode: 'OPENING_TIMEOUT', lastError }, mint.version);
     }

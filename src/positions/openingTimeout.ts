@@ -71,7 +71,7 @@ export async function enforceOpeningTimeout(position: PositionRecord, deps: Open
       return { skipResume: true, result };
     case 'BLOCKED_UNRESOLVED_TX':
       deps.logger.info('opening_timeout_eligible', { positionId: position.id, maxAgeMs });
-      deps.logger.warn('opening_timeout_blocked_unresolved_tx', { positionId: position.id, mintStatus: result.mintStatus, maxAgeMs });
+      deps.logger.warn('opening_timeout_blocked_unresolved_tx', { positionId: position.id, mintStatus: result.mintStatus, approveStatus: result.approveStatus ?? null, maxAgeMs });
       return { skipResume: false, result };
     case 'MINT_VERIFIED':
       deps.logger.info('opening_timeout_eligible', { positionId: position.id, maxAgeMs });

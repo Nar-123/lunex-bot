@@ -1,6 +1,7 @@
 import { keccak256, TransactionReceiptNotFoundError } from 'viem';
+import type { LocalAccount } from 'viem';
 import { getPublicClient } from '../blockchain/viemClient';
-import { getWalletClient, getExecutorAddress } from '../blockchain/walletClient';
+import { getExecutorAccount, getExecutorAddress } from '../blockchain/walletClient';
 import { robinhoodChain } from '../blockchain/viemChain';
 import { checkGasAffordability } from './gasAffordability';
 import type { StepResult, TxRequest } from './types';
@@ -76,16 +77,35 @@ export async function getCurrentNonce(): Promise<number> {
   return client.getTransactionCount({ address: getExecutorAddress(), blockTag: 'pending' });
 }
 
-export async function signTx(
+/**
+ * Signs LOCALLY with the executor's private-key account -- pure computation,
+ * no network I/O, so it cannot hang and a throw is deterministic.
+ *
+ * Incident fix: this used to call `walletClient.signTransaction({ account:
+ * getExecutorAddress(), ... })`. viem's `parseAccount` turns an address
+ * STRING into a JSON-RPC account (no local signer), so viem ignored the
+ * local key and sent `eth_signTransaction` to the RPC node -- which a hosted
+ * RPC cannot serve. Every critical transaction therefore failed at the
+ * signing step (after NONCE_ASSIGNED, before SIGNED) and nothing was ever
+ * signed or broadcast. It also made an RPC round-trip (`eth_chainId`) inside
+ * the executor lock; local signing removes both.
+ *
+ * `chainId` is the configured chain (EIP-155 replay protection binds the
+ * signature to it; a mismatched RPC would reject the broadcast outright).
+ * `type: 'legacy'` is what viem inferred for this exact field set before
+ * (gasPrice, no EIP-1559 fees) -- same payload shape as before the fix.
+ */
+export async function signTxWithAccount(
+  account: Pick<LocalAccount, 'signTransaction'>,
+  chainId: number,
   tx: TxRequest,
   nonce: number,
   gasLimit: bigint,
   gasPrice: bigint,
 ): Promise<{ raw: `0x${string}`; hash: `0x${string}` }> {
-  const walletClient = getWalletClient();
-  const raw = await walletClient.signTransaction({
-    account: getExecutorAddress(),
-    chain: robinhoodChain,
+  const raw = await account.signTransaction({
+    type: 'legacy',
+    chainId,
     to: tx.to,
     data: tx.data,
     value: tx.value,
@@ -99,6 +119,15 @@ export async function signTx(
   // look up on resume.
   const hash = keccak256(raw);
   return { raw, hash };
+}
+
+export async function signTx(
+  tx: TxRequest,
+  nonce: number,
+  gasLimit: bigint,
+  gasPrice: bigint,
+): Promise<{ raw: `0x${string}`; hash: `0x${string}` }> {
+  return signTxWithAccount(getExecutorAccount(), robinhoodChain.id, tx, nonce, gasLimit, gasPrice);
 }
 
 export async function broadcastRawTx(raw: `0x${string}`): Promise<void> {
