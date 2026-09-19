@@ -35,16 +35,18 @@ import type { AppDeps } from './types';
 export function createRealAppDeps(): AppDeps {
   const prisma = getPrismaClient();
   const positions = new PrismaPositionRepository(prisma);
+  const txAttempts = new PrismaTransactionAttemptRepository(prisma);
   const walletAddress = getExecutorAddress();
 
   return {
     positions,
-    txAttempts: new PrismaTransactionAttemptRepository(prisma),
+    txAttempts,
     exitStates: new PrismaExitStateRepository(prisma),
     settings: new PrismaSettingsRepository(prisma),
     cooldown: new PrismaCooldownRepository(prisma),
     activePositionChecker: new PositionActivePositionChecker(positions),
-    capitalSnapshot: new PositionCapitalSnapshotProvider(positions, walletAddress),
+    // H2: txAttempts lets the snapshot account for USDG a CLOSING position has already returned.
+    capitalSnapshot: new PositionCapitalSnapshotProvider(positions, walletAddress, undefined, txAttempts),
     canaryGuard: new InMemoryCanaryGuard(),
     discoveryService: new DiscoveryService(new GmgnCliClient()),
     stockClassifier: new CachedRobinhoodStockClassifier(new OnChainRobinhoodStockClassifier()),

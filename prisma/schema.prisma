@@ -285,6 +285,26 @@ model ExitState {
   /// across the two DB writes, since a restart can happen in between.
   pendingCloseReason String?
 
+  /// Stale-writer fix: optimistic-concurrency version, +1 on EVERY write
+  /// (see `exits/exitStateRepository.ts`). Decision-state writes are a
+  /// compare-and-swap on it, the swap counter and swap-leg fields are
+  /// conditional on `swapAttemptCount`, so a worker holding an older
+  /// snapshot (another process, or a call that outlived its claim lease)
+  /// can never overwrite newer exit state. Migration
+  /// `20260918000000_add_exit_state_version`.
+  version Int @default(1)
+
+  /// Unroutable TOKEN leg (migration `20260919000000_add_exit_state_swap_leg_block`):
+  /// why the CURRENT swap attempt cannot proceed right now --
+  /// 'QUOTE_UNAVAILABLE' | 'PRICE_IMPACT_BLOCKED' -- since when (set once per
+  /// continuous block), and when it was last re-checked. Written only for the
+  /// current `swapAttemptCount`; cleared the moment the swap can proceed.
+  /// Observability/classification ONLY: never closes, settles or values
+  /// anything.
+  swapLegBlockedReason String?
+  swapLegBlockedSince  DateTime?
+  swapLegLastCheckedAt DateTime?
+
   updatedAt DateTime @updatedAt
 
   @@index([oorStartedAt])

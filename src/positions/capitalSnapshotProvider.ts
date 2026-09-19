@@ -1,7 +1,8 @@
 import type { Address } from 'viem';
 import type { CapitalSnapshot, CapitalSnapshotProvider } from '../capital/types';
 import { readUsdgBalance } from '../capital/usdgBalanceReader';
-import { deriveCapitalSnapshot } from '../capital/freshCapitalSnapshot';
+import { deriveCapitalSnapshot, exitLegKeyPrefix } from '../capital/freshCapitalSnapshot';
+import type { TransactionAttemptRepository } from '../execution/types';
 import type { PositionRepository } from './types';
 
 /**
@@ -56,10 +57,32 @@ import type { PositionRepository } from './types';
  * ...which is exactly the true total: `onChainBalance` already includes
  * every OPENING position's still-unspent capital (it hasn't left the
  * wallet), plus whatever's genuinely locked away in ACTIVE/CLOSING LPs.
+ *
  * See the invariant tests for the numeric confirmation, including that
  * sequential OPENING attempts before anything confirms now behave
  * identically (in total-safety terms) to fully-sequential confirmed
  * deployments -- the fix removes the timing-dependence entirely.
+ *
+ * ## The CLOSING-after-remove fix (H2)
+ * The proof above silently assumed a CLOSING position's capital is still
+ * locked in its LP. It is not once its remove-liquidity has been VERIFIED:
+ * the burn pays USDG back into the wallet (so it is inside
+ * `onChainBalance`) while the row stays CLOSING until the TOKEN swap (if
+ * any) completes -- and `CLOSING_sum` still carried the FULL entry, so that
+ * USDG was counted twice (1000 wallet + 350 entry = 1350 for a true ~1000).
+ * A CLOSING position whose remove-liquidity is VERIFIED now contributes only
+ * what is still unconverted: 0 once fully back in USDG (the burn paid no
+ * TOKEN, or its swap VERIFIED), otherwise `max(entry - receipt-measured
+ * USDG the burn returned, 0)` -- the unrecovered cost basis of the TOKEN
+ * awaiting its swap -- so the sum is:
+ *
+ *   freeUsdgBalance + totalDeployedUsdg
+ *   = onChainBalance + ACTIVE_sum + CLOSING_before_remove_sum
+ *                    + sum(unconverted residual for CLOSING_after_remove)
+ *
+ * and a leg that may be mined but is not yet verified makes the snapshot
+ * unresolved (the allocator fails closed). See
+ * `capital/freshCapitalSnapshot.ts` for the per-position rules.
  *
  * ## The FAILED question (revision 7) -- no logic change needed here
  * Asked right after the above: does a position whose deploy transaction
@@ -82,24 +105,42 @@ export class PositionCapitalSnapshotProvider implements CapitalSnapshotProvider 
     private readonly walletAddress: Address,
     /** Injectable for tests -- defaults to the real on-chain ERC20 read. */
     private readonly readBalance: (wallet: Address) => Promise<bigint> = readUsdgBalance,
+    /**
+     * H2: needed to account for USDG a CLOSING position has already
+     * returned to the wallet. Optional only so snapshot-only tests with no
+     * CLOSING rows need not construct one; when absent and a CLOSING row
+     * exists, the snapshot is marked unresolved (the allocator refuses it)
+     * rather than silently double-counting. Production wiring
+     * (`composition/deps.ts`) always passes it.
+     */
+    private readonly txAttempts?: TransactionAttemptRepository,
   ) {}
 
+  /**
+   * H2 read ORDER is deliberate (sequential, not Promise.all):
+   *  1. position rows, THEN 2. the on-chain balance -- an OPENING row whose
+   *     mint lands in between is still seen as OPENING, so its capital is
+   *     subtracted even though the balance already dropped (conservative
+   *     under-count), never the reverse;
+   *  2. the balance, THEN 3. CLOSING rows' exit-leg attempts -- an exit
+   *     transaction can only reach the chain after its attempt is persisted
+   *     at SIGNED, so if its USDG is already in the balance read, the later
+   *     attempt read sees it at SIGNED..VERIFIED: either unresolved (fail
+   *     closed) or VERIFIED with a measured amount that is then removed
+   *     from the deployed figure. A leg verified AFTER the balance read only
+   *     makes the snapshot conservative (returned USDG subtracted from
+   *     deployed but not yet seen in the balance).
+   * `createIfCapitalAllows` re-derives the same way under CapitalLock
+   * before anything is written, so this per-cycle sizing read is never
+   * the last word.
+   */
   async getSnapshot(): Promise<CapitalSnapshot> {
-    const [onChainBalance, deployedPositions, activePositionsCount] = await Promise.all([
-      this.readBalance(this.walletAddress),
-      this.positions.findDeployedPositions(), // OPENING + ACTIVE + CLOSING
-      this.positions.countNonClosed(),
-    ]);
+    const deployedPositions = await this.positions.findDeployedPositions(); // OPENING + ACTIVE + CLOSING
+    const onChainBalance = await this.readBalance(this.walletAddress);
+    const closeKeys = deployedPositions.filter((p) => p.status === 'CLOSING' && p.closeIdempotencyKey).map((p) => exitLegKeyPrefix(p.closeIdempotencyKey as string));
+    const exitLegAttempts = this.txAttempts ? await this.txAttempts.findByKeyPrefixes(closeKeys) : null;
 
-    // Same formula as always, now shared with createIfCapitalAllows's
-    // write-time re-check (P1-1) via capital/freshCapitalSnapshot.ts.
-    const { freeUsdgBalance, totalDeployedUsdg } = deriveCapitalSnapshot(onChainBalance, deployedPositions);
-
-    return {
-      freeUsdgBalance,
-      activePositionsCount,
-      totalDeployedUsdg,
-    };
+    return deriveCapitalSnapshot(onChainBalance, deployedPositions, exitLegAttempts);
   }
 
   readOnChainUsdgBalance(): Promise<bigint> {

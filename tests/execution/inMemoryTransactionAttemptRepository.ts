@@ -6,8 +6,14 @@ export class InMemoryTransactionAttemptRepository implements TransactionAttemptR
   private byKey = new Map<string, TransactionAttemptRecord>();
   private nextId = 1;
 
+  // H3: every read/write returns a COPY, exactly like the real Prisma
+  // repository (a fresh object per query). Returning the stored object
+  // itself let a caller's "snapshot" silently mutate when ANOTHER writer
+  // updated the row, which made the P1-5 version check vacuous in tests --
+  // the stale snapshot always carried the new version.
   async find(idempotencyKey: string): Promise<TransactionAttemptRecord | null> {
-    return this.byKey.get(idempotencyKey) ?? null;
+    const record = this.byKey.get(idempotencyKey);
+    return record ? { ...record } : null;
   }
 
   async create(idempotencyKey: string, purpose: string): Promise<TransactionAttemptRecord> {
@@ -30,7 +36,7 @@ export class InMemoryTransactionAttemptRepository implements TransactionAttemptR
       version: 1,
     };
     this.byKey.set(idempotencyKey, record);
-    return record;
+    return { ...record };
   }
 
   async update(
@@ -48,7 +54,7 @@ export class InMemoryTransactionAttemptRepository implements TransactionAttemptR
         }
         Object.assign(record, patch);
         record.version += 1;
-        return record;
+        return { ...record };
       }
     }
     throw new Error(`no attempt with id ${id}`);
@@ -56,6 +62,11 @@ export class InMemoryTransactionAttemptRepository implements TransactionAttemptR
 
   async findNonTerminal(): Promise<TransactionAttemptRecord[]> {
     return [...this.byKey.values()].filter((r) => r.status !== 'VERIFIED' && r.status !== 'FAILED');
+  }
+
+  async findByKeyPrefixes(prefixes: readonly string[]): Promise<TransactionAttemptRecord[]> {
+    if (prefixes.length === 0) return [];
+    return [...this.byKey.values()].filter((r) => prefixes.some((p) => r.idempotencyKey.startsWith(p))).map((r) => ({ ...r }));
   }
 
   /** Test helper: how many attempts exist -- used to assert idempotency (no duplicate rows created). */

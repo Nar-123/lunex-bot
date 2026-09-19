@@ -29,6 +29,7 @@ describe('PositionActivePositionChecker', () => {
     const repo = new InMemoryPositionRepository();
     const created = await repo.create(makeCreateInput());
     await repo.markActive(created.id, '42', new Date());
+    await repo.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
     await repo.markClosed(created.id, new Date(), 'TRAILING_TP');
     const checker = new PositionActivePositionChecker(repo);
     expect(await checker.hasActivePosition('0x0000000000000000000000000000000000000002')).toBe(false);

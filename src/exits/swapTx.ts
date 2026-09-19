@@ -7,6 +7,39 @@ import * as txSteps from '../execution/viemTxSteps';
 import type { SwapExecutor, SwapQuote } from '../swap/types';
 import type { ExitStateRepository } from './types';
 
+/**
+ * Same-attempt swap race fix: the quote-derived snapshot an exit-swap
+ * attempt's calldata was built from. Returned by `buildTransaction` INSIDE
+ * the `TxRequest` (as `buildContext`), so `executeCriticalTransaction`
+ * persists it in the SAME version-checked BUILT write as the calldata --
+ * one attempt, one owner, one quote snapshot. Every value comes from the
+ * SAME `quote` object `swapExecutor.buildSwapTx` encoded, in the same call.
+ * No quote id is invented: the Trading API response carries none (see
+ * `swap/types.ts`), and none is needed -- the calldata and this snapshot
+ * are bound by being persisted together atomically.
+ */
+export interface ExitSwapBuildContext {
+  kind: 'exit-swap/v1';
+  positionId: string;
+  swapAttemptCount: number;
+  amountInRaw: bigint;
+  expectedAmountOutRaw: bigint;
+  minOutputAmountRaw: bigint;
+  priceImpactPct: number | null;
+  slippageBps: number;
+  /** Wallet USDG balance read by THIS builder just before building (defense-in-depth balance-delta baseline, never the primary proof). */
+  usdgBalanceBeforeRaw: bigint;
+}
+
+/** Reads back a persisted `ExitSwapBuildContext`, or `null` for an attempt built before it existed (legacy) or anything malformed. */
+export function readExitSwapBuildContext(buildContext: unknown): ExitSwapBuildContext | null {
+  if (typeof buildContext !== 'object' || buildContext === null) return null;
+  const c = buildContext as Partial<ExitSwapBuildContext>;
+  if (c.kind !== 'exit-swap/v1') return null;
+  if (typeof c.minOutputAmountRaw !== 'bigint' || typeof c.usdgBalanceBeforeRaw !== 'bigint' || typeof c.amountInRaw !== 'bigint' || typeof c.expectedAmountOutRaw !== 'bigint') return null;
+  return c as ExitSwapBuildContext;
+}
+
 export interface SwapVerifyData {
   usdgIncreaseRaw: bigint;
   /** VALIDATION PHASE: USDG the swap's own confirmed receipt paid the wallet (realized-PnL measurement -- exact, immune to concurrent wallet activity, unlike the balance delta above which stays as the safety check). */
@@ -60,13 +93,16 @@ export function shouldBlockForPriceImpact(priceImpactPct: number | null, enabled
  * proceed. `shouldBlockForPriceImpact` is still exported and used there,
  * not duplicated here.
  *
- * `verifyOnChain` needs a "before" USDG balance baseline that survives a
- * process restart between broadcast and confirmation -- captured once, in
- * `buildTransaction` (which runs exactly once per attempt and is skipped on
- * resume), persisted to `ExitState` (`swapUsdgBalanceBeforeRaw`/
- * `swapMinOutputAmountRaw`) precisely so a resumed `verifyOnChain` call, in
- * a potentially different process, still has the correct baseline instead
- * of re-reading a balance that may already reflect the swap's own effect.
+ * `verifyOnChain` needs the minimum output and a "before" USDG balance
+ * baseline that survive a process restart between broadcast and
+ * confirmation. They are captured in `buildTransaction` and persisted INSIDE
+ * the attempt's own `txRequest` (`ExitSwapBuildContext`), by the same
+ * version-checked BUILT write that persists the calldata -- so a resumed
+ * `verifyOnChain` (in any process) reads the values that belong to THIS
+ * attempt's calldata. (Before the same-attempt race fix they lived in
+ * `ExitState.swapUsdgBalanceBeforeRaw`/`swapMinOutputAmountRaw`, shared per
+ * position and written before ownership was decided; those columns are now
+ * read only for attempts built before the fix.)
  *
  * `quote` may be `null` ONLY for resume-only deps: `executeExit.ts` passes
  * null when the attempt under this key already holds a signed payload, so
@@ -76,6 +112,14 @@ export function shouldBlockForPriceImpact(priceImpactPct: number | null, enabled
  * than build calldata from nothing.
  */
 export interface BuildSwapDepsOptions {
+  /**
+   * The swap attempt number (ExitState.swapAttemptCount) this deps object
+   * belongs to. `buildTransaction` refuses to build (read-only check, no
+   * write) once the counter has moved past it, and records it in the
+   * attempt's `ExitSwapBuildContext`. When omitted, the current count is
+   * read once and used.
+   */
+  swapAttemptCount?: number;
   /** Injectable for tests -- defaults to the real on-chain ERC20 read (same reasoning as `capitalSnapshotProvider.ts`'s `readBalance` default). */
   readBalance?: (tokenAddress: Address, walletAddress: Address) => Promise<bigint>;
   /** Injectable for tests -- defaults to the real receipt-log decoder (`blockchain/erc20.ts`'s `readErc20TransfersTo`). */
@@ -102,14 +146,39 @@ export function buildSwapDeps(
       if (quote === null) {
         throw new Error(`cannot build exit swap tx for position ${positionId}: resume-only deps have no quote -- an already-signed swap attempt must never be rebuilt`);
       }
+      // Same-attempt swap race fix: this builder has NO persistent side
+      // effect any more. It used to write the quote's minimum output and
+      // the USDG baseline to ExitState here -- BEFORE the attempt's
+      // version-checked BUILT write decided which worker owns the attempt --
+      // so two workers on the same attempt (after a claim lease expired)
+      // both wrote, the last writer won, and the stored minimum could come
+      // from a DIFFERENT quote than the calldata that won the BUILT write.
+      // Now the snapshot is returned WITH the calldata and persisted
+      // atomically with it (see `ExitSwapBuildContext`); a losing worker's
+      // BUILT write fails its version check and its snapshot is simply
+      // discarded -- it never builds on, signs, or broadcasts anything.
+      //
+      // Read-only staleness check (no write): a worker still holding an
+      // older attempt number stops here, before any build.
+      const attemptNumber = options.swapAttemptCount ?? (await exitStates.getOrCreate(positionId)).swapAttemptCount;
+      const current = await exitStates.getOrCreate(positionId);
+      if (current.swapAttemptCount !== attemptNumber) {
+        throw new Error(`exit swap for position ${positionId}: swap attempt ${attemptNumber} is no longer current (now ${current.swapAttemptCount}) -- stale worker, not building`);
+      }
       const usdgBalanceBefore = await readBalance(usdgAddress, wallet);
-      await exitStates.update(positionId, {
-        swapUsdgBalanceBeforeRaw: usdgBalanceBefore,
-        swapMinOutputAmountRaw: quote.minOutputAmountRaw,
-        swapVerifiedUsdgIncreaseRaw: null, // a new attempt has not passed its balance check yet
-      });
-
-      return swapExecutor.buildSwapTx(tokenAddress, quote);
+      const tx = await swapExecutor.buildSwapTx(tokenAddress, quote);
+      const buildContext: ExitSwapBuildContext = {
+        kind: 'exit-swap/v1',
+        positionId,
+        swapAttemptCount: attemptNumber,
+        amountInRaw: quote.amountInRaw,
+        expectedAmountOutRaw: quote.expectedAmountOutRaw,
+        minOutputAmountRaw: quote.minOutputAmountRaw,
+        priceImpactPct: quote.priceImpactPct,
+        slippageBps: quote.slippageBps,
+        usdgBalanceBeforeRaw: usdgBalanceBefore,
+      };
+      return { to: tx.to, data: tx.data, value: tx.value, buildContext };
     },
     simulate: txSteps.simulateTx,
     estimateGas: txSteps.estimateGasForTx,
@@ -120,9 +189,15 @@ export function buildSwapDeps(
     broadcastRaw: txSteps.broadcastRawTx,
     waitForReceipt: txSteps.waitForTxReceipt,
     getReceiptIfAvailable: txSteps.getReceiptIfAvailable,
-    verifyOnChain: async (confirmedTxHash) => {
-      const exitState = await exitStates.getOrCreate(positionId);
-      const minRequired = exitState.swapMinOutputAmountRaw ?? 0n;
+    verifyOnChain: async (confirmedTxHash, attempt) => {
+      // Same-attempt swap race fix: the minimum and baseline come from the
+      // snapshot persisted WITH this attempt's own calldata -- never from
+      // per-position state another worker could have written. Attempts
+      // built before this fix (no snapshot) keep the old ExitState source.
+      const built = readExitSwapBuildContext(attempt?.txRequest?.buildContext);
+      const legacyState = built === null ? await exitStates.getOrCreate(positionId) : null;
+      const minRequired = built !== null ? built.minOutputAmountRaw : (legacyState?.swapMinOutputAmountRaw ?? 0n);
+      const baseline = built !== null ? built.usdgBalanceBeforeRaw : (legacyState?.swapUsdgBalanceBeforeRaw ?? null);
 
       // P0-5 fix: PRIMARY proof is now the swap's OWN CONFIRMED RECEIPT,
       // not a wallet-wide balance delta. `readUsdgTransfersTo` decodes
@@ -180,12 +255,15 @@ export function buildSwapDeps(
       // have since moved) -- its outcome can NEVER by itself flip
       // verification from fail to pass, and a read failure here is
       // swallowed rather than blocking an already receipt-proven success.
-      let usdgIncreaseRaw: bigint | null = exitState.swapVerifiedUsdgIncreaseRaw;
-      if (usdgIncreaseRaw === null && exitState.swapUsdgBalanceBeforeRaw !== null) {
+      let usdgIncreaseRaw: bigint | null = legacyState?.swapVerifiedUsdgIncreaseRaw ?? null;
+      if (usdgIncreaseRaw === null && baseline !== null) {
         try {
           const usdgBalanceAfter = await readBalance(usdgAddress, wallet);
-          usdgIncreaseRaw = usdgBalanceAfter - exitState.swapUsdgBalanceBeforeRaw;
-          await exitStates.update(positionId, { swapVerifiedUsdgIncreaseRaw: usdgIncreaseRaw });
+          usdgIncreaseRaw = usdgBalanceAfter - baseline;
+          // Legacy attempts only: keep the old resume-cache behavior. A
+          // snapshot-built attempt needs no shared cache -- its baseline is
+          // its own, and this value is observability, never the gate.
+          if (legacyState !== null) await exitStates.updateSwapLegFields(positionId, legacyState.swapAttemptCount, { swapVerifiedUsdgIncreaseRaw: usdgIncreaseRaw });
         } catch {
           // Best-effort only -- never blocks a receipt-proven verification.
         }

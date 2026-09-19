@@ -1,11 +1,31 @@
 export interface CapitalSnapshot {
-  /** Wallet's current USDG token balance, raw units. Deployed USDG has physically left the wallet
-   * (it's locked in the position's NFT via `PositionManager.modifyLiquidities()`), so this IS the
-   * free/available balance directly -- no separate subtraction needed. */
+  /**
+   * FREE allocator capital, raw USDG: the wallet's raw on-chain USDG balance
+   * minus the capital RESERVED by OPENING positions (reserved, not yet
+   * spent -- it is still physically in the wallet until the mint lands).
+   * NOT the raw wallet balance. See `capital/freshCapitalSnapshot.ts`'s
+   * `deriveCapitalSnapshot` for the full invariant.
+   */
   freeUsdgBalance: bigint;
+  /** Non-closed positions (OPENING + ACTIVE + CLOSING) -- a CLOSING position occupies its slot until CLOSED. */
   activePositionsCount: number;
-  /** Sum of the original deployed size (at entry) of every currently-active position, raw USDG units. */
+  /**
+   * DEPLOYED exposure, raw USDG, at cost: entry of every OPENING/ACTIVE
+   * position and every CLOSING position whose remove-liquidity has not
+   * been verified, plus -- for a CLOSING position whose remove-liquidity
+   * IS verified -- only the part of its entry not yet returned to the
+   * wallet as receipt-measured USDG (H2). `freeUsdgBalance + totalDeployedUsdg`
+   * counts every position's entry capital exactly once.
+   */
   totalDeployedUsdg: bigint;
+  /**
+   * H2: set when the snapshot cannot be trusted for sizing -- a CLOSING
+   * position's exit leg may have moved USDG on-chain without a verified,
+   * measured amount yet (see `assessRemainingExposure`). The numbers are
+   * still filled in for display, but `decideCapitalAllocation` refuses to
+   * allocate against it (fail closed).
+   */
+  accountingUnresolvedReason?: string;
   /**
    * Native ETH balance, raw wei. Optional -- only required when
    * `config.rules.capital.ETH_GAS_RESERVE_ENABLED` is true (default

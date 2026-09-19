@@ -57,7 +57,7 @@ describe('executeCriticalTransaction -- P1: resumable verification failure after
     expect(resumeDeps.broadcastRaw).not.toHaveBeenCalled();
     expect(resumeDeps.waitForReceipt).not.toHaveBeenCalled();
     expect(resumeDeps.verifyOnChain).toHaveBeenCalledTimes(1);
-    expect(resumeDeps.verifyOnChain).toHaveBeenCalledWith(TX_HASH);
+    expect(resumeDeps.verifyOnChain).toHaveBeenCalledWith(TX_HASH, expect.objectContaining({ id: expect.any(String) })); // the persisted attempt is passed along (same-attempt race fix)
   });
 
   it('repeated resumable failures never escalate to FAILED, while attemptCount keeps growing (stuck-detectable)', async () => {

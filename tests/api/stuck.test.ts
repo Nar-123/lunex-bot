@@ -1,3 +1,4 @@
+import type { InMemoryExitStateRepository } from '../exits/inMemoryExitStateRepository';
 import { describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { buildTestApp, authHeader } from './testApp';
@@ -34,7 +35,7 @@ describe('GET /positions/stuck', () => {
     const closing = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000004' }));
     await deps.positions.markActive(closing.id, '1', new Date());
     await deps.positions.markClosing(closing.id, `exit:${closing.id}:1`);
-    await deps.exitStates.update(closing.id, { swapAttemptCount: 5 });
+    await (deps.exitStates as InMemoryExitStateRepository).update(closing.id, { swapAttemptCount: 5 });
 
     const res = await request(app).get('/positions/stuck').set('Authorization', authHeader());
 
@@ -46,7 +47,7 @@ describe('GET /positions/stuck', () => {
     const closed = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000005' }));
     await deps.positions.markActive(closed.id, '1', new Date());
     await deps.positions.markClosing(closed.id, `exit:${closed.id}:1`);
-    await deps.exitStates.update(closed.id, { swapAttemptCount: 10 });
+    await (deps.exitStates as InMemoryExitStateRepository).update(closed.id, { swapAttemptCount: 10 });
     await deps.positions.markClosed(closed.id, new Date(), 'HARD_STOP_LOSS');
 
     const res = await request(app).get('/positions/stuck').set('Authorization', authHeader());

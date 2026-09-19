@@ -6,6 +6,7 @@ import type { CapitalRules } from '../../src/capital/types';
 import { config } from '../../src/config';
 import { InMemoryPositionRepository } from './inMemoryPositionRepository';
 import { makeCreateInput } from './fixtures';
+import { InMemoryTransactionAttemptRepository } from '../execution/inMemoryTransactionAttemptRepository';
 
 const WALLET = '0x9999999999999999999999999999999999999999' as Address;
 const USDG = (n: number): bigint => BigInt(n) * 10n ** 18n;
@@ -73,7 +74,7 @@ describe('PositionCapitalSnapshotProvider', () => {
       await repo.markActive(closing.id, '2', new Date());
       await repo.markClosing(closing.id, 'exit:1');
 
-      const provider = new PositionCapitalSnapshotProvider(repo, WALLET, async () => USDG(100));
+      const provider = new PositionCapitalSnapshotProvider(repo, WALLET, async () => USDG(100), new InMemoryTransactionAttemptRepository()); // H2: no exit leg started -> CLOSING-before-remove, full entry still deployed
       const snapshot = await provider.getSnapshot();
 
       // The snapshot itself must reflect the TRUE numbers, not the buggy ones.
@@ -101,7 +102,7 @@ describe('PositionCapitalSnapshotProvider', () => {
       await repo.markActive(closing.id, '2', new Date());
       await repo.markClosing(closing.id, 'exit:1');
 
-      const provider = new PositionCapitalSnapshotProvider(repo, WALLET, async () => USDG(100));
+      const provider = new PositionCapitalSnapshotProvider(repo, WALLET, async () => USDG(100), new InMemoryTransactionAttemptRepository()); // H2: no exit leg started -> CLOSING-before-remove, full entry still deployed
       const snapshot = await provider.getSnapshot();
       const decision = decideCapitalAllocation(snapshot, RULES);
 
@@ -312,6 +313,7 @@ describe('PositionCapitalSnapshotProvider', () => {
     await repo.markClosing(closing.id, 'exit:1');
     const closed = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000005' }));
     await repo.markActive(closed.id, '3', new Date());
+    await repo.markClosing(closed.id, `exit:${closed.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
     await repo.markClosed(closed.id, new Date(), 'TRAILING_TP');
 
     const provider = new PositionCapitalSnapshotProvider(repo, WALLET, async () => USDG(100));

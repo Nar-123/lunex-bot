@@ -102,15 +102,36 @@ export async function handleReport(apiClient: TelegramApiClient, ctx: Context): 
 interface StuckResponse {
   stuckTransactionAttempts: Array<{ idempotencyKey: string; status: string; attemptCount: number }>;
   stuckSwapRetryPositionIds: string[];
+  closingPositions?: Array<{
+    positionId: string;
+    tokenSymbol: string;
+    phase: string;
+    operatorActionRequired: boolean;
+    closingAgeMs: number | null;
+    tokenResidualRaw: string | null;
+    usdgRecoveredRaw: string | null;
+    lastCheckedAt: string | null;
+  }>;
 }
 
 export async function handleStuck(apiClient: TelegramApiClient, ctx: Context): Promise<void> {
   await safely(ctx, async () => {
     const r = await apiClient.get<StuckResponse>('/positions/stuck');
-    if (r.stuckTransactionAttempts.length === 0 && r.stuckSwapRetryPositionIds.length === 0) {
+    // Unroutable TOKEN leg: CLOSING positions that are not simply moving
+    // along (blocked, failing, ambiguous, or flagged for the operator).
+    const QUIET = new Set(['REMOVE_NOT_STARTED', 'REMOVE_IN_PROGRESS', 'SWAP_PENDING', 'READY_TO_FINALIZE']);
+    const closing = (r.closingPositions ?? []).filter((c) => c.operatorActionRequired || !QUIET.has(c.phase));
+    if (r.stuckTransactionAttempts.length === 0 && r.stuckSwapRetryPositionIds.length === 0 && closing.length === 0) {
       return 'Tidak ada yang stuck.';
     }
     const lines: string[] = [];
+    for (const c of closing) {
+      const age = c.closingAgeMs === null ? '?' : `${Math.floor(c.closingAgeMs / 60_000)}m`;
+      lines.push(
+        `${c.operatorActionRequired ? 'PERLU TINDAKAN OPERATOR' : 'CLOSING'}: ${c.tokenSymbol} (${c.positionId}) -- ${c.phase}, umur ${age}, ` +
+          `TOKEN tersisa ${c.tokenResidualRaw ?? '?'}, USDG kembali ${c.usdgRecoveredRaw ?? '?'}, cek terakhir ${c.lastCheckedAt ?? '-'}`,
+      );
+    }
     for (const a of r.stuckTransactionAttempts) lines.push(`Attempt stuck: ${a.idempotencyKey} (${a.status}, ${a.attemptCount}x)`);
     for (const id of r.stuckSwapRetryPositionIds) lines.push(`Swap retry stuck: position ${id}`);
     return lines.join('\n');

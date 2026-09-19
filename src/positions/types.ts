@@ -75,6 +75,30 @@ export class DuplicateActiveTokenPositionError extends Error {
   }
 }
 
+/** The mint leg's TransactionAttempt idempotencyKey for an open -- the ONE derivation, shared by `openPosition.ts` and `expireStaleOpening`. */
+export function openMintAttemptKey(openIdempotencyKey: string): string {
+  return `${openIdempotencyKey}:mint`;
+}
+
+/**
+ * H3: outcome of `PositionRepository.expireStaleOpening`.
+ *  - EXPIRED: the position was OPENING, at least `maxAgeMs` old, and its
+ *    mint provably never broadcast -- the mint attempt is now FAILED
+ *    (`OPENING_TIMEOUT`) and the position FAILED, in ONE transaction.
+ *  - NOT_OPENING / TOO_YOUNG: nothing to do.
+ *  - BLOCKED_UNRESOLVED_TX: the mint reached SIGNED/SENT/CONFIRMED -- it
+ *    may be (or become) mined, so nothing is released; the normal resume
+ *    path must resolve it first.
+ *  - MINT_VERIFIED: the mint already succeeded; the position must be
+ *    RECOVERED to ACTIVE by the normal resume path, never expired.
+ */
+export type OpeningExpiryResult =
+  | { outcome: 'EXPIRED'; mintStatusBefore: string | null }
+  | { outcome: 'NOT_OPENING' }
+  | { outcome: 'TOO_YOUNG'; ageMs: number }
+  | { outcome: 'BLOCKED_UNRESOLVED_TX'; mintStatus: string }
+  | { outcome: 'MINT_VERIFIED' };
+
 export type CreateIfCapitalAllowsResult =
   | { ok: true; record: PositionRecord }
   | { ok: false; reason: string };
@@ -198,14 +222,20 @@ export interface PositionRepository {
    * as a separate method since the two calls serve different consumers.
    */
   countNonClosed(): Promise<number>;
-  markActive(id: string, positionTokenId: string, openedAt: Date): Promise<PositionRecord>;
-  markClosing(id: string, closeIdempotencyKey: string): Promise<PositionRecord>;
+  /** OPENING -> ACTIVE only (conditional); `null` if the row is no longer OPENING -- a stale worker never moves a later state backwards. */
+  markActive(id: string, positionTokenId: string, openedAt: Date): Promise<PositionRecord | null>;
+  /** ACTIVE -> CLOSING only (conditional); `null` if not ACTIVE -- so two workers can never both start (and re-key) the same exit. */
+  markClosing(id: string, closeIdempotencyKey: string): Promise<PositionRecord | null>;
   /**
    * `realizedUsdgRaw` (optional, null = not measured) is persisted in the
    * SAME atomic update as the status transition -- the proceeds and the
    * CLOSED state can never disagree. See `PositionRecord.realizedUsdgRaw`.
    */
-  markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null): Promise<PositionRecord>;
+  /**
+   * CLOSING -> CLOSED only (conditional, and only for `expectedCloseIdempotencyKey` when given); `null` if already moved on -- a late duplicate finalization writes nothing.
+   * Cooldown crash-gap fix: in the SAME atomic transaction, and only when this call's transition wins, also records the token's exit cooldown (`TokenCooldown`, the configured duration from `closedAt` -- never "now"). A successful close and its cooldown are therefore committed together or not at all.
+   */
+  markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null, expectedCloseIdempotencyKey?: string): Promise<PositionRecord | null>;
   /**
    * P1-13 fix: idempotently backfills `realizedUsdgRaw` for a position
    * that is ALREADY CLOSED and whose value is still null (a legacy row,
@@ -250,7 +280,8 @@ export interface PositionRepository {
    * since "not in that set" is already sufficient; this method's entire
    * job is just making the transition OUT of OPENING possible at all.
    */
-  markFailed(id: string): Promise<PositionRecord>;
+  /** OPENING -> FAILED only (conditional); `null` if no longer OPENING (e.g. another worker already made it ACTIVE). */
+  markFailed(id: string): Promise<PositionRecord | null>;
   /**
    * The exit-side mirror of `markFailed` (Module 8, revision-3-of-Module-8
    * in review terms) -- reverts status CLOSING -> ACTIVE and clears
@@ -271,7 +302,8 @@ export interface PositionRepository {
    * where a definitive SWAP failure instead stays at CLOSING and retries
    * with a fresh swap-specific key, since there is no LP left to revert to.
    */
-  markExitFailed(id: string): Promise<PositionRecord>;
+  /** CLOSING -> ACTIVE only for THIS close attempt (`closeIdempotencyKey` must match); `null` otherwise -- a stale worker can never revert a newer close or a CLOSED position. */
+  markExitFailed(id: string, closeIdempotencyKey: string): Promise<PositionRecord | null>;
   /**
    * C7 concurrency fix, P0-1 hardened: atomic compare-and-swap claim --
    * succeeds ONLY if `id` is currently at `expectedStatus` AND was not
@@ -323,4 +355,21 @@ export interface PositionRepository {
    * claim to expiry.
    */
   releaseResumeClaim(id: string, token: string): Promise<boolean>;
+  /**
+   * H3: bounds how long an OPENING position may hold reserved capital, a
+   * slot and its token -- WITHOUT ever releasing them while its entry could
+   * still succeed. Age comes from the persisted `createdAt` (restart-safe,
+   * never process uptime). In ONE write-locked transaction (CapitalLock
+   * touched first, same as `createIfCapitalAllows`): re-reads the row and
+   * its mint attempt; if the mint is absent or still before SIGNED
+   * (`executeCriticalTransaction` persists SIGNED before it broadcasts, so
+   * "before SIGNED" proves nothing was ever broadcast), it FENCES the mint
+   * key -- creating it FAILED, or CAS-updating it to FAILED with a version
+   * bump so any in-flight worker's SIGNED write fails and it can never
+   * broadcast -- and moves the position OPENING -> FAILED conditionally
+   * (`WHERE status = 'OPENING'`). SIGNED/SENT/CONFIRMED -> blocked;
+   * VERIFIED -> left for recovery to ACTIVE. Idempotent and race-safe: a
+   * second caller sees NOT_OPENING.
+   */
+  expireStaleOpening(id: string, maxAgeMs: number, now: Date): Promise<OpeningExpiryResult>;
 }

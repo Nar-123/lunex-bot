@@ -1,3 +1,4 @@
+import type { InMemoryExitStateRepository } from '../exits/inMemoryExitStateRepository';
 import { describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { buildTestApp, authHeader } from './testApp';
@@ -34,7 +35,7 @@ describe('GET /positions', () => {
     const { app, deps } = buildTestApp();
     const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
     await deps.positions.markActive(created.id, '1', new Date());
-    await deps.exitStates.update(created.id, { oorStartedAt: new Date(Date.now() - 5 * 60 * 1000) });
+    await (deps.exitStates as InMemoryExitStateRepository).update(created.id, { oorStartedAt: new Date(Date.now() - 5 * 60 * 1000) });
 
     const res = await request(app).get('/positions').set('Authorization', authHeader());
 
@@ -49,6 +50,7 @@ describe('GET /positions?status=closed (Module 11)', () => {
     const { app, deps } = buildTestApp();
     const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002' }));
     await deps.positions.markActive(created.id, '1', new Date());
+    await deps.positions.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
     await deps.positions.markClosed(created.id, new Date(), 'HARD_STOP_LOSS');
 
     const res = await request(app).get('/positions?status=closed').set('Authorization', authHeader());
@@ -69,6 +71,7 @@ describe('GET /positions?status=closed (Module 11)', () => {
     await deps.positions.markActive(created.id, '1', new Date());
     // 90 USDG remove-liquidity proceeds + 10 USDG swap proceeds = 100 total;
     // entry is 1000 USDG -> realized PnL = -900 USDG, raw-exact.
+    await deps.positions.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
     await deps.positions.markClosed(created.id, new Date(), 'TRAILING_TP', (90n + 10n) * 10n ** 18n);
 
     const res = await request(app).get('/positions?status=closed').set('Authorization', authHeader());
@@ -86,6 +89,7 @@ describe('GET /positions?status=closed (Module 11)', () => {
     await deps.positions.markActive(active.id, '1', new Date());
     const closed = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000004' }));
     await deps.positions.markActive(closed.id, '2', new Date());
+    await deps.positions.markClosing(closed.id, `exit:${closed.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
     await deps.positions.markClosed(closed.id, new Date(), 'TRAILING_TP');
 
     const res = await request(app).get('/positions?status=closed').set('Authorization', authHeader());

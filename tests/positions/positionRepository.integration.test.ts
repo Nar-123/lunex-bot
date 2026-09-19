@@ -10,7 +10,12 @@ import { DuplicateActiveTokenPositionError } from '../../src/positions/types';
 import type { CapitalRules } from '../../src/capital/types';
 import Database from 'better-sqlite3';
 import { decideCapitalAllocation } from '../../src/capital/decideCapitalAllocation';
+import { PrismaTransactionAttemptRepository } from '../../src/execution/transactionAttemptRepository';
+import { StaleTransactionAttemptWriteError } from '../../src/execution/types';
+import { PositionCapitalSnapshotProvider } from '../../src/positions/capitalSnapshotProvider';
 import { makeCreateInput } from './fixtures';
+
+const WALLET_H2 = '0x9999999999999999999999999999999999999999' as Address;
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const TEST_DB_PATH = path.resolve(PROJECT_ROOT, 'data', 'test-positions-integration.db');
@@ -68,7 +73,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
   it('markActive transitions status and sets positionTokenId/openedAt', async () => {
     const created = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000004' }));
     const openedAt = new Date();
-    const updated = await repo.markActive(created.id, '777', openedAt);
+    const updated = (await repo.markActive(created.id, '777', openedAt))!;
     expect(updated.status).toBe('ACTIVE');
     expect(updated.positionTokenId).toBe('777');
     expect(updated.openedAt?.getTime()).toBe(openedAt.getTime());
@@ -77,6 +82,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
   it('markClosed excludes the position from findActiveByToken and findAllActive', async () => {
     const created = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000005' }));
     await repo.markActive(created.id, '1', new Date());
+    await repo.markClosing(created.id, 'exit:excl-1'); // stale-writer fix: CLOSED is only reachable from CLOSING
     await repo.markClosed(created.id, new Date(), 'HARD_STOP_LOSS');
 
     expect(await repo.findActiveByToken('0x0000000000000000000000000000000000000005')).toBeNull();
@@ -91,7 +97,8 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
     // A routine 18-decimal proceeds figure -- far beyond SQLite's signed
     // INTEGER range, stored as a decimal string like every other raw field.
     const proceeds = 970_123_456_789n * 10n ** 18n;
-    const closed = await repo.markClosed(created.id, new Date(), 'HARD_TP', proceeds);
+    await repo.markClosing(created.id, 'exit:proceeds-1');
+    const closed = (await repo.markClosed(created.id, new Date(), 'HARD_TP', proceeds))!;
 
     expect(closed.status).toBe('CLOSED');
     expect(closed.realizedUsdgRaw).toBe(proceeds); // strict equality, not closeTo
@@ -103,6 +110,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
   it('VALIDATION PHASE: markClosed without proceeds leaves realizedUsdgRaw honestly null (never 0-as-placeholder), against a real DB', async () => {
     const created = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000022' }));
     await repo.markActive(created.id, '1', new Date());
+    await repo.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
     await repo.markClosed(created.id, new Date(), 'OOR_TIMEOUT'); // legacy-style call: no proceeds argument
 
     const reloaded = await repo.findById(created.id);
@@ -114,6 +122,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
     it('backfills a null realizedUsdgRaw on a CLOSED position, against a real DB', async () => {
       const created = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000023' }));
       await repo.markActive(created.id, '1', new Date());
+      await repo.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
       await repo.markClosed(created.id, new Date(), 'HARD_STOP_LOSS'); // no proceeds -- null
 
       const proceeds = 970n * 10n ** 18n;
@@ -128,6 +137,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
       const created = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000024' }));
       await repo.markActive(created.id, '1', new Date());
       const original = 500n * 10n ** 18n;
+      await repo.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
       await repo.markClosed(created.id, new Date(), 'HARD_TP', original);
 
       const result = await repo.backfillRealizedUsdgRaw(created.id, 999n * 10n ** 18n);
@@ -152,6 +162,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
     it('concurrency: many genuinely concurrent backfill calls for the SAME position -- exactly one write lands, never a double-write', async () => {
       const created = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000026' }));
       await repo.markActive(created.id, '1', new Date());
+      await repo.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
       await repo.markClosed(created.id, new Date(), 'HARD_STOP_LOSS');
 
       const attempts = await Promise.all(Array.from({ length: 5 }, (_, i) => repo.backfillRealizedUsdgRaw(created.id, BigInt(i + 1) * 10n ** 18n)));
@@ -184,6 +195,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
     await repo.markClosing(closing.id, 'exit:integration-1');
     const closed = await repo.create(makeCreateInput({ tokenAddress: '0x000000000000000000000000000000000000000c' }));
     await repo.markActive(closed.id, '3', new Date());
+    await repo.markClosing(closed.id, `exit:${closed.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
     await repo.markClosed(closed.id, new Date(), 'HARD_STOP_LOSS');
 
     const deployed = await repo.findDeployedPositions();
@@ -200,6 +212,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
     const opening = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000006' }));
     const toClose = await repo.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000007' }));
     await repo.markActive(toClose.id, '1', new Date());
+    await repo.markClosing(toClose.id, `exit:${toClose.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
     await repo.markClosed(toClose.id, new Date(), 'OOR_TIMEOUT');
 
     const after = await repo.countNonClosed();
@@ -227,7 +240,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
     await repo.markActive(created.id, '1', new Date());
     await repo.markClosing(created.id, 'exit:integration-failed-1');
 
-    const reverted = await repo.markExitFailed(created.id);
+    const reverted = (await repo.markExitFailed(created.id, 'exit:integration-failed-1'))!;
     expect(reverted.status).toBe('ACTIVE');
     expect(reverted.closeIdempotencyKey).toBeNull();
 
@@ -249,7 +262,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
     const created = await repo.create(makeCreateInput({ tokenAddress: '0x000000000000000000000000000000000000000d' }));
     const before = await repo.countNonClosed();
 
-    const failed = await repo.markFailed(created.id);
+    const failed = (await repo.markFailed(created.id))!;
     expect(failed.status).toBe('FAILED');
 
     const after = await repo.countNonClosed();
@@ -444,6 +457,7 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
       const token = '0x00000000000000000000000000000000000000b3';
       const first = await repo.create(makeCreateInput({ tokenAddress: token, openIdempotencyKey: 'deploy:b3:first' }));
       await repo.markActive(first.id, '1', new Date());
+      await repo.markClosing(first.id, `exit:${first.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
       await repo.markClosed(first.id, new Date(), 'HARD_STOP_LOSS');
 
       const second = await repo.create(makeCreateInput({ tokenAddress: token, openIdempotencyKey: 'deploy:b3:second' }));
@@ -897,6 +911,265 @@ describe('PrismaPositionRepository (real SQLite DB, real migration)', () => {
           }
         }),
       20_000,
+    );
+    // ------------------------------------------------------------------
+    // H2 (real SQLite DB): a CLOSING position whose remove-liquidity already
+    // returned USDG is never counted twice -- neither by the sizing snapshot
+    // nor by the CapitalLock write-time re-check -- across restarts,
+    // concurrent processes, and an exit landing mid-reservation.
+    // True portfolio in every case below: 1000.
+    //   A: ACTIVE, entry 350.
+    //   B: CLOSING, entry 350; its burn returned 345 USDG + some TOKEN still
+    //      to swap (unrecovered cost basis 5).
+    //   Raw wallet: 1000 - 350 (A) - 350 (B) + 345 (returned) = 645.
+    // Pre-H2 figure: 645 + 350 + 350 = 1345 (35% -> ~470).
+    // ------------------------------------------------------------------
+    const H2_WALLET = 645n * U;
+
+    async function seedH2Book(repoH2: PrismaPositionRepository, attempts: PrismaTransactionAttemptRepository, removeStatus: 'VERIFIED' | 'NONCE_ASSIGNED') {
+      const a = await repoH2.create(makeCreateInput({ tokenAddress: '0x00000000000000000000000000000000000000a1', entryUsdgRaw: 350n * U, openIdempotencyKey: 'deploy:h2a' }));
+      await repoH2.markActive(a.id, '101', new Date());
+      const b = await repoH2.create(makeCreateInput({ tokenAddress: '0x00000000000000000000000000000000000000b1', entryUsdgRaw: 350n * U, openIdempotencyKey: 'deploy:h2b' }));
+      await repoH2.markActive(b.id, '102', new Date());
+      const closeKey = `exit:${b.id}:h2`;
+      await repoH2.markClosing(b.id, closeKey);
+      const remove = await attempts.create(`${closeKey}:removeLiquidity`, 'exit:removeLiquidity');
+      if (removeStatus === 'VERIFIED') {
+        await attempts.update(remove.id, { status: 'VERIFIED', txHash: `0x${'aa'.repeat(32)}`, verifyData: { liquidityZero: true, usdgProceedsRaw: 345n * U, tokenProceedsRaw: 5n } });
+      } else {
+        await attempts.update(remove.id, { status: 'NONCE_ASSIGNED', nonce: 3 });
+      }
+      return { closeKey, removeId: remove.id };
+    }
+
+    it(
+      'H2 REGRESSION (real DB): with B CLOSING after its burn returned 345 USDG, the snapshot base is the TRUE 1000 (not 1345), identical after a restart (new PrismaClient); the write-time re-check rejects the pre-H2 inflated 470 and accepts 350',
+      () =>
+        withFreshCapDb(async (repoH2, p, dbUrl) => {
+          const attempts = new PrismaTransactionAttemptRepository(p);
+          await seedH2Book(repoH2, attempts, 'VERIFIED');
+
+          const snapshot = await new PositionCapitalSnapshotProvider(repoH2, WALLET_H2, async () => H2_WALLET, attempts).getSnapshot();
+          expect(snapshot).toEqual({ freeUsdgBalance: 645n * U, totalDeployedUsdg: 355n * U, activePositionsCount: 2 });
+          expect(snapshot.freeUsdgBalance + snapshot.totalDeployedUsdg).toBe(1000n * U);
+
+          // Restart: a fresh client over the same DB file reconstructs the same accounting.
+          const restartedClient = new PrismaClient({ adapter: new PrismaBetterSqlite3({ url: dbUrl }) });
+          try {
+            const restarted = new PositionCapitalSnapshotProvider(new PrismaPositionRepository(restartedClient), WALLET_H2, async () => H2_WALLET, new PrismaTransactionAttemptRepository(restartedClient));
+            expect(await restarted.getSnapshot()).toEqual(snapshot);
+          } finally {
+            await restartedClient.$disconnect();
+          }
+
+          const legacy = decideCapitalAllocation({ freeUsdgBalance: H2_WALLET, totalDeployedUsdg: 700n * U, activePositionsCount: 2 }, PROD_RULES);
+          expect(legacy.ok && legacy.positionSizeUsdgRaw > 470n * U).toBe(true); // what pre-H2 accounting would have sized
+
+          const inflated = await repoH2.createIfCapitalAllows(makeCreateInput({ tokenAddress: '0x00000000000000000000000000000000000000c1', entryUsdgRaw: 470n * U, openIdempotencyKey: 'deploy:h2c1' }), async () => H2_WALLET, PROD_RULES);
+          expect(inflated.ok).toBe(false);
+          const correct = await repoH2.createIfCapitalAllows(makeCreateInput({ tokenAddress: '0x00000000000000000000000000000000000000c2', entryUsdgRaw: 350n * U, openIdempotencyKey: 'deploy:h2c2' }), async () => H2_WALLET, PROD_RULES);
+          expect(correct.ok).toBe(true);
+        }),
+      30_000,
+    );
+
+    it(
+      'H2 race (real DB): A reads capital, B\'s exit lands, A enters -- (i) B\'s burn is on-chain but only SENT when A takes the lock -> A fails closed; (ii) B\'s burn VERIFIED after A\'s balance read -> A is sized conservatively, never inflated',
+      () =>
+        withFreshCapDb(async (repoH2, p) => {
+          const attempts = new PrismaTransactionAttemptRepository(p);
+          const { removeId } = await seedH2Book(repoH2, attempts, 'NONCE_ASSIGNED');
+          const walletBeforeBurn = 300n * U; // 1000 - 350 - 350
+
+          // (i) B signs + broadcasts and the burn lands during A's balance read: A sees the returned USDG, but B's attempt is not verified yet.
+          const unresolved = await repoH2.createIfCapitalAllows(
+            makeCreateInput({ tokenAddress: '0x00000000000000000000000000000000000000c3', entryUsdgRaw: 350n * U, openIdempotencyKey: 'deploy:h2c3' }),
+            async () => {
+              await attempts.update(removeId, { status: 'SENT', txHash: `0x${'bb'.repeat(32)}` });
+              return H2_WALLET;
+            },
+            PROD_RULES,
+          );
+          expect(unresolved.ok).toBe(false);
+          if (!unresolved.ok) expect(unresolved.reason).toMatch(/capital accounting unresolved \(fail-closed\).*removeLiquidity is SENT/);
+          expect(await p.position.count({ where: { tokenAddress: '0x00000000000000000000000000000000000000c3' } })).toBe(0);
+
+          // (ii) A's balance read happened BEFORE the burn's USDG arrived; by the time A holds the lock, B is VERIFIED.
+          await attempts.update(removeId, { status: 'NONCE_ASSIGNED' }); // reset the scenario
+          const conservative = await repoH2.createIfCapitalAllows(
+            makeCreateInput({ tokenAddress: '0x00000000000000000000000000000000000000c4', entryUsdgRaw: 350n * U, openIdempotencyKey: 'deploy:h2c4' }),
+            async () => {
+              const balanceReadNow = walletBeforeBurn;
+              await attempts.update(removeId, { status: 'VERIFIED', txHash: `0x${'cc'.repeat(32)}`, verifyData: { liquidityZero: true, usdgProceedsRaw: 345n * U, tokenProceedsRaw: 5n } });
+              return balanceReadNow;
+            },
+            PROD_RULES,
+          );
+          // base = 300 + 350 + 5 = 655 (below the true 1000 -- conservative): target 229.25 < 350 -> rejected, never over-sized.
+          expect(conservative.ok).toBe(false);
+          if (!conservative.ok) expect(conservative.reason).toMatch(/now available/);
+        }),
+      30_000,
+    );
+
+    it(
+      'H2 cross-process (real OS processes, real CapitalLock): B CLOSING with returned USDG in the wallet; four processes race (three at 350, one at the pre-H2-inflated 470) -> exactly one 350 reserves (3-position cap incl. the CLOSING slot), the 470 is always rejected, TRUE exposure stays <= 95%',
+      () =>
+        withFreshCapDb(async (repoH2, p, dbUrl) => {
+          await seedH2Book(repoH2, new PrismaTransactionAttemptRepository(p), 'VERIFIED');
+          const results = await Promise.all([
+            runCapitalWorker(dbUrl, '0x00000000000000000000000000000000000000d7', 350n * U, 'deploy:h2d7', H2_WALLET, PROD_RULES),
+            runCapitalWorker(dbUrl, '0x00000000000000000000000000000000000000d8', 350n * U, 'deploy:h2d8', H2_WALLET, PROD_RULES),
+            runCapitalWorker(dbUrl, '0x00000000000000000000000000000000000000d9', 350n * U, 'deploy:h2d9', H2_WALLET, PROD_RULES),
+            runCapitalWorker(dbUrl, '0x00000000000000000000000000000000000000da', 470n * U, 'deploy:h2da', H2_WALLET, PROD_RULES),
+          ]);
+          expect(results.filter((r) => 'threw' in r)).toEqual([]);
+          expect(results.filter((r) => r.ok === true)).toHaveLength(1);
+          expect(results[3]!.ok).toBe(false);
+
+          const newRows = await p.position.findMany({ where: { tokenAddress: { in: ['0x00000000000000000000000000000000000000d7', '0x00000000000000000000000000000000000000d8', '0x00000000000000000000000000000000000000d9', '0x00000000000000000000000000000000000000da'] } } });
+          expect(newRows).toHaveLength(1);
+          expect(BigInt(newRows[0]!.entryUsdgRaw)).toBe(350n * U);
+          // TRUE exposure after: A 350 + B's unswapped residual 5 + new 350 = 705 of 1000.
+          const trueExposure = 350n * U + 5n * U + 350n * U;
+          expect(trueExposure * 100n <= 1000n * U * 95n).toBe(true);
+        }),
+      90_000,
+    );
+    // ------------------------------------------------------------------
+    // H3 (real SQLite DB): bounded OPENING lifetime -- persisted age across
+    // restarts, cross-process exclusivity, the version fence on the real
+    // TransactionAttempt table, and CapitalLock reuse only when released.
+    // ------------------------------------------------------------------
+    const TTL_H3 = 30 * 60 * 1000;
+
+    async function agedOpening(repoH3: PrismaPositionRepository, p: PrismaClient, token: string, key: string, mintStatus: 'NONE' | 'PENDING' | 'NONCE_ASSIGNED' | 'SENT') {
+      const created = await repoH3.create(makeCreateInput({ tokenAddress: token as Address, entryUsdgRaw: 350n * U, openIdempotencyKey: key }));
+      const attempts = new PrismaTransactionAttemptRepository(p);
+      if (mintStatus !== 'NONE') {
+        const mint = await attempts.create(`${key}:mint`, 'deploy:mint');
+        if (mintStatus === 'NONCE_ASSIGNED') await attempts.update(mint.id, { status: 'NONCE_ASSIGNED', nonce: 5 });
+        if (mintStatus === 'SENT') await attempts.update(mint.id, { status: 'SENT', nonce: 5, rawTx: '0xdeadbeef', txHash: `0x${'aa'.repeat(32)}` });
+      }
+      const { createdAt } = await p.position.findUniqueOrThrow({ where: { id: created.id }, select: { createdAt: true } });
+      return { id: created.id, createdAt, attempts };
+    }
+
+    it(
+      'H3 restart (real DB): the OPENING age comes from the persisted createdAt -- a new PrismaClient (process restart) sees the SAME age; claims/touches never reset it; TTL-1 -> TOO_YOUNG, TTL -> EXPIRED',
+      () =>
+        withFreshCapDb(async (repoH3, p, dbUrl) => {
+          const { id, createdAt } = await agedOpening(repoH3, p, '0x00000000000000000000000000000000000000e7', 'deploy:h3r', 'PENDING');
+          const token = await repoH3.claimForResume(id, 'OPENING', 20_000); // touches updatedAt, not createdAt
+          if (token) await repoH3.releaseResumeClaim(id, token);
+          expect(await repoH3.expireStaleOpening(id, TTL_H3, new Date(createdAt.getTime() + TTL_H3 - 1))).toEqual({ outcome: 'TOO_YOUNG', ageMs: TTL_H3 - 1 });
+
+          const restarted = new PrismaClient({ adapter: new PrismaBetterSqlite3({ url: dbUrl }) });
+          try {
+            const after = await restarted.position.findUniqueOrThrow({ where: { id }, select: { createdAt: true } });
+            expect(after.createdAt.getTime()).toBe(createdAt.getTime());
+            expect(await new PrismaPositionRepository(restarted).expireStaleOpening(id, TTL_H3, new Date(createdAt.getTime() + TTL_H3))).toEqual({ outcome: 'EXPIRED', mintStatusBefore: 'PENDING' });
+          } finally {
+            await restarted.$disconnect();
+          }
+          expect((await p.position.findUniqueOrThrow({ where: { id } })).status).toBe('FAILED');
+          expect(await p.transactionAttempt.findUniqueOrThrow({ where: { idempotencyKey: 'deploy:h3r:mint' } })).toMatchObject({ status: 'FAILED', failureCode: 'OPENING_TIMEOUT' });
+        }),
+      30_000,
+    );
+
+    it(
+      'H3 cross-process (real OS processes): two separate processes expire the SAME aged OPENING at once -> exactly one EXPIRED, the other NOT_OPENING; the fence is applied exactly once',
+      () =>
+        withFreshCapDb(async (repoH3, p, dbUrl) => {
+          const { id, createdAt } = await agedOpening(repoH3, p, '0x00000000000000000000000000000000000000e8', 'deploy:h3c', 'NONCE_ASSIGNED');
+          const versionBefore = (await p.transactionAttempt.findUniqueOrThrow({ where: { idempotencyKey: 'deploy:h3c:mint' } })).version;
+          const now = new Date(createdAt.getTime() + TTL_H3 + 1).toISOString();
+          const worker = path.resolve(__dirname, 'openingExpiryWorker.ts');
+          const run = () =>
+            new Promise<Record<string, unknown>>((resolve, reject) => {
+              const child = spawn(process.execPath, [TS_NODE_BIN, '--transpile-only', worker, dbUrl, id, String(TTL_H3), now], { cwd: PROJECT_ROOT, env: process.env });
+              let out = '';
+              child.stdout.on('data', (d) => (out += d.toString()));
+              child.on('close', () => {
+                const line = out.trim().split('\n').filter(Boolean).pop();
+                if (!line) reject(new Error('openingExpiryWorker produced no output'));
+                else resolve(JSON.parse(line));
+              });
+            });
+          const results = await Promise.all([run(), run()]);
+          expect(results.map((r) => r.outcome).sort()).toEqual(['EXPIRED', 'NOT_OPENING']);
+          const mint = await p.transactionAttempt.findUniqueOrThrow({ where: { idempotencyKey: 'deploy:h3c:mint' } });
+          expect(mint).toMatchObject({ status: 'FAILED', failureCode: 'OPENING_TIMEOUT' });
+          expect(mint.version).toBe(versionBefore + 1); // fenced exactly once
+        }),
+      90_000,
+    );
+
+    it(
+      'H3 fence (real DB): a worker holding the pre-timeout attempt snapshot cannot write SIGNED afterwards -- the real repository rejects it with StaleTransactionAttemptWriteError, so it can never broadcast',
+      () =>
+        withFreshCapDb(async (repoH3, p) => {
+          const { id, createdAt, attempts } = await agedOpening(repoH3, p, '0x00000000000000000000000000000000000000e9', 'deploy:h3f', 'NONCE_ASSIGNED');
+          const workerSnapshot = (await attempts.find('deploy:h3f:mint'))!;
+          expect((await repoH3.expireStaleOpening(id, TTL_H3, new Date(createdAt.getTime() + TTL_H3))).outcome).toBe('EXPIRED');
+          await expect(attempts.update(workerSnapshot.id, { status: 'SIGNED', rawTx: '0xdeadbeef', txHash: `0x${'bb'.repeat(32)}` }, workerSnapshot.version)).rejects.toBeInstanceOf(StaleTransactionAttemptWriteError);
+          expect((await attempts.find('deploy:h3f:mint'))?.status).toBe('FAILED');
+        }),
+      30_000,
+    );
+
+    async function twoActive(repoH3: PrismaPositionRepository, tag: string) {
+      const a = await repoH3.create(makeCreateInput({ tokenAddress: `0x00000000000000000000000000000000000000a${tag}` as Address, entryUsdgRaw: 150n * U, openIdempotencyKey: `deploy:h3a${tag}` }));
+      await repoH3.markActive(a.id, `30${tag}`, new Date());
+      const b = await repoH3.create(makeCreateInput({ tokenAddress: `0x00000000000000000000000000000000000000b${tag}` as Address, entryUsdgRaw: 150n * U, openIdempotencyKey: `deploy:h3b${tag}` }));
+      await repoH3.markActive(b.id, `31${tag}`, new Date());
+    }
+
+    it(
+      'H3 + CapitalLock (real DB): an aged OPENING whose mint is SENT (possibly on-chain) is NEVER released -- its capital stays reserved, its slot still counts (a new entry is refused 3/3) and its token stays locked',
+      () =>
+        withFreshCapDb(async (repoH3, p) => {
+          await twoActive(repoH3, '4');
+          const xToken = '0x00000000000000000000000000000000000000f4';
+          const x = await agedOpening(repoH3, p, xToken, 'deploy:h3x', 'SENT');
+          const wallet = 700n * U; // 1000 - 150 - 150; X's 350 is still in the wallet, reserved
+
+          expect(await repoH3.expireStaleOpening(x.id, TTL_H3, new Date(x.createdAt.getTime() + TTL_H3 * 10))).toEqual({ outcome: 'BLOCKED_UNRESOLVED_TX', mintStatus: 'SENT' });
+          expect((await p.position.findUniqueOrThrow({ where: { id: x.id } })).status).toBe('OPENING');
+
+          const snapshot = await new PositionCapitalSnapshotProvider(repoH3, WALLET_H2, async () => wallet, x.attempts).getSnapshot();
+          expect(snapshot).toEqual({ freeUsdgBalance: 350n * U, totalDeployedUsdg: 650n * U, activePositionsCount: 3 });
+
+          const entry = await repoH3.createIfCapitalAllows(makeCreateInput({ tokenAddress: '0x00000000000000000000000000000000000000c4', entryUsdgRaw: 100n * U, openIdempotencyKey: 'deploy:h3c4' }), async () => wallet, PROD_RULES);
+          expect(entry.ok).toBe(false);
+          if (!entry.ok) expect(entry.reason).toMatch(/max active positions reached \(3\/3\)/);
+          await expect(repoH3.create(makeCreateInput({ tokenAddress: xToken as Address, openIdempotencyKey: 'deploy:h3x-dup' }))).rejects.toBeInstanceOf(DuplicateActiveTokenPositionError);
+        }),
+      30_000,
+    );
+
+    it(
+      'H3 + CapitalLock (real DB): an aged OPENING that never broadcast is released -- afterwards a new entry through the REAL CapitalLock re-check can use the released capital, the freed slot and the SAME token',
+      () =>
+        withFreshCapDb(async (repoH3, p) => {
+          await twoActive(repoH3, '5');
+          const yToken = '0x00000000000000000000000000000000000000f5';
+          const y = await agedOpening(repoH3, p, yToken, 'deploy:h3y', 'PENDING');
+          const wallet = 700n * U;
+
+          const before = await repoH3.createIfCapitalAllows(makeCreateInput({ tokenAddress: '0x00000000000000000000000000000000000000c5', entryUsdgRaw: 100n * U, openIdempotencyKey: 'deploy:h3c5' }), async () => wallet, PROD_RULES);
+          expect(before.ok).toBe(false); // 3/3 while Y holds its slot
+
+          expect((await repoH3.expireStaleOpening(y.id, TTL_H3, new Date(y.createdAt.getTime() + TTL_H3))).outcome).toBe('EXPIRED');
+          const snapshot = await new PositionCapitalSnapshotProvider(repoH3, WALLET_H2, async () => wallet, y.attempts).getSnapshot();
+          expect(snapshot).toEqual({ freeUsdgBalance: 700n * U, totalDeployedUsdg: 300n * U, activePositionsCount: 2 });
+          expect(snapshot.freeUsdgBalance + snapshot.totalDeployedUsdg).toBe(1000n * U); // H2 invariant intact
+
+          const reuse = await repoH3.createIfCapitalAllows(makeCreateInput({ tokenAddress: yToken as Address, entryUsdgRaw: 350n * U, openIdempotencyKey: 'deploy:h3y2' }), async () => wallet, PROD_RULES);
+          expect(reuse.ok).toBe(true);
+        }),
+      30_000,
     );
   });
 });

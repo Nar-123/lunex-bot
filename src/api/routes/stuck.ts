@@ -4,6 +4,8 @@ import { config } from '../../config';
 import { filterToClosingPositions } from '../../exits/stuckSwapRetries';
 import { runReconciliation } from '../../reconciliation/runReconciliation';
 import type { AppDeps } from '../../composition/types';
+import { assessClosingRecovery } from '../../exits/closingRecovery';
+import { exitLegKeyPrefix } from '../../capital/freshCapitalSnapshot';
 
 /**
  * `GET /positions/stuck` -- pure surfacing of already-built primitives, no
@@ -42,7 +44,24 @@ export function createStuckRouter(deps: AppDeps): Router {
       { includeOrphanScan: false },
     );
 
+    // Unroutable TOKEN leg: every CLOSING position's exit phase, derived
+    // ONLY from durable state (no live quote/balance read), with
+    // `operatorActionRequired` set by the existing stuck policies. Read-only.
+    const now = new Date();
+    const closingPositions = [];
+    for (const position of currentlyClosing) {
+      const legs = position.closeIdempotencyKey ? await deps.txAttempts.findByKeyPrefixes([exitLegKeyPrefix(position.closeIdempotencyKey)]) : [];
+      const r = assessClosingRecovery(position, legs, await deps.exitStates.getOrCreate(position.id), now);
+      closingPositions.push({
+        ...r,
+        tokenResidualRaw: r.tokenResidualRaw === null ? null : r.tokenResidualRaw.toString(),
+        usdgRecoveredRaw: r.usdgRecoveredRaw === null ? null : r.usdgRecoveredRaw.toString(),
+      });
+    }
+
     res.status(200).json({
+      closingPositions,
+      operatorActionRequiredPositionIds: closingPositions.filter((c) => c.operatorActionRequired).map((c) => c.positionId),
       stuckTransactionAttempts: stuckAttempts.map((a) => ({
         id: a.id,
         idempotencyKey: a.idempotencyKey,

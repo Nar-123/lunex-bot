@@ -684,4 +684,18 @@ export const EXECUTION = {
   /// 15s exit cycle's OPENING-resume pass on a brand-new position); it
   /// never blocks or delays genuine crash recovery beyond one tick.
   RESUME_CLAIM_FRESHNESS_MS: 20 * 1000,
+  /// H3: maximum age of an OPENING position (measured from its persisted
+  /// `Position.createdAt`, i.e. the moment its capital was reserved) after
+  /// which -- and ONLY if its mint provably was never broadcast -- it is
+  /// terminally marked FAILED, releasing its reserved capital, its slot
+  /// and its token. Not a new number: it IS the screening cadence
+  /// (`DISCOVERY.CYCLE_INTERVAL_MS`), by reference, because the entry
+  /// flow's own documented policy (`positions/openPosition.ts`) is that a
+  /// candidate that cannot complete is NOT retried on stale parameters --
+  /// "the correct retry is the NEXT screening cycle evaluating fresh
+  /// candidates against fresh prices". An OPENING reservation older than
+  /// one cycle is therefore holding capital for a decision the strategy
+  /// already considers superseded. Change it here (or change the cadence)
+  /// -- never hardcode a separate value elsewhere. See `positions/openingTimeout.ts`.
+  OPENING_MAX_AGE_MS: DISCOVERY.CYCLE_INTERVAL_MS,
 } as const;

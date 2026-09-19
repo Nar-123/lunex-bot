@@ -8,7 +8,7 @@ import { executeCriticalTransaction } from '../execution/executeCriticalTransact
 import type { TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring/types';
 import type { CreatePositionInput, PositionPoolContext, PositionRecord, PositionRepository } from './types';
-import { DuplicateActiveTokenPositionError } from './types';
+import { DuplicateActiveTokenPositionError, openMintAttemptKey } from './types';
 import type { CapitalRules } from '../capital/types';
 import { buildApproveDeps as realBuildApproveDeps, needsApproval, type ApproveVerifyData } from './approveTx';
 import { buildMintDeps as realBuildMintDeps, type MintInput, type MintVerifyData } from './mintTx';
@@ -212,14 +212,13 @@ async function executeOpenClaimed(position: PositionRecord, deps: OpenPositionDe
 
     if (!approveResult.ok) {
       if (!approveResult.resumable) {
-        await deps.positions.markFailed(position.id);
-        return { outcome: 'FAILED', reason: approveResult.reason };
+        return fail(position, approveResult.reason, deps);
       }
       return { outcome: 'PENDING', reason: approveResult.reason };
     }
   }
 
-  const mintKey = `${position.openIdempotencyKey}:mint`;
+  const mintKey = openMintAttemptKey(position.openIdempotencyKey);
   const mintInput: MintInput = {
     tokenAddress: position.tokenAddress,
     tokenSymbol: position.tokenSymbol,
@@ -234,8 +233,7 @@ async function executeOpenClaimed(position: PositionRecord, deps: OpenPositionDe
 
   if (!mintResult.ok) {
     if (!mintResult.resumable) {
-      await deps.positions.markFailed(position.id);
-      return { outcome: 'FAILED', reason: mintResult.reason };
+      return fail(position, mintResult.reason, deps);
     }
     return { outcome: 'PENDING', reason: mintResult.reason };
   }
@@ -255,8 +253,7 @@ async function executeOpenClaimed(position: PositionRecord, deps: OpenPositionDe
     if (attempt?.txHash) {
       try {
         const tokenId = await discoverTokenId(attempt.txHash, positionManagerAddress, wallet);
-        const updated = await deps.positions.markActive(position.id, tokenId.toString(), new Date());
-        return { outcome: 'ACTIVE', position: updated };
+        return await activate(position, tokenId.toString(), deps);
       } catch {
         // Ambiguous -- fall through to PENDING below. Never markFailed: the
         // mint is VERIFIED, i.e. already confirmed successful on-chain.
@@ -265,6 +262,29 @@ async function executeOpenClaimed(position: PositionRecord, deps: OpenPositionDe
     return { outcome: 'PENDING', reason: 'mint verified on-chain but positionTokenId could not be recovered yet' };
   }
 
-  const updated = await deps.positions.markActive(position.id, mintResult.data.positionTokenId, new Date());
-  return { outcome: 'ACTIVE', position: updated };
+  return activate(position, mintResult.data.positionTokenId, deps);
+}
+
+/**
+ * Stale-writer fix: `markActive` is conditional on OPENING. If it wrote
+ * nothing, another worker already moved the row: the same mint recorded
+ * as ACTIVE is idempotent success; anything else is reported, never
+ * overwritten (a late worker must not drag a CLOSING/CLOSED position back
+ * to ACTIVE).
+ */
+async function activate(position: PositionRecord, positionTokenId: string, deps: OpenPositionDeps): Promise<OpenPositionOutcome> {
+  const updated = await deps.positions.markActive(position.id, positionTokenId, new Date());
+  if (updated) return { outcome: 'ACTIVE', position: updated };
+  const current = await deps.positions.findById(position.id);
+  if (current?.status === 'ACTIVE' && current.positionTokenId === positionTokenId) return { outcome: 'ACTIVE', position: current };
+  return { outcome: 'PENDING', reason: `mint verified but the position is no longer OPENING (now ${current?.status ?? 'missing'}) -- not moved backwards` };
+}
+
+/** Stale-writer fix: `markFailed` is conditional on OPENING -- a worker whose failure is already superseded (another worker made it ACTIVE, or H3 expired it) changes nothing. */
+async function fail(position: PositionRecord, reason: string, deps: OpenPositionDeps): Promise<OpenPositionOutcome> {
+  const failed = await deps.positions.markFailed(position.id);
+  if (failed) return { outcome: 'FAILED', reason };
+  const current = await deps.positions.findById(position.id);
+  if (current?.status === 'FAILED') return { outcome: 'FAILED', reason };
+  return { outcome: 'PENDING', reason: `definitive failure (${reason}) but the position is no longer OPENING (now ${current?.status ?? 'missing'}) -- not overwritten` };
 }

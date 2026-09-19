@@ -39,12 +39,34 @@ export type TxFailureCode =
   | 'GAS_UNAFFORDABLE'
   | 'BROADCAST_REJECTED'
   | 'REVERTED'
-  | 'VERIFICATION_FAILED';
+  | 'VERIFICATION_FAILED'
+  /**
+   * H3: written ONLY by `PositionRepository.expireStaleOpening` onto an
+   * OPENING position's mint attempt that provably never reached SIGNED
+   * (nothing was ever broadcast) -- a fence: the CAS/version bump makes
+   * any in-flight worker's later SIGNED write fail, so it can never
+   * broadcast, and `executeCriticalTransaction` returns this cached
+   * definitive failure for the key forever after.
+   */
+  | 'OPENING_TIMEOUT';
 
 export interface TxRequest {
   to: Address;
   data: `0x${string}`;
   value: bigint;
+  /**
+   * Same-attempt swap race fix: OPTIONAL builder-owned snapshot of the
+   * inputs the calldata was built from (e.g. the exit swap's quote-derived
+   * minimum output and USDG baseline). Never sent on-chain -- every viem
+   * call picks `to`/`data`/`value` explicitly. It rides INSIDE this object
+   * precisely so it is persisted by the SAME version-checked
+   * `update({ status: 'BUILT', txRequest })` that persists the calldata:
+   * whichever worker wins that compare-and-swap owns BOTH, atomically, and
+   * a stale worker's snapshot can never be stored next to another
+   * worker's calldata. `verifyOnChain` receives the persisted attempt and
+   * reads it back from there.
+   */
+  buildContext?: unknown;
 }
 
 export interface TransactionAttemptRecord {
@@ -127,6 +149,8 @@ export interface TransactionAttemptRepository {
   ): Promise<TransactionAttemptRecord>;
   /** Every attempt not yet at a terminal status (VERIFIED/FAILED) -- the basis for stuck-attempt queries (e.g. a future `/status` command). */
   findNonTerminal(): Promise<TransactionAttemptRecord[]>;
+  /** H2: every attempt whose idempotencyKey starts with any of `prefixes` (empty list -> empty result) -- capital accounting's read of CLOSING positions' exit legs. */
+  findByKeyPrefixes(prefixes: readonly string[]): Promise<TransactionAttemptRecord[]>;
 }
 
 export type StepResult<TReason extends string = string> = { ok: true } | { ok: false; reason: TReason };
@@ -200,6 +224,14 @@ export interface TxSafetyDeps<TVerifyData = unknown> {
    */
   verifyOnChain: (
     confirmedTxHash: `0x${string}`,
+    /**
+     * Same-attempt swap race fix: the persisted attempt being verified, so a
+     * verifier can check against the exact inputs its OWN calldata was built
+     * from (`attempt.txRequest.buildContext`) instead of shared per-position
+     * state another worker may have written. Optional -- verifiers that
+     * don't need it simply ignore it.
+     */
+    attempt?: Pick<TransactionAttemptRecord, 'id' | 'txRequest'>,
   ) => Promise<{ ok: true; data: TVerifyData } | { ok: false; reason: string; resumable?: boolean }>;
 }
 

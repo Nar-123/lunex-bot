@@ -3,6 +3,7 @@ import type { PrismaClient } from '@prisma/client';
 import { getPrismaClient } from '../storage/prismaClient';
 import type { CooldownChecker, CooldownStatus } from '../filters/types';
 import { computeCooldownEndsAt, computeCooldownStatus } from './cooldownLogic';
+import { config } from '../config';
 
 function normalizeAddress(address: string): string {
   return getAddress(address).toLowerCase();
@@ -24,7 +25,12 @@ function laterOf(a: Date | null, b: Date | null): Date | null {
 export class PrismaCooldownRepository implements CooldownChecker {
   constructor(private readonly prisma: PrismaClient = getPrismaClient()) {}
 
-  /** Starts (or restarts) a token's 2h cooldown. Called by `exits/` (Module 8) once a position closes. */
+  /**
+   * Starts (or restarts) a token's cooldown. NOT on the exit path any more:
+   * exits record their cooldown atomically inside
+   * `PositionRepository.markClosed` (cooldown crash-gap fix). Kept as the
+   * repository primitive (tests, manual/admin use).
+   */
   async recordExit(tokenAddress: string, exitedAt: Date = new Date()): Promise<void> {
     const address = normalizeAddress(tokenAddress);
     const cooldownEndsAt = computeCooldownEndsAt(exitedAt);
@@ -36,9 +42,12 @@ export class PrismaCooldownRepository implements CooldownChecker {
   }
 
   /**
-   * H17 fix: `TokenCooldown`'s own row is written by a SEPARATE call
-   * (`recordExit`, from `composition/exitCycle.ts`) AFTER
-   * `Position.markClosed` already committed -- a crash between the two
+   * H17 fix (kept as defense-in-depth): `TokenCooldown`'s own row USED TO be
+   * written by a SEPARATE call (`recordExit`, from
+   * `composition/exitCycle.ts`) AFTER `Position.markClosed` already
+   * committed. Since the cooldown crash-gap fix `markClosed` writes it in
+   * the same transaction, so a NEW close can no longer lack it; this
+   * reconstruction still covers rows closed before that fix. Originally: a crash between the two
    * (or the position row itself catching up, or a currently-executing
    * `recordExit` that hasn't landed yet) leaves this row missing/stale
    * while the position is nonetheless genuinely CLOSED. Introducing a
@@ -79,11 +88,29 @@ export class PrismaCooldownRepository implements CooldownChecker {
    * `inCooldown: false` for) so this stays a genuinely "active only" list.
    */
   async findAllActive(now: Date = new Date()): Promise<Array<{ tokenAddress: string; remainingMs: number; cooldownEndsAt: number }>> {
-    const rows = await this.prisma.tokenCooldown.findMany({ where: { cooldownEndsAt: { gt: now } } });
-    return rows.map((row) => {
-      const status = computeCooldownStatus(row.cooldownEndsAt, now.getTime());
-      // status.inCooldown is guaranteed true here (query already filtered to cooldownEndsAt > now), so cooldownEndsAt is always present.
-      return { tokenAddress: row.tokenAddress, remainingMs: status.remainingMs, cooldownEndsAt: status.cooldownEndsAt as number };
-    });
+    // Cooldown crash-gap fix: the SAME "later of the dedicated row and the
+    // most recent close" rule `getCooldownStatus` (the screening gate) uses,
+    // so the listing can never disagree with what screening enforces -- a
+    // close finalized before the atomic `markClosed` fix whose row was lost
+    // to the old crash window still shows here.
+    const closedSince = new Date(now.getTime() - config.rules.cooldown.DURATION_MS);
+    const [rows, recentClosed] = await Promise.all([
+      this.prisma.tokenCooldown.findMany({ where: { cooldownEndsAt: { gt: now } } }),
+      this.prisma.position.findMany({ where: { status: 'CLOSED', closedAt: { gt: closedSince } }, select: { tokenAddress: true, closedAt: true } }),
+    ]);
+    const endsAtByToken = new Map<string, Date>();
+    for (const row of rows) endsAtByToken.set(row.tokenAddress, row.cooldownEndsAt);
+    for (const p of recentClosed) {
+      if (!p.closedAt) continue;
+      const reconstructed = computeCooldownEndsAt(p.closedAt);
+      const later = laterOf(endsAtByToken.get(p.tokenAddress) ?? null, reconstructed);
+      if (later) endsAtByToken.set(p.tokenAddress, later);
+    }
+    const out: Array<{ tokenAddress: string; remainingMs: number; cooldownEndsAt: number }> = [];
+    for (const [tokenAddress, endsAt] of endsAtByToken) {
+      const status = computeCooldownStatus(endsAt, now.getTime());
+      if (status.inCooldown && status.cooldownEndsAt !== undefined) out.push({ tokenAddress, remainingMs: status.remainingMs, cooldownEndsAt: status.cooldownEndsAt });
+    }
+    return out;
   }
 }

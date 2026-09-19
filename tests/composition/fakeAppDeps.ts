@@ -77,8 +77,14 @@ export function makeCandidate(overrides: Partial<CandidateToken> = {}): Candidat
  * this -- only the actual on-chain calls are faked.
  */
 export function createFakeAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
-  const positions = new InMemoryPositionRepository();
   const txAttempts = new InMemoryTransactionAttemptRepository();
+  const cooldown: AppDeps['cooldown'] = {
+    getCooldownStatus: vi.fn(async (): Promise<CooldownStatus> => ({ inCooldown: false, remainingMs: 0 })),
+    recordExit: vi.fn(async () => undefined),
+    findAllActive: vi.fn(async () => []),
+  };
+  // Cooldown crash-gap fix: exits record their cooldown inside markClosed (see the real repository).
+  const positions = new InMemoryPositionRepository(txAttempts, cooldown);
   const exitStates = new InMemoryExitStateRepository();
 
   const base: AppDeps = {
@@ -86,18 +92,14 @@ export function createFakeAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
     txAttempts,
     exitStates,
     settings: new InMemorySettingsRepository(),
-    cooldown: {
-      getCooldownStatus: vi.fn(async (): Promise<CooldownStatus> => ({ inCooldown: false, remainingMs: 0 })),
-      recordExit: vi.fn(async () => undefined),
-      findAllActive: vi.fn(async () => []),
-    },
+    cooldown,
     activePositionChecker: { hasActivePosition: vi.fn(async () => false) },
     // The REAL capital-accounting logic (Revisions 5-7-proven), operating
     // on the fake in-memory `positions` repository above -- not a
     // hardcoded fixed snapshot. A constant simulated on-chain balance
     // (1000 USDG) means the snapshot genuinely reflects whatever the
     // in-memory repository's actual position rows are at read time.
-    capitalSnapshot: new PositionCapitalSnapshotProvider(positions, WALLET, async () => USDG(1000)),
+    capitalSnapshot: new PositionCapitalSnapshotProvider(positions, WALLET, async () => USDG(1000), txAttempts),
     canaryGuard: new InMemoryCanaryGuard(),
     discoveryService: { discoverTopCandidates: vi.fn(async () => []) } as unknown as AppDeps['discoveryService'],
     // Default fake: NON_STOCK, which is a no-op on `assetType` (see

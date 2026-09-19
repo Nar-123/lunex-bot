@@ -76,10 +76,34 @@ describe('P1-11: remove-liquidity slippage is bounded (100 bps), never 100% tole
 });
 
 describe('buildRemoveLiquidityDeps.verifyOnChain -- P1: proceeds-read failure after a proven burn is resumable', () => {
-  it('liquidity 0 and a readable receipt -> ok, with the exact measured proceeds', async () => {
-    const { deps } = makeDeps(0n, vi.fn(async () => USDG(480)));
+  it('liquidity 0 and a readable receipt -> ok, with the exact measured USDG AND TOKEN proceeds (H1: both from the SAME receipt)', async () => {
+    const position = makeExitTestPosition({ status: 'CLOSING' });
+    const reader = vi.fn(async (_hash: `0x${string}`, token: Address) =>
+      token.toLowerCase() === config.quoteAsset.ADDRESS.toLowerCase() ? USDG(480) : 7n * 10n ** 17n,
+    );
+    const { deps } = makeDeps(0n, reader);
     const result = await deps.verifyOnChain(HASH);
-    expect(result).toEqual({ ok: true, data: { liquidityZero: true, usdgProceedsRaw: USDG(480) } });
+    expect(result).toEqual({ ok: true, data: { liquidityZero: true, usdgProceedsRaw: USDG(480), tokenProceedsRaw: 7n * 10n ** 17n } });
+    expect(reader).toHaveBeenCalledWith(HASH, config.quoteAsset.ADDRESS, WALLET);
+    expect(reader).toHaveBeenCalledWith(HASH, position.tokenAddress, WALLET);
+  });
+
+  it('H1: a USDG-only burn (one-sided position never traded into range) records tokenProceedsRaw = 0n from the receipt -- proven, not inferred from a live balance', async () => {
+    const reader = vi.fn(async (_hash: `0x${string}`, token: Address) => (token.toLowerCase() === config.quoteAsset.ADDRESS.toLowerCase() ? USDG(500) : 0n));
+    const { deps } = makeDeps(0n, reader);
+    const result = await deps.verifyOnChain(HASH);
+    expect(result).toEqual({ ok: true, data: { liquidityZero: true, usdgProceedsRaw: USDG(500), tokenProceedsRaw: 0n } });
+  });
+
+  it('H1: a TOKEN-proceeds read failure after a proven burn is resumable too (never a definitive failure over a burned LP)', async () => {
+    const reader = vi.fn(async (_hash: `0x${string}`, token: Address) => {
+      if (token.toLowerCase() === config.quoteAsset.ADDRESS.toLowerCase()) return USDG(500);
+      throw new Error('RPC timeout');
+    });
+    const { deps } = makeDeps(0n, reader);
+    const result = await deps.verifyOnChain(HASH);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.resumable).toBe(true);
   });
 
   it('liquidity 0 but the proceeds read throws -> ok:false with resumable:true (the burn is already proven)', async () => {

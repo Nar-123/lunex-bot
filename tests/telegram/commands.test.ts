@@ -105,6 +105,38 @@ describe('command handlers -- success replies', () => {
     expect(text).toContain('pos-1');
   });
 
+  it('/stuck (unroutable TOKEN leg) shows a blocked CLOSING position with its operator flag, residual TOKEN and recovered USDG; quiet in-progress exits are not listed', async () => {
+    const closing = (positionId: string, phase: string, operatorActionRequired: boolean) => ({
+      positionId,
+      tokenSymbol: 'AAPLx',
+      phase,
+      operatorActionRequired,
+      closingAgeMs: 45 * 60_000,
+      tokenResidualRaw: '3000',
+      usdgRecoveredRaw: '200000',
+      lastCheckedAt: '2026-09-19T00:00:00.000Z',
+    });
+    const apiClient = fakeApiClient({
+      get: vi.fn(async () => ({
+        stuckTransactionAttempts: [],
+        stuckSwapRetryPositionIds: [],
+        closingPositions: [closing('pos-blocked', 'QUOTE_UNAVAILABLE', true), closing('pos-normal', 'SWAP_PENDING', false)],
+      })) as never,
+    });
+    const { ctx, reply } = fakeCtx();
+
+    await handleStuck(apiClient, ctx);
+
+    const text = reply.mock.calls[0]?.[0] as string;
+    expect(text).toContain('PERLU TINDAKAN OPERATOR');
+    expect(text).toContain('pos-blocked');
+    expect(text).toContain('QUOTE_UNAVAILABLE');
+    expect(text).toContain('TOKEN tersisa 3000');
+    expect(text).toContain('USDG kembali 200000');
+    expect(text).toContain('umur 45m');
+    expect(text).not.toContain('pos-normal');
+  });
+
   it('/stuck reports nothing stuck plainly', async () => {
     const apiClient = fakeApiClient({ get: vi.fn(async () => ({ stuckTransactionAttempts: [], stuckSwapRetryPositionIds: [] })) as never });
     const { ctx, reply } = fakeCtx();

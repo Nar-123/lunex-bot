@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { executeExit, exitSlippageBpsForAttempt } from '../../src/exits/executeExit';
+import { classifyUsdgOnlyRemoval, computeRealizedProceeds, executeExit, exitSlippageBpsForAttempt } from '../../src/exits/executeExit';
 import type { ExecuteExitDeps } from '../../src/exits/executeExit';
 import { executeCriticalTransaction } from '../../src/execution/executeCriticalTransaction';
 import type { TxRequest, TxSafetyDeps } from '../../src/execution/types';
@@ -8,8 +8,10 @@ import { InMemoryPositionRepository } from '../positions/inMemoryPositionReposit
 import { InMemoryExitStateRepository } from './inMemoryExitStateRepository';
 import { makeCreateInput } from '../positions/fixtures';
 import { PositionCapitalSnapshotProvider } from '../../src/positions/capitalSnapshotProvider';
+import { decideCapitalAllocation } from '../../src/capital/decideCapitalAllocation';
 import type { SwapExecutor, SwapQuote } from '../../src/swap/types';
 import type { Address } from 'viem';
+import { config } from '../../src/config';
 
 const TX: TxRequest = { to: '0x1111111111111111111111111111111111111111', data: '0xabcdef', value: 0n };
 const WALLET = '0x9999999999999999999999999999999999999999' as Address;
@@ -330,7 +332,7 @@ describe('executeExit -- P1: a proceeds-read failure after a confirmed on-chain 
     });
 
     expect(second.outcome).toBe('CLOSED');
-    expect(resumeSwapFactory).toHaveBeenCalledWith(position.id, TOKEN, null, swapExecutor, exitStates);
+    expect(resumeSwapFactory).toHaveBeenCalledWith(position.id, TOKEN, null, swapExecutor, exitStates, { swapAttemptCount: 0 }); // stale-writer fix: resumes bound to THIS attempt number
     expect(readTokenBalance).not.toHaveBeenCalled();
     expect(swapExecutor.getQuote).not.toHaveBeenCalled();
     expect(swapExecutor.checkApproval).not.toHaveBeenCalled();
@@ -947,7 +949,7 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
         // could not change it, and the swap may already be on-chain.
         expect(second.outcome).toBe('PENDING');
         expect(bps).toEqual([100]);
-        expect(ambiguousSwapDeps).toHaveBeenLastCalledWith(position.id, TOKEN, null, executor, exitStates);
+        expect(ambiguousSwapDeps).toHaveBeenLastCalledWith(position.id, TOKEN, null, executor, exitStates, { swapAttemptCount: 0 });
         expect((await exitStates.getOrCreate(position.id)).swapAttemptCount).toBe(0);
       });
 
@@ -1052,7 +1054,12 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
       expect(warnLog).toHaveBeenCalledWith('exit_missing_pending_close_reason', expect.objectContaining({ positionId: position.id }));
     });
 
-    it('throws (invariant violation) if remove-liquidity is VERIFIED but TOKEN balance reads 0', async () => {
+    // H1: this used to assert that ANY zero TOKEN balance after a verified
+    // remove-liquidity throws -- which stranded every never-filled one-sided
+    // position at CLOSING (see the H1 describe block below). The invariant
+    // it was protecting still exists, now stated precisely: the removal's
+    // own receipt PROVES TOKEN was paid out, yet the wallet holds none.
+    it('throws (invariant violation) if remove-liquidity VERIFIED with TOKEN proceeds > 0 but the TOKEN balance reads 0', async () => {
       const positions = new InMemoryPositionRepository();
       const exitStates = new InMemoryExitStateRepository();
       const txAttempts = new InMemoryTransactionAttemptRepository();
@@ -1063,9 +1070,33 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
           positions,
           exitStates,
           txAttempts,
-          ...baseDeps({ buildRemoveLiquidityDeps: successfulRemoveDeps(), readTokenBalance: vi.fn(async () => 0n) }),
+          ...baseDeps({
+            buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(200), tokenProceedsRaw: USDG(3) })),
+            readTokenBalance: vi.fn(async () => 0n),
+          }),
         }),
-      ).rejects.toThrow(/TOKEN balance reads 0/);
+      ).rejects.toThrow(/paid 3000000000000000000 TOKEN, but TOKEN balance reads 0 -- invariant violated/);
+      expect((await positions.findById(position.id))?.status).toBe('CLOSING');
+    });
+
+    it('legacy attempt (no tokenProceedsRaw recorded) + TOKEN balance 0: re-reads the removal receipt, and if it shows TOKEN WAS paid, still throws the invariant', async () => {
+      const positions = new InMemoryPositionRepository();
+      const exitStates = new InMemoryExitStateRepository();
+      const txAttempts = new InMemoryTransactionAttemptRepository();
+      const position = await makeClosingPosition(positions, USDG(500));
+
+      await expect(
+        executeExit(position, {
+          positions,
+          exitStates,
+          txAttempts,
+          ...baseDeps({
+            buildRemoveLiquidityDeps: successfulRemoveDeps(), // legacy verifyData shape: no tokenProceedsRaw
+            readTokenBalance: vi.fn(async () => 0n),
+            readTransfersTo: vi.fn(async (_h: `0x${string}`, token: Address) => (token === position.tokenAddress ? USDG(3) : USDG(200))),
+          }),
+        }),
+      ).rejects.toThrow(/invariant violated/);
     });
   });
 
@@ -1165,5 +1196,714 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
       expect(pending).toHaveLength(1);
       expect(buildCalls).toBe(1); // never built twice for the same close
     });
+  });
+});
+
+describe('H1: a one-sided USDG position that never filled closes cleanly after a USDG-only remove-liquidity (was: stuck at CLOSING forever)', () => {
+  const USDG_ADDRESS = config.quoteAsset.ADDRESS.toLowerCase();
+
+  function seedExitState(exitStates: InMemoryExitStateRepository, positionId: string, overrides: Partial<Parameters<InMemoryExitStateRepository['seed']>[0]> = {}) {
+    exitStates.seed({
+      positionId,
+      pendingCloseReason: 'OOR_TIMEOUT',
+      swapAttemptCount: 0,
+      trailingPeakPnlPct: null,
+      drawdownConfirmStartedAt: null,
+      oorStartedAt: null,
+      safetyExitArmedAt: null,
+      maxDrawdownPnlPct: null,
+      metricsFailureSince: null,
+      swapUsdgBalanceBeforeRaw: null,
+      swapMinOutputAmountRaw: null,
+      swapVerifiedUsdgIncreaseRaw: null,
+      ...overrides,
+    });
+  }
+
+  /** A remove-liquidity leg that succeeds with the given receipt-measured proceeds (new verifyData shape). */
+  function removeDepsPaying(usdgProceedsRaw: bigint, tokenProceedsRaw: bigint) {
+    return vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw, tokenProceedsRaw }));
+  }
+
+  /** Swap/quote/balance deps that FAIL LOUDLY if touched -- a USDG-only close must never reach any of them. */
+  function noSwapDeps() {
+    return {
+      buildSwapDeps: vi.fn(() => { throw new Error('must never build a swap for a USDG-only close'); }),
+      buildApproveDeps: vi.fn(() => { throw new Error('must never approve for a USDG-only close'); }),
+      swapExecutor: {
+        getQuote: vi.fn(async () => { throw new Error('must never quote a nonexistent TOKEN amount'); }),
+        checkApproval: vi.fn(async () => { throw new Error('must never check approval for a USDG-only close'); }),
+        buildSwapTx: vi.fn(),
+      } as unknown as SwapExecutor,
+      // The REAL on-chain state after a USDG-only burn: 0 TOKEN in the wallet.
+      readTokenBalance: vi.fn(async () => 0n),
+    };
+  }
+
+  async function setup(entry = USDG(500)) {
+    const positions = new InMemoryPositionRepository();
+    const exitStates = new InMemoryExitStateRepository();
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const position = await makeClosingPosition(positions, entry);
+    seedExitState(exitStates, position.id);
+    return { positions, exitStates, txAttempts, position };
+  }
+
+  it('REGRESSION (the H1 bug): remove-liquidity VERIFIED, receipt pays 500 USDG and 0 TOKEN -> CLOSED with realized 500; no swap, no quote, no live TOKEN balance read (the old code threw "TOKEN balance reads 0 -- invariant violated" here, forever)', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    const deps = noSwapDeps();
+
+    const outcome = await executeExit(position, {
+      positions,
+      exitStates,
+      txAttempts,
+      ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(USDG(500), 0n), ...deps }),
+    });
+
+    expect(outcome).toEqual({ outcome: 'CLOSED' });
+    const closed = await positions.findById(position.id);
+    expect(closed?.status).toBe('CLOSED');
+    expect(closed?.closeReason).toBe('OOR_TIMEOUT');
+    expect(closed?.realizedUsdgRaw).toBe(USDG(500));
+    expect(deps.readTokenBalance).not.toHaveBeenCalled();
+    expect(deps.swapExecutor.getQuote).not.toHaveBeenCalled();
+    expect(deps.buildSwapDeps).not.toHaveBeenCalled();
+    expect(await txAttempts.find(`${position.closeIdempotencyKey}:swap:0`)).toBeNull();
+  });
+
+  it('TOKEN proceeds > 0 -> the existing swap path runs unchanged (quote, swap, realized = remove USDG + swap USDG)', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    const swapExecutor = makeSwapExecutor();
+    const buildSwapDeps = successfulSwapDeps(); // swap pays 100 USDG
+
+    const outcome = await executeExit(position, {
+      positions,
+      exitStates,
+      txAttempts,
+      ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(USDG(200), USDG(3)), buildSwapDeps, swapExecutor, readTokenBalance: vi.fn(async () => USDG(3)) }),
+    });
+
+    expect(outcome).toEqual({ outcome: 'CLOSED' });
+    expect(swapExecutor.getQuote).toHaveBeenCalledWith(TOKEN, USDG(3), 100);
+    expect(buildSwapDeps).toHaveBeenCalledTimes(1);
+    expect((await positions.findById(position.id))?.realizedUsdgRaw).toBe(USDG(300));
+  });
+
+  it('USDG proceeds EXACTLY equal to the entry amount -> CLOSED, realized == entry', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    const outcome = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(USDG(500), 0n), ...noSwapDeps() }) });
+    expect(outcome).toEqual({ outcome: 'CLOSED' });
+    expect((await positions.findById(position.id))?.realizedUsdgRaw).toBe(USDG(500));
+  });
+
+  it('USDG-only close whose receipt USDG exceeds the entry (USDG-denominated fees included): realized = the full receipt USDG, never reduced to the principal-only trigger PnL. NOTE: a real in-and-back-out round trip normally ALSO pays TOKEN fees (tokenProceedsRaw > 0) and takes the swap path instead -- see the TOKEN-leg tests below', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    const withFees = USDG(500) + 3_200_000_000_000_000n; // 500.0032 USDG
+    const outcome = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(withFees, 0n), ...noSwapDeps() }) });
+    expect(outcome).toEqual({ outcome: 'CLOSED' });
+    expect((await positions.findById(position.id))?.realizedUsdgRaw).toBe(withFees);
+  });
+
+  it('wei-level rounding below the entry (the burn rounds down) is still a valid USDG-only close', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    const outcome = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(USDG(500) - 3n, 0n), ...noSwapDeps() }) });
+    expect(outcome).toEqual({ outcome: 'CLOSED' });
+    expect((await positions.findById(position.id))?.realizedUsdgRaw).toBe(USDG(500) - 3n);
+  });
+
+  it('ZERO USDG and zero TOKEN -> fails safe: PENDING with an anomaly warning, stays CLOSING, NOT marked CLOSED, no realized value written', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    const warnLog = vi.fn();
+    const outcome = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(0n, 0n), warnLog, ...noSwapDeps() }) });
+    expect(outcome.outcome).toBe('PENDING');
+    if (outcome.outcome === 'PENDING') expect(outcome.reason).toMatch(/0 TOKEN and 0 USDG.*manual review/);
+    expect(warnLog).toHaveBeenCalledWith('exit_usdg_only_close_anomaly', expect.objectContaining({ positionId: position.id }));
+    const still = await positions.findById(position.id);
+    expect(still?.status).toBe('CLOSING');
+    expect(still?.realizedUsdgRaw).toBeNull();
+  });
+
+  it('0 TOKEN but USDG materially BELOW the one-sided floor (TOKEN that should exist is missing) -> anomaly, PENDING, stays CLOSING', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    // Floor = 500 * (1 - 1%) = 495. 400 USDG with 0 TOKEN cannot be a one-sided close.
+    const outcome = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(USDG(400), 0n), warnLog: vi.fn(), ...noSwapDeps() }) });
+    expect(outcome.outcome).toBe('PENDING');
+    expect((await positions.findById(position.id))?.status).toBe('CLOSING');
+  });
+
+  it('remove-liquidity AMBIGUOUS -> unchanged: PENDING, stays CLOSING, nothing finalized', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    const outcome = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: ambiguousRemoveDeps(), ...noSwapDeps() }) });
+    expect(outcome.outcome).toBe('PENDING');
+    expect((await positions.findById(position.id))?.status).toBe('CLOSING');
+  });
+
+  it('remove-liquidity DEFINITIVELY failed -> unchanged: reverted to ACTIVE (LP intact)', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    const outcome = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: definitivelyFailingRemoveDeps(), ...noSwapDeps() }) });
+    expect(outcome.outcome).toBe('REVERTED_TO_ACTIVE');
+    expect((await positions.findById(position.id))?.status).toBe('ACTIVE');
+  });
+
+  describe('crash safety / idempotency', () => {
+    async function persistVerifiedUsdgOnlyRemoval(txAttempts: InMemoryTransactionAttemptRepository, closeKey: string, usdg: bigint) {
+      const attempt = await txAttempts.create(`${closeKey}:removeLiquidity`, 'exit:removeLiquidity');
+      await txAttempts.update(attempt.id, { status: 'VERIFIED', txHash: `0x${'cd'.repeat(32)}`, verifyData: { liquidityZero: true, usdgProceedsRaw: usdg, tokenProceedsRaw: 0n } });
+    }
+    const neverRebuildRemove = () =>
+      vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n, tokenProceedsRaw: 0n }, { buildTransaction: vi.fn(async () => { throw new Error('must never rebuild an already-VERIFIED remove-liquidity'); }) }));
+
+    it('crash AFTER remove-liquidity VERIFIED (USDG-only proceeds persisted) but BEFORE markClosed: the resume closes from the persisted receipt data -- no rebuild, no swap, realized written once', async () => {
+      const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+      await persistVerifiedUsdgOnlyRemoval(txAttempts, position.closeIdempotencyKey!, USDG(501));
+      const markClosed = vi.spyOn(positions, 'markClosed');
+
+      const outcome = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: neverRebuildRemove(), ...noSwapDeps() }) });
+
+      expect(outcome).toEqual({ outcome: 'CLOSED' });
+      expect(markClosed).toHaveBeenCalledTimes(1);
+      expect((await positions.findById(position.id))?.realizedUsdgRaw).toBe(USDG(501));
+    });
+
+    it('crash DURING markClosed (the write fails): position stays CLOSING; the retry closes exactly once with the same realized amount', async () => {
+      const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+      await persistVerifiedUsdgOnlyRemoval(txAttempts, position.closeIdempotencyKey!, USDG(501));
+      const markClosed = vi.spyOn(positions, 'markClosed').mockRejectedValueOnce(new Error('process killed mid-write'));
+      const deps = { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: neverRebuildRemove(), ...noSwapDeps() }) };
+
+      await expect(executeExit(position, deps)).rejects.toThrow(/process killed/);
+      expect((await positions.findById(position.id))?.status).toBe('CLOSING');
+
+      const retried = await executeExit(position, deps);
+      expect(retried).toEqual({ outcome: 'CLOSED' });
+      expect(markClosed).toHaveBeenCalledTimes(2); // 1 failed + 1 successful -- exactly one CLOSED write
+      expect((await positions.findById(position.id))?.realizedUsdgRaw).toBe(USDG(501));
+    });
+
+    it('AFTER markClosed: repeated executeExit calls (a stale CLOSING record) are no-ops -- PENDING via the claim guard, never reopened, no second close, no swap, realized unchanged', async () => {
+      const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+      const deps = { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(USDG(500), 0n), ...noSwapDeps() }) };
+      expect(await executeExit(position, deps)).toEqual({ outcome: 'CLOSED' });
+      const markClosed = vi.spyOn(positions, 'markClosed');
+
+      for (let i = 0; i < 3; i++) {
+        const again = await executeExit(position, deps); // `position` is the stale pre-close CLOSING snapshot
+        expect(again.outcome).toBe('PENDING');
+      }
+      expect(markClosed).not.toHaveBeenCalled();
+      const closed = await positions.findById(position.id);
+      expect(closed?.status).toBe('CLOSED');
+      expect(closed?.realizedUsdgRaw).toBe(USDG(500));
+    });
+
+    it('concurrency: two simultaneous executeExit calls for the same USDG-only position -> exactly one CLOSED, the other defers (existing CLOSING claim)', async () => {
+      const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+      const markClosed = vi.spyOn(positions, 'markClosed');
+      const deps = { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(USDG(500), 0n), ...noSwapDeps() }) };
+      const outcomes = await Promise.all([executeExit(position, deps), executeExit(position, deps)]);
+      expect(outcomes.map((o) => o.outcome).sort()).toEqual(['CLOSED', 'PENDING']);
+      expect(markClosed).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('legacy remove-liquidity attempts (verified by an older build, no tokenProceedsRaw) -- recovers positions ALREADY stuck by H1', () => {
+    it('TOKEN balance 0 + the removal receipt re-read proves 0 TOKEN -> USDG-only close from the receipt', async () => {
+      const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+      const readTransfersTo = vi.fn(async (_h: `0x${string}`, token: Address) => (token.toLowerCase() === USDG_ADDRESS ? USDG(500) : 0n));
+      const outcome = await executeExit(position, {
+        positions,
+        exitStates,
+        txAttempts,
+        // legacy shape: USDG measured, TOKEN side never recorded
+        ...baseDeps({ buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(500) })), ...noSwapDeps(), readTransfersTo }),
+      });
+      expect(outcome).toEqual({ outcome: 'CLOSED' });
+      expect((await positions.findById(position.id))?.realizedUsdgRaw).toBe(USDG(500));
+      expect(readTransfersTo).toHaveBeenCalledWith(`0x${'ab'.repeat(32)}`, position.tokenAddress, WALLET);
+    });
+
+    it('oldest shape (verifyData has neither proceeds field): USDG is also taken from the receipt, never fabricated', async () => {
+      const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+      const attempt = await txAttempts.create(`${position.closeIdempotencyKey}:removeLiquidity`, 'exit:removeLiquidity');
+      await txAttempts.update(attempt.id, { status: 'VERIFIED', txHash: `0x${'ef'.repeat(32)}`, verifyData: { liquidityZero: true } });
+      const readTransfersTo = vi.fn(async (_h: `0x${string}`, token: Address) => (token.toLowerCase() === USDG_ADDRESS ? USDG(502) : 0n));
+      const outcome = await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: successfulRemoveDeps(), ...noSwapDeps(), readTransfersTo }) });
+      expect(outcome).toEqual({ outcome: 'CLOSED' });
+      expect((await positions.findById(position.id))?.realizedUsdgRaw).toBe(USDG(502));
+    });
+
+    it('receipt re-read fails -> PENDING (resumable), stays CLOSING -- never guesses', async () => {
+      const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+      const outcome = await executeExit(position, {
+        positions,
+        exitStates,
+        txAttempts,
+        ...baseDeps({ buildRemoveLiquidityDeps: successfulRemoveDeps(), ...noSwapDeps(), readTransfersTo: vi.fn(async () => { throw new Error('RPC down'); }) }),
+      });
+      expect(outcome.outcome).toBe('PENDING');
+      expect((await positions.findById(position.id))?.status).toBe('CLOSING');
+    });
+
+    it('legacy attempt WITH TOKEN in the wallet -> the unchanged live-balance swap path (receipt never consulted)', async () => {
+      const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+      const readTransfersTo = vi.fn();
+      const outcome = await executeExit(position, {
+        positions,
+        exitStates,
+        txAttempts,
+        ...baseDeps({ buildRemoveLiquidityDeps: successfulRemoveDeps(), buildSwapDeps: successfulSwapDeps(), readTokenBalance: vi.fn(async () => USDG(2)), readTransfersTo }),
+      });
+      expect(outcome).toEqual({ outcome: 'CLOSED' });
+      expect(readTransfersTo).not.toHaveBeenCalled();
+    });
+  });
+
+  it('capital accounting across a USDG-only close (H2 model): the base stays the true 1000 before the burn and after it; once CLOSED the position leaves deployed capital and the count entirely', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    let wallet = USDG(500); // 1000 portfolio, 500 of it deployed in the LP
+    const snapshotProvider = new PositionCapitalSnapshotProvider(positions, WALLET, async () => wallet, txAttempts);
+
+    const beforeBurn = await snapshotProvider.getSnapshot(); // CLOSING, remove-liquidity not started
+    expect(beforeBurn).toEqual({ freeUsdgBalance: USDG(500), totalDeployedUsdg: USDG(500), activePositionsCount: 1 });
+
+    await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(USDG(500), 0n), ...noSwapDeps() }) });
+    wallet = USDG(1000); // the burn returned 500 USDG
+
+    const after = await snapshotProvider.getSnapshot();
+    expect(after).toEqual({ freeUsdgBalance: USDG(1000), totalDeployedUsdg: 0n, activePositionsCount: 0 }); // base 1000 = true portfolio
+  });
+
+  it('token uniqueness: once CLOSED, the same token may be entered again (CLOSED is outside the one-token-one-position set)', async () => {
+    const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
+    await expect(positions.create(makeCreateInput({ tokenAddress: TOKEN, openIdempotencyKey: 'deploy:dup-while-closing' }))).rejects.toThrow(/already exists/);
+
+    await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeDepsPaying(USDG(500), 0n), ...noSwapDeps() }) });
+
+    const reentry = await positions.create(makeCreateInput({ tokenAddress: TOKEN, openIdempotencyKey: 'deploy:reentry-after-close' }));
+    expect(reentry.status).toBe('OPENING');
+  });
+
+  it('computeRealizedProceeds (shared with the P1-13 backfill): a USDG-only removal is the whole realized amount -- no swap leg required, nothing summed twice', async () => {
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const attempt = await txAttempts.create('k:removeLiquidity', 'exit:removeLiquidity');
+    await txAttempts.update(attempt.id, { status: 'VERIFIED', verifyData: { liquidityZero: true, usdgProceedsRaw: USDG(500), tokenProceedsRaw: 0n } });
+    expect(await computeRealizedProceeds({ txAttempts }, 'k:removeLiquidity', 'k:swap:0')).toBe(USDG(500));
+  });
+
+  describe('classifyUsdgOnlyRemoval (pure)', () => {
+    it('accepts exactly the 1% floor (495 of 500) and rejects one wei below it', () => {
+      expect(classifyUsdgOnlyRemoval(USDG(500), USDG(495)).ok).toBe(true);
+      expect(classifyUsdgOnlyRemoval(USDG(500), USDG(495) - 1n).ok).toBe(false);
+    });
+    it('rejects zero or negative USDG', () => {
+      expect(classifyUsdgOnlyRemoval(USDG(500), 0n).ok).toBe(false);
+      expect(classifyUsdgOnlyRemoval(USDG(500), -1n).ok).toBe(false);
+    });
+  });
+});
+
+describe('H1 follow-up: TOKEN left over after remove-liquidity (e.g. residual TOKEN fees) -- deterministic, value-preserving handling of an unactionable swap leg', () => {
+  // NO dust threshold is tested here on purpose: there is no vetted, safe
+  // "negligible TOKEN value" policy in this codebase (see executeExit.ts's
+  // TOKEN-leg comment). Any TOKEN > 0 proven by the receipt stays on the
+  // swap path; when that swap cannot be quoted/cleared, the TOKEN is
+  // RETAINED and the position deterministically stays CLOSING -- never
+  // discarded, never thrown, never gas-spending.
+  const DUST = 37n; // 37 raw units of an 18-decimal TOKEN
+
+  function seed(exitStates: InMemoryExitStateRepository, positionId: string) {
+    exitStates.seed({
+      positionId,
+      pendingCloseReason: 'OOR_PROFIT',
+      swapAttemptCount: 0,
+      trailingPeakPnlPct: null,
+      drawdownConfirmStartedAt: null,
+      oorStartedAt: null,
+      safetyExitArmedAt: null,
+      maxDrawdownPnlPct: null,
+      metricsFailureSince: null,
+      swapUsdgBalanceBeforeRaw: null,
+      swapMinOutputAmountRaw: null,
+      swapVerifiedUsdgIncreaseRaw: null,
+    });
+  }
+
+  async function setup() {
+    const positions = new InMemoryPositionRepository();
+    const exitStates = new InMemoryExitStateRepository();
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const position = await makeClosingPosition(positions, USDG(500));
+    seed(exitStates, position.id);
+    return { positions, exitStates, txAttempts, position };
+  }
+
+  const removePaying = (usdg: bigint, token: bigint) => vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: usdg, tokenProceedsRaw: token }));
+
+  function rejectingSwapExecutor(message: string): SwapExecutor {
+    return {
+      getQuote: vi.fn(async () => { throw new Error(message); }),
+      checkApproval: vi.fn(async () => { throw new Error('must never reach approval when the quote failed'); }),
+      buildSwapTx: vi.fn(),
+    } as unknown as SwapExecutor;
+  }
+
+  const neverBuildSwap = () => vi.fn(() => { throw new Error('must never build a swap without a quote'); });
+
+  async function assertRetainedAndPending(
+    outcome: Awaited<ReturnType<typeof executeExit>>,
+    ctx: Awaited<ReturnType<typeof setup>>,
+  ) {
+    expect(outcome.outcome).toBe('PENDING');
+    const still = await ctx.positions.findById(ctx.position.id);
+    expect(still?.status).toBe('CLOSING'); // capital still counted as deployed -- conservative
+    expect(still?.realizedUsdgRaw).toBeNull(); // nothing finalized, nothing discarded
+    expect(await ctx.txAttempts.find(`${ctx.position.closeIdempotencyKey}:swap:0`)).toBeNull(); // no swap attempt, no gas
+    expect(await ctx.txAttempts.find(`${ctx.position.closeIdempotencyKey}:approve:0`)).toBeNull();
+    expect((await ctx.exitStates.getOrCreate(ctx.position.id)).swapAttemptCount).toBe(0); // not a definitive failure
+  }
+
+  it('TOKEN dust + Trading API rejects the amount -> explicit PENDING (no exception), TOKEN retained, structured warning carrying the RECEIPT amount', async () => {
+    const ctx = await setup();
+    const warnLog = vi.fn();
+    const outcome = await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({
+        buildRemoveLiquidityDeps: removePaying(USDG(500), DUST),
+        readTokenBalance: vi.fn(async () => DUST),
+        swapExecutor: rejectingSwapExecutor('Trading API /v1/quote failed: HTTP 400 {"errorCode":"VALIDATION_ERROR","detail":"amount too small"}'),
+        buildSwapDeps: neverBuildSwap(),
+        warnLog,
+      }),
+    });
+    await assertRetainedAndPending(outcome, ctx);
+    if (outcome.outcome === 'PENDING') expect(outcome.reason).toMatch(/quote unavailable for 37 TOKEN.*TOKEN retained/);
+    expect(warnLog).toHaveBeenCalledWith(
+      'exit_token_leg_unactionable',
+      expect.objectContaining({ positionId: ctx.position.id, cause: 'QUOTE_UNAVAILABLE', receiptTokenProceedsRaw: '37', walletTokenAmountRaw: '37', tokenDecimals: 18 }),
+    );
+  });
+
+  it('TOKEN dust + Trading API has no route -> the same deterministic retained PENDING', async () => {
+    const ctx = await setup();
+    const warnLog = vi.fn();
+    const outcome = await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({
+        buildRemoveLiquidityDeps: removePaying(USDG(500), DUST),
+        readTokenBalance: vi.fn(async () => DUST),
+        swapExecutor: rejectingSwapExecutor('Trading API /v1/quote failed: HTTP 404 {"errorCode":"ResourceNotFound","detail":"No quotes available"}'),
+        buildSwapDeps: neverBuildSwap(),
+        warnLog,
+      }),
+    });
+    await assertRetainedAndPending(outcome, ctx);
+    expect(warnLog).toHaveBeenCalledWith('exit_token_leg_unactionable', expect.objectContaining({ cause: 'QUOTE_UNAVAILABLE' }));
+  });
+
+  it('TOKEN dust + price impact unverifiable (provider omits it) -> the impact gate defers as before, now with a structured warning', async () => {
+    const ctx = await setup();
+    const warnLog = vi.fn();
+    const outcome = await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({
+        buildRemoveLiquidityDeps: removePaying(USDG(500), DUST),
+        readTokenBalance: vi.fn(async () => DUST),
+        swapExecutor: makeSwapExecutor(makeQuote({ amountInRaw: DUST, priceImpactPct: null })),
+        buildSwapDeps: neverBuildSwap(),
+        warnLog,
+      }),
+    });
+    await assertRetainedAndPending(outcome, ctx);
+    expect(warnLog).toHaveBeenCalledWith('exit_token_leg_unactionable', expect.objectContaining({ cause: 'PRICE_IMPACT_BLOCKED', priceImpactPct: null }));
+  });
+
+  it('retry is idempotent and bounded in cost: 5 ticks of an unroutable dust leg create no attempts, spend no gas, bump no counter; once the API routes it, the swap closes exactly once with realized = remove USDG + swap USDG (no double count)', async () => {
+    const ctx = await setup();
+    const removeDeps = removePaying(USDG(500), DUST);
+    for (let tick = 0; tick < 5; tick++) {
+      const outcome = await executeExit(ctx.position, {
+        ...ctx,
+        ...baseDeps({ buildRemoveLiquidityDeps: removeDeps, readTokenBalance: vi.fn(async () => DUST), swapExecutor: rejectingSwapExecutor('HTTP 404 No quotes available'), buildSwapDeps: neverBuildSwap(), warnLog: vi.fn() }),
+      });
+      await assertRetainedAndPending(outcome, ctx);
+    }
+    // The remove leg was built/broadcast exactly once across all ticks (VERIFIED short-circuit).
+    const removeBroadcasts = removeDeps.mock.results.reduce((n, r) => n + ((r.value as TxSafetyDeps<unknown>).broadcastRaw as ReturnType<typeof vi.fn>).mock.calls.length, 0);
+    expect(removeBroadcasts).toBe(1);
+
+    const markClosed = vi.spyOn(ctx.positions, 'markClosed');
+    const swapPays = 2_000_000_000_000n; // the dust sold for 0.000002 USDG
+    const recovered = await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({
+        buildRemoveLiquidityDeps: removeDeps,
+        readTokenBalance: vi.fn(async () => DUST),
+        swapExecutor: makeSwapExecutor(makeQuote({ amountInRaw: DUST })),
+        buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: swapPays, usdgProceedsRaw: swapPays })),
+      }),
+    });
+    expect(recovered).toEqual({ outcome: 'CLOSED' });
+    expect(markClosed).toHaveBeenCalledTimes(1);
+    expect((await ctx.positions.findById(ctx.position.id))?.realizedUsdgRaw).toBe(USDG(500) + swapPays);
+  });
+
+  it('TOKEN dust that the Trading API DOES route goes through the normal swap and closes -- no special-casing by amount', async () => {
+    const ctx = await setup();
+    const swapExecutor = makeSwapExecutor(makeQuote({ amountInRaw: DUST }));
+    const outcome = await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({ buildRemoveLiquidityDeps: removePaying(USDG(500), DUST), readTokenBalance: vi.fn(async () => DUST), swapExecutor, buildSwapDeps: successfulSwapDeps() }),
+    });
+    expect(outcome).toEqual({ outcome: 'CLOSED' });
+    expect(swapExecutor.getQuote).toHaveBeenCalledWith(TOKEN, DUST, 100);
+  });
+
+  it('MEANINGFUL TOKEN is never discarded: a quote failure for a large TOKEN amount is the same retained PENDING -- there is no amount-based bypass', async () => {
+    const ctx = await setup();
+    const outcome = await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({
+        buildRemoveLiquidityDeps: removePaying(USDG(200), USDG(3)),
+        readTokenBalance: vi.fn(async () => USDG(3)),
+        swapExecutor: rejectingSwapExecutor('HTTP 503 upstream unavailable'),
+        buildSwapDeps: neverBuildSwap(),
+        warnLog: vi.fn(),
+      }),
+    });
+    await assertRetainedAndPending(outcome, ctx);
+  });
+
+  it('MEANINGFUL TOKEN stays protected by the existing swap verification: a swap whose verification fails definitively is still SWAP_FAILED_RETRY_PENDING with the counter bumped (unchanged)', async () => {
+    const ctx = await setup();
+    const outcome = await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({
+        buildRemoveLiquidityDeps: removePaying(USDG(200), USDG(3)),
+        readTokenBalance: vi.fn(async () => USDG(3)),
+        buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n }, { verifyOnChain: vi.fn(async () => ({ ok: false as const, reason: 'swap receipt shows only 0 USDG paid' })) })),
+      }),
+    });
+    expect(outcome.outcome).toBe('SWAP_FAILED_RETRY_PENDING');
+    expect((await ctx.exitStates.getOrCreate(ctx.position.id)).swapAttemptCount).toBe(1);
+    expect((await ctx.positions.findById(ctx.position.id))?.status).toBe('CLOSING');
+  });
+
+  it('the RECEIPT, not the wallet, decides: receipt TOKEN = 0 closes USDG-only even while the wallet holds unrelated TOKEN, which is never read, quoted, or swapped', async () => {
+    const ctx = await setup();
+    const readTokenBalance = vi.fn(async () => USDG(999)); // unrelated TOKEN already sitting in the wallet
+    const swapExecutor = makeSwapExecutor();
+    const outcome = await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({ buildRemoveLiquidityDeps: removePaying(USDG(500), 0n), readTokenBalance, swapExecutor, buildSwapDeps: neverBuildSwap() }),
+    });
+    expect(outcome).toEqual({ outcome: 'CLOSED' });
+    expect(readTokenBalance).not.toHaveBeenCalled();
+    expect(swapExecutor.getQuote).not.toHaveBeenCalled();
+    expect((await ctx.positions.findById(ctx.position.id))?.realizedUsdgRaw).toBe(USDG(500));
+  });
+
+  it('the RECEIPT, not the wallet, decides the other way too: receipt TOKEN = 1 wei is NOT USDG-only -- it takes the swap path even though the USDG alone clears the floor', async () => {
+    const ctx = await setup();
+    const swapExecutor = makeSwapExecutor(makeQuote({ amountInRaw: 1n }));
+    const outcome = await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({ buildRemoveLiquidityDeps: removePaying(USDG(500), 1n), readTokenBalance: vi.fn(async () => 1n), swapExecutor, buildSwapDeps: successfulSwapDeps() }),
+    });
+    expect(outcome).toEqual({ outcome: 'CLOSED' });
+    expect(swapExecutor.getQuote).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('H2: capital accounting across the REAL exit lifecycle (executeExit + PositionCapitalSnapshotProvider over the same repositories)', () => {
+  // True portfolio 1000. The position (entry 500) is CLOSING; wallet holds the other 500.
+  // The remove-liquidity burn returns 300 USDG + 3 TOKEN (the TOKEN's unrecovered cost basis is 200).
+  const TRUE = USDG(1000);
+
+  async function setupLifecycle() {
+    const positions = new InMemoryPositionRepository();
+    const exitStates = new InMemoryExitStateRepository();
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const position = await makeClosingPosition(positions, USDG(500));
+    exitStates.seed({
+      positionId: position.id,
+      pendingCloseReason: 'HARD_STOP_LOSS',
+      swapAttemptCount: 0,
+      trailingPeakPnlPct: null,
+      drawdownConfirmStartedAt: null,
+      oorStartedAt: null,
+      safetyExitArmedAt: null,
+      maxDrawdownPnlPct: null,
+      metricsFailureSince: null,
+      swapUsdgBalanceBeforeRaw: null,
+      swapMinOutputAmountRaw: null,
+      swapVerifiedUsdgIncreaseRaw: null,
+    });
+    const chain = { wallet: USDG(500) };
+    const provider = new PositionCapitalSnapshotProvider(positions, WALLET, async () => chain.wallet, txAttempts);
+    return { positions, exitStates, txAttempts, position, chain, provider };
+  }
+
+  const removeReturning = (usdg: bigint, token: bigint) => vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: usdg, tokenProceedsRaw: token }));
+  const quoteFails = () => ({ getQuote: vi.fn(async () => { throw new Error('HTTP 404 No quotes available'); }), checkApproval: vi.fn(), buildSwapTx: vi.fn() }) as unknown as SwapExecutor;
+
+  it('CLOSING before remove -> after verified remove with TOKEN pending: the base stays the TRUE 1000 (returned 300 counted once, the 200 TOKEN cost basis stays deployed)', async () => {
+    const ctx = await setupLifecycle();
+    expect(await ctx.provider.getSnapshot()).toEqual({ freeUsdgBalance: USDG(500), totalDeployedUsdg: USDG(500), activePositionsCount: 1 });
+
+    const outcome = await executeExit(ctx.position, { ...ctx, ...baseDeps({ buildRemoveLiquidityDeps: removeReturning(USDG(300), USDG(3)), readTokenBalance: vi.fn(async () => USDG(3)), swapExecutor: quoteFails(), warnLog: vi.fn() }) });
+    expect(outcome.outcome).toBe('PENDING'); // swap leg unactionable this tick
+    ctx.chain.wallet = USDG(800);
+
+    const s = await ctx.provider.getSnapshot();
+    expect(s).toEqual({ freeUsdgBalance: USDG(800), totalDeployedUsdg: USDG(200), activePositionsCount: 1 });
+    expect(s.freeUsdgBalance + s.totalDeployedUsdg).toBe(TRUE); // pre-H2: 800 + 500 = 1300
+  });
+
+  it('quote-unavailable deferrals: 5 ticks later the snapshot is identical -- free capital never inflates', async () => {
+    const ctx = await setupLifecycle();
+    const deps = { ...ctx, ...baseDeps({ buildRemoveLiquidityDeps: removeReturning(USDG(300), USDG(3)), readTokenBalance: vi.fn(async () => USDG(3)), swapExecutor: quoteFails(), warnLog: vi.fn() }) };
+    await executeExit(ctx.position, deps);
+    ctx.chain.wallet = USDG(800);
+    const first = await ctx.provider.getSnapshot();
+    for (let tick = 0; tick < 5; tick++) {
+      expect((await executeExit(ctx.position, deps)).outcome).toBe('PENDING');
+      expect(await ctx.provider.getSnapshot()).toEqual(first);
+    }
+  });
+
+  it('price-impact deferrals: repeated ticks leave the snapshot identical too', async () => {
+    const ctx = await setupLifecycle();
+    const deps = { ...ctx, ...baseDeps({ buildRemoveLiquidityDeps: removeReturning(USDG(300), USDG(3)), readTokenBalance: vi.fn(async () => USDG(3)), swapExecutor: makeSwapExecutor(makeQuote({ priceImpactPct: null })), warnLog: vi.fn() }) };
+    await executeExit(ctx.position, deps);
+    ctx.chain.wallet = USDG(800);
+    const first = await ctx.provider.getSnapshot();
+    for (let tick = 0; tick < 5; tick++) {
+      expect((await executeExit(ctx.position, deps)).outcome).toBe('PENDING');
+      expect(await ctx.provider.getSnapshot()).toEqual(first);
+    }
+    expect(first.freeUsdgBalance + first.totalDeployedUsdg).toBe(TRUE);
+  });
+
+  it('successful swap -> CLOSED: capital moves out of deployed exactly once; afterwards base = wallet (the realized result), slot freed', async () => {
+    const ctx = await setupLifecycle();
+    const markClosed = vi.spyOn(ctx.positions, 'markClosed');
+    await executeExit(ctx.position, { ...ctx, ...baseDeps({ buildRemoveLiquidityDeps: removeReturning(USDG(300), USDG(3)), readTokenBalance: vi.fn(async () => USDG(3)), swapExecutor: quoteFails(), warnLog: vi.fn() }) });
+    ctx.chain.wallet = USDG(800);
+
+    const swapPays = USDG(190);
+    const outcome = await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({ buildRemoveLiquidityDeps: removeReturning(USDG(300), USDG(3)), readTokenBalance: vi.fn(async () => USDG(3)), buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: swapPays, usdgProceedsRaw: swapPays })) }),
+    });
+    expect(outcome).toEqual({ outcome: 'CLOSED' });
+    ctx.chain.wallet = USDG(990);
+    expect(markClosed).toHaveBeenCalledTimes(1);
+    expect(await ctx.provider.getSnapshot()).toEqual({ freeUsdgBalance: USDG(990), totalDeployedUsdg: 0n, activePositionsCount: 0 });
+  });
+
+  it('crash after the swap VERIFIED but before markClosed: the still-CLOSING position contributes 0 -- remove AND swap proceeds are both already in the wallet, neither is counted again', async () => {
+    const ctx = await setupLifecycle();
+    const removeKey = `${ctx.position.closeIdempotencyKey}:removeLiquidity`;
+    const r = await ctx.txAttempts.create(removeKey, 'exit:removeLiquidity');
+    await ctx.txAttempts.update(r.id, { status: 'VERIFIED', verifyData: { liquidityZero: true, usdgProceedsRaw: USDG(300), tokenProceedsRaw: USDG(3) } });
+    const sw = await ctx.txAttempts.create(`${ctx.position.closeIdempotencyKey}:swap:0`, 'exit:swap');
+    await ctx.txAttempts.update(sw.id, { status: 'VERIFIED', verifyData: { usdgIncreaseRaw: USDG(190), usdgProceedsRaw: USDG(190) } });
+    ctx.chain.wallet = USDG(990);
+    expect(await ctx.provider.getSnapshot()).toEqual({ freeUsdgBalance: USDG(990), totalDeployedUsdg: 0n, activePositionsCount: 1 });
+  });
+
+  it('an AMBIGUOUS remove-liquidity (broadcast uncertain: SIGNED/SENT in the DB, maybe mined) makes the snapshot unresolved and the allocator refuses; once the resume verifies it, accounting resolves to the true base', async () => {
+    const ctx = await setupLifecycle();
+    const ambiguous = await executeExit(ctx.position, { ...ctx, ...baseDeps({ buildRemoveLiquidityDeps: ambiguousRemoveDeps(), warnLog: vi.fn() }) });
+    expect(ambiguous.outcome).toBe('PENDING');
+    ctx.chain.wallet = USDG(800); // the tx may in fact have landed
+
+    const unresolved = await ctx.provider.getSnapshot();
+    expect(unresolved.accountingUnresolvedReason).toMatch(/removeLiquidity is (SIGNED|SENT)/);
+    expect(decideCapitalAllocation(unresolved, config.rules.capital).ok).toBe(false);
+
+    // Resume: the receipt is found and verification completes.
+    await executeExit(ctx.position, {
+      ...ctx,
+      ...baseDeps({
+        buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(300), tokenProceedsRaw: USDG(3) }, { getReceiptIfAvailable: vi.fn(async () => ({ status: 'success' as const, blockNumber: 9n })) })),
+        readTokenBalance: vi.fn(async () => USDG(3)),
+        swapExecutor: quoteFails(),
+        warnLog: vi.fn(),
+      }),
+    });
+    const resolved = await ctx.provider.getSnapshot();
+    expect(resolved.accountingUnresolvedReason).toBeUndefined();
+    expect(resolved.freeUsdgBalance + resolved.totalDeployedUsdg).toBe(TRUE);
+  });
+
+  it('failed exit / retry: a definitive remove failure reverts to ACTIVE (full entry deployed, nothing lost); the NEXT close uses a fresh key and the old attempts are ignored', async () => {
+    const ctx = await setupLifecycle();
+    const reverted = await executeExit(ctx.position, { ...ctx, ...baseDeps({ buildRemoveLiquidityDeps: definitivelyFailingRemoveDeps() }) });
+    expect(reverted.outcome).toBe('REVERTED_TO_ACTIVE');
+    expect(await ctx.provider.getSnapshot()).toEqual({ freeUsdgBalance: USDG(500), totalDeployedUsdg: USDG(500), activePositionsCount: 1 });
+
+    await ctx.positions.markClosing(ctx.position.id, `exit:${ctx.position.id}:attempt-2`);
+    const again = await ctx.positions.findById(ctx.position.id);
+    expect(await ctx.provider.getSnapshot()).toEqual({ freeUsdgBalance: USDG(500), totalDeployedUsdg: USDG(500), activePositionsCount: 1 }); // new close, nothing started
+    await executeExit(again!, { ...ctx, ...baseDeps({ buildRemoveLiquidityDeps: removeReturning(USDG(300), USDG(3)), readTokenBalance: vi.fn(async () => USDG(3)), swapExecutor: quoteFails(), warnLog: vi.fn() }) });
+    ctx.chain.wallet = USDG(800);
+    const s = await ctx.provider.getSnapshot();
+    expect(s.freeUsdgBalance + s.totalDeployedUsdg).toBe(TRUE);
+  });
+
+  it('restart: a brand-new provider over the same persisted rows/attempts reconstructs the identical snapshot', async () => {
+    const ctx = await setupLifecycle();
+    await executeExit(ctx.position, { ...ctx, ...baseDeps({ buildRemoveLiquidityDeps: removeReturning(USDG(300), USDG(3)), readTokenBalance: vi.fn(async () => USDG(3)), swapExecutor: quoteFails(), warnLog: vi.fn() }) });
+    ctx.chain.wallet = USDG(800);
+    const before = await ctx.provider.getSnapshot();
+    const restarted = new PositionCapitalSnapshotProvider(ctx.positions, WALLET, async () => ctx.chain.wallet, ctx.txAttempts);
+    expect(await restarted.getSnapshot()).toEqual(before);
+  });
+
+  it('the write-time re-check (createIfCapitalAllows) uses the SAME H2 accounting: with the returned USDG in the wallet, an entry pre-sized off the old inflated base is rejected, a correctly-sized one is accepted', async () => {
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const positions = new InMemoryPositionRepository(txAttempts);
+    const exitStates = new InMemoryExitStateRepository();
+    const position = await makeClosingPosition(positions, USDG(350));
+    await executeExit(position, { positions, exitStates, txAttempts, ...baseDeps({ buildRemoveLiquidityDeps: removeReturning(USDG(345), 5n), readTokenBalance: vi.fn(async () => 5n), swapExecutor: quoteFails(), warnLog: vi.fn() }) });
+    const wallet = USDG(995); // true portfolio 1000: 995 USDG + 5-wei-of-TOKEN leg carried at 5 USDG cost
+
+    const inflated = await positions.createIfCapitalAllows(makeCreateInput({ tokenAddress: '0x00000000000000000000000000000000000000c7', entryUsdgRaw: USDG(470), openIdempotencyKey: 'deploy:c7:1' }), async () => wallet, config.rules.capital);
+    expect(inflated.ok).toBe(false); // the pre-H2 base 995 + 350 = 1345 would have allowed ~470
+    const correct = await positions.createIfCapitalAllows(makeCreateInput({ tokenAddress: '0x00000000000000000000000000000000000000c8', entryUsdgRaw: USDG(350), openIdempotencyKey: 'deploy:c8:1' }), async () => wallet, config.rules.capital);
+    expect(correct.ok).toBe(true);
+  });
+});
+
+describe('Same-attempt swap race -- executeExit treats a lost attempt ownership as PENDING (no gas, no failure count) and surfaces it once', () => {
+  it('a swap leg that stops because another worker owns the attempt -> PENDING, swapAttemptCount unchanged, exit_swap_attempt_ownership_lost logged', async () => {
+    const positions = new InMemoryPositionRepository();
+    const exitStates = new InMemoryExitStateRepository();
+    const txAttempts = new InMemoryTransactionAttemptRepository();
+    const position = await makeClosingPosition(positions, USDG(500));
+    const warnLog = vi.fn();
+    const broadcastRaw = vi.fn(async () => undefined);
+    const outcome = await executeExit(position, {
+      positions,
+      exitStates,
+      txAttempts,
+      ...baseDeps({
+        buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(200), tokenProceedsRaw: USDG(3) })),
+        readTokenBalance: vi.fn(async () => USDG(3)),
+        buildSwapDeps: vi.fn(() =>
+          fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n }, {
+            buildTransaction: vi.fn(async () => { throw new Error('exit swap for position x: swap attempt 0 is no longer current (now 1) -- stale worker, not building'); }),
+            broadcastRaw,
+          }),
+        ),
+        warnLog,
+      }),
+    });
+    expect(outcome.outcome).toBe('PENDING');
+    expect(broadcastRaw).not.toHaveBeenCalled();
+    expect((await exitStates.getOrCreate(position.id)).swapAttemptCount).toBe(0);
+    expect(warnLog).toHaveBeenCalledTimes(1);
+    expect(warnLog).toHaveBeenCalledWith('exit_swap_attempt_ownership_lost', expect.objectContaining({ positionId: position.id, swapKey: `${position.closeIdempotencyKey}:swap:0` }));
   });
 });

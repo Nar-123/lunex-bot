@@ -124,6 +124,12 @@ export function decideCapitalAllocation(snapshot: CapitalSnapshot, callerRules: 
   // below uses the CLAMPED version. See `capital/hardCeilings.ts`.
   const rules = clampToHardCeilings(callerRules);
 
+  // H2: never size against capital figures that may double-count USDG a
+  // closing position has already returned (see capital/freshCapitalSnapshot.ts).
+  if (snapshot.accountingUnresolvedReason !== undefined) {
+    return { ok: false, reason: `capital accounting unresolved (fail-closed): ${snapshot.accountingUnresolvedReason}` };
+  }
+
   if (snapshot.activePositionsCount >= rules.MAX_ACTIVE_POSITIONS) {
     return {
       ok: false,

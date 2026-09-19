@@ -11,7 +11,7 @@ describe('ExitStateRepository', () => {
   it('getOrCreate returns an all-null/zero row for a position with no prior state', async () => {
     const repo = new InMemoryExitStateRepository();
     const record = await repo.getOrCreate('pos-1');
-    expect(record).toEqual({ positionId: 'pos-1', ...EMPTY_EXIT_STATE });
+    expect(record).toEqual({ positionId: 'pos-1', ...EMPTY_EXIT_STATE, version: 1 });
   });
 
   it('update merges a patch without clobbering other fields', async () => {
@@ -23,12 +23,13 @@ describe('ExitStateRepository', () => {
     expect(record.oorStartedAt).toEqual(new Date('2026-01-01T00:00:00.000Z'));
   });
 
-  it('incrementSwapAttempt increments from 0, and repeated calls keep incrementing', async () => {
+  it('incrementSwapAttemptFrom increments from 0, repeated calls from the current count keep incrementing, and a repeat from an old count is a no-op', async () => {
     const repo = new InMemoryExitStateRepository();
-    const first = await repo.incrementSwapAttempt('pos-1');
-    expect(first.swapAttemptCount).toBe(1);
-    const second = await repo.incrementSwapAttempt('pos-1');
-    expect(second.swapAttemptCount).toBe(2);
+    await repo.getOrCreate('pos-1');
+    expect(await repo.incrementSwapAttemptFrom('pos-1', 0)).toBe(true);
+    expect(await repo.incrementSwapAttemptFrom('pos-1', 1)).toBe(true);
+    expect(await repo.incrementSwapAttemptFrom('pos-1', 1)).toBe(false);
+    expect((await repo.getOrCreate('pos-1')).swapAttemptCount).toBe(2);
   });
 
   it('findStuckSwapRetries returns only positions at/above the threshold', async () => {

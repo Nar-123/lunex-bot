@@ -96,26 +96,28 @@ describe('PrismaCooldownRepository (real SQLite DB, real migration)', () => {
   describe('H17 regression: crash between Position.markClosed and cooldown.recordExit', () => {
     const TOKEN_C = '0x3333333333333333333333333333333333333333';
 
-    it('markClosed succeeds, recordExit NEVER runs (simulated crash) -- cooldown is still reconstructed and reported active, entirely from Position.closedAt', async () => {
+    it('cooldown crash-gap fix: markClosed now writes the cooldown row ATOMICALLY (same transaction, stamped with closedAt) -- and a close from BEFORE that fix whose row was lost is still reconstructed from Position.closedAt', async () => {
       const positions = new PrismaPositionRepository(prisma);
       const created = await positions.create(makeCreateInput({ tokenAddress: TOKEN_C, openIdempotencyKey: 'deploy:h17:1' }));
       await positions.markActive(created.id, '1', new Date());
-      // markClosed succeeds (the real, durable write)...
-      await positions.markClosed(created.id, new Date(), 'HARD_STOP_LOSS');
-      // ...but recordExit is deliberately NEVER called -- simulates the
-      // process dying between the two writes in composition/exitCycle.ts.
+      await positions.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
+      const closedAt = new Date();
+      await positions.markClosed(created.id, closedAt, 'HARD_STOP_LOSS');
 
+      // The dedicated row exists with NO separate recordExit call at all.
+      const dedicatedRow = await prisma.tokenCooldown.findUnique({ where: { tokenAddress: TOKEN_C.toLowerCase() } });
+      expect(dedicatedRow?.exitedAt.getTime()).toBe(closedAt.getTime());
+      expect(dedicatedRow!.cooldownEndsAt.getTime() - closedAt.getTime()).toBe(2 * 60 * 60 * 1000);
+
+      // H17 defense-in-depth for legacy data: simulate a close finalized
+      // before this fix whose row was lost to the old crash window.
+      await prisma.tokenCooldown.delete({ where: { tokenAddress: TOKEN_C.toLowerCase() } });
       const status = await repo.getCooldownStatus(TOKEN_C);
-
       expect(status.inCooldown).toBe(true);
       expect(status.remainingMs).toBeGreaterThan(0);
       expect(status.remainingMs).toBeLessThanOrEqual(2 * 60 * 60 * 1000);
-
-      // Confirms the dedicated row genuinely never got written (proving
-      // the reconstruction path, not the normal recordExit path, is what
-      // produced the active-cooldown result above).
-      const dedicatedRow = await prisma.tokenCooldown.findUnique({ where: { tokenAddress: TOKEN_C.toLowerCase() } });
-      expect(dedicatedRow).toBeNull();
+      // ...and the listing now agrees with the screening gate.
+      expect((await repo.findAllActive()).map((c) => c.tokenAddress)).toContain(TOKEN_C.toLowerCase());
     });
 
     it('an OLD closed position (well past the cooldown window) with no recordExit ever having run correctly reports NOT in cooldown', async () => {
@@ -124,6 +126,7 @@ describe('PrismaCooldownRepository (real SQLite DB, real migration)', () => {
       const created = await positions.create(makeCreateInput({ tokenAddress: tokenD, openIdempotencyKey: 'deploy:h17:2' }));
       await positions.markActive(created.id, '1', new Date());
       const longAgo = new Date(Date.now() - 3 * 60 * 60 * 1000); // 3h ago > 2h cooldown
+      await positions.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
       await positions.markClosed(created.id, longAgo, 'HARD_STOP_LOSS');
 
       const status = await repo.getCooldownStatus(tokenD);
@@ -136,6 +139,7 @@ describe('PrismaCooldownRepository (real SQLite DB, real migration)', () => {
       const created = await positions.create(makeCreateInput({ tokenAddress: tokenE, openIdempotencyKey: 'deploy:h17:3' }));
       await positions.markActive(created.id, '1', new Date());
       const earlierClose = new Date(Date.now() - 60 * 60 * 1000); // 1h ago
+      await positions.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
       await positions.markClosed(created.id, earlierClose, 'HARD_STOP_LOSS');
       // The dedicated row records a LATER exit (e.g. a subsequent
       // recordExit call for a different close of the same token) --

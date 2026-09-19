@@ -71,7 +71,7 @@ async function resumeVerified<TVerifyData>(
     );
   }
   try {
-    const reverify = await deps.verifyOnChain(attempt.txHash);
+    const reverify = await deps.verifyOnChain(attempt.txHash, attempt);
     if (!reverify.ok) {
       return ambiguousFailure(`VERIFIED attempt's data could not be reconstructed yet: ${reverify.reason}`, attempt);
     }
@@ -327,7 +327,7 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
       attempt = await repo.update(attempt.id, { status: 'CONFIRMED' }, attempt.version);
     }
 
-    const verification = await deps.verifyOnChain(txHash);
+    const verification = await deps.verifyOnChain(txHash, attempt);
     if (!verification.ok) {
       if (verification.resumable === true) {
         // P1 fix: the confirmed transaction's effect is not in doubt -- only

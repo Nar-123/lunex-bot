@@ -12,10 +12,25 @@ import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring
 
 const DEADLINE_WINDOW_SECONDS = 10 * 60; // 10 minutes from build time -- generous enough to survive the SIMULATED/GAS_CHECKED/SIGNED steps, short enough that a very stale resumed attempt fails loudly instead of executing against a long-gone price
 
-/** VALIDATION PHASE: `liquidityZero` proves the burn happened; `usdgProceedsRaw` is the USDG the SAME confirmed transaction paid the wallet (realized-PnL measurement). */
+/**
+ * VALIDATION PHASE: `liquidityZero` proves the burn happened; `usdgProceedsRaw` is the USDG the SAME confirmed transaction paid the wallet (realized-PnL measurement).
+ *
+ * H1 fix: `tokenProceedsRaw` is the position's TOKEN the SAME confirmed
+ * transaction paid the wallet, read from the SAME receipt with the SAME
+ * receipt-scoped decoder. It is what lets `executeExit.ts` tell a genuine
+ * USDG-only close (a one-sided USDG position that never traded into its
+ * range -- the strategy's normal "never filled" lifecycle -- whose burn
+ * pays out exactly 0 TOKEN) apart from a close that SHOULD have left TOKEN
+ * to swap. Before this field existed, the exit flow inferred "is there
+ * TOKEN to swap" from the live wallet balance and treated 0 as an
+ * invariant violation, stranding every never-filled position at CLOSING.
+ * Optional ONLY because attempts VERIFIED by an older build persisted
+ * verifyData without it; every new verification always sets it.
+ */
 export interface RemoveLiquidityVerifyData {
   liquidityZero: true;
   usdgProceedsRaw: bigint;
+  tokenProceedsRaw?: bigint;
 }
 
 export interface BuildRemoveLiquidityDepsOptions {
@@ -143,14 +158,22 @@ export function buildRemoveLiquidityDeps(
       // re-runs only this verification against the same hash -- nothing is
       // rebuilt or re-broadcast. (P1 fix: this used to return a plain
       // `ok: false`, which the pipeline treats as a definitive failure.)
+      // H1: the TOKEN side is read from the SAME receipt with the SAME
+      // decoder (the injected reader is token-agnostic -- it takes the ERC20
+      // address), so a USDG-only burn is PROVEN (0 TOKEN transferred to the
+      // wallet in this exact transaction), never inferred from a live
+      // wallet balance that unrelated activity could move. Same resumable
+      // treatment as the USDG read on failure.
       let usdgProceedsRaw: bigint;
+      let tokenProceedsRaw: bigint;
       try {
         usdgProceedsRaw = await readUsdgTransfersTo(confirmedTxHash, usdgAddress, wallet);
+        tokenProceedsRaw = await readUsdgTransfersTo(confirmedTxHash, position.tokenAddress, wallet);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return { ok: false, resumable: true, reason: `burn verified but proceeds could not be measured: ${message}` };
       }
-      return { ok: true, data: { liquidityZero: true, usdgProceedsRaw } };
+      return { ok: true, data: { liquidityZero: true, usdgProceedsRaw, tokenProceedsRaw } };
     },
   };
 }

@@ -7,11 +7,14 @@ import type { PositionRecord, PositionRepository } from '../positions/types';
 import type { TransactionAttemptRepository } from '../execution/types';
 import type { SwapExecutor } from '../swap/types';
 import type { SettingsRepository } from '../settings/types';
-import type { ExitMetricsSnapshot, ExitRules, ExitStateFields, ExitStateRepository } from './types';
+import type { ExitMetricsSnapshot, ExitRules, ExitStateFields, ExitStateRecord, ExitStateRepository } from './types';
 import { resolveExitDecision } from './resolveExitDecision';
 import { evaluateMetricsFailureSafetyExit, isMetricsFailureOutageCorrelated, isPoolPriceStructurallyInvalid } from './safetyExit';
 import { executeExit } from './executeExit';
 import type { ExecuteExitDeps, ExitExecutionOutcome } from './executeExit';
+
+/** Stale-writer fix: reported when a decision-state write lost its version check -- the decision computed from the stale snapshot is discarded, never acted on. */
+const STALE_EXIT_STATE_REASON = 'exit state changed concurrently (stale snapshot) -- decision discarded, re-evaluated next tick';
 
 /** Extends `ExecuteExitDeps` (rather than duplicating its fields) so the same optional `buildRemoveLiquidityDeps`/`buildSwapDeps` test-injection points that make `executeExit` testable in isolation also flow through a full `runExitCycle` call -- see `executeExit.ts`'s doc comment on those fields for why. */
 export interface RunExitCycleDeps extends ExecuteExitDeps {
@@ -151,7 +154,7 @@ export async function runExitCycle(deps: RunExitCycleDeps): Promise<ExitCycleRes
   const active = await deps.positions.findAllActive();
   const snapshots: Array<{
     position: PositionRecord;
-    rawExitState: ExitStateFields;
+    rawExitState: ExitStateRecord;
     metrics: ExitMetricsSnapshot;
     poolPriceState: PoolPriceState | null;
     metricsOk: boolean;
@@ -243,8 +246,12 @@ export async function runExitCycle(deps: RunExitCycleDeps): Promise<ExitCycleRes
         // Can't evaluate any PnL-based trigger without metrics, and the
         // infra failure-streak threshold hasn't been crossed yet --
         // still persist the (possibly newly-started) failure streak.
-        await deps.exitStates.update(position.id, { metricsFailureSince });
-        results.push({ positionId: position.id, action: 'NONE' });
+        // Version-checked against the snapshot it was computed from
+        // (stale-writer fix): if another worker wrote this position's exit
+        // state in the meantime, nothing is written and the streak is
+        // re-evaluated next tick from the newer state.
+        const written = await deps.exitStates.updateDecisionState(position.id, rawExitState.version, { metricsFailureSince });
+        results.push(written ? { positionId: position.id, action: 'NONE' } : { positionId: position.id, action: 'NONE', outcome: { outcome: 'PENDING', reason: STALE_EXIT_STATE_REASON } });
         continue;
       }
 
@@ -260,34 +267,48 @@ export async function runExitCycle(deps: RunExitCycleDeps): Promise<ExitCycleRes
         },
         exitRules,
       );
-      await deps.exitStates.update(position.id, nextExitState);
+      // Stale-writer fix: ONE compare-and-swap write of exactly the fields
+      // the decision owns, against the version this decision was computed
+      // from. The old code wrote the FULL record (every field, including
+      // swapAttemptCount and the swap-leg metadata it never changes) with no
+      // condition, so a worker holding an older snapshot could silently
+      // revert newer state another worker had written -- a lower
+      // swapAttemptCount, a cleared safetyExitArmedAt, a reset timer. Now a
+      // stale snapshot writes NOTHING and its decision is DISCARDED (never
+      // acted on): the position is simply re-evaluated next tick from the
+      // newer state.
+      //
+      // C4 ordering is preserved: when closing, `pendingCloseReason` goes
+      // into this SAME write, which still lands BEFORE `markClosing`. Only
+      // the worker whose write wins may go on to `markClosing`, and
+      // `markClosing` itself is conditional on ACTIVE, so two workers can
+      // never both start (or re-key) the same exit.
+      const written = await deps.exitStates.updateDecisionState(position.id, rawExitState.version, {
+        trailingPeakPnlPct: nextExitState.trailingPeakPnlPct,
+        drawdownConfirmStartedAt: nextExitState.drawdownConfirmStartedAt,
+        oorStartedAt: nextExitState.oorStartedAt,
+        safetyExitArmedAt: nextExitState.safetyExitArmedAt,
+        maxDrawdownPnlPct: nextExitState.maxDrawdownPnlPct,
+        metricsFailureSince: nextExitState.metricsFailureSince,
+        ...(decision.shouldClose && { pendingCloseReason: decision.reason }),
+      });
+      if (!written) {
+        results.push({ positionId: position.id, action: 'NONE', outcome: { outcome: 'PENDING', reason: STALE_EXIT_STATE_REASON } });
+        continue;
+      }
 
       if (!decision.shouldClose) {
         results.push({ positionId: position.id, action: 'NONE' });
         continue;
       }
 
-      // C4 fix: `pendingCloseReason` is written FIRST, `markClosing`
-      // SECOND -- deliberately the opposite of the original order. A
-      // crash between these two writes now leaves, at worst, an ACTIVE
-      // position with a stale `pendingCloseReason` sitting in `ExitState`
-      // -- completely harmless: `resolveExitDecision`'s `nextExitState`
-      // spread overwrites/re-derives every other field on the very next
-      // tick regardless, and `pendingCloseReason` is never READ until
-      // `markClosing` has actually happened. The original order could
-      // instead leave a position at CLOSING with `pendingCloseReason:
-      // null` -- a state `executeExit.ts`'s `finalizeClose` used to throw
-      // on permanently (now additionally hardened with an UNKNOWN
-      // fallback, see that file, as defense-in-depth for any OTHER path
-      // that could theoretically produce this -- but the real fix is
-      // simply never producing it in the first place).
       const closeIdempotencyKey = `exit:${position.id}:${randomUUID()}`;
-      await deps.exitStates.update(position.id, { pendingCloseReason: decision.reason });
-      await deps.positions.markClosing(position.id, closeIdempotencyKey);
+      const updatedPosition = await deps.positions.markClosing(position.id, closeIdempotencyKey);
+      if (!updatedPosition) {
+        results.push({ positionId: position.id, action: 'NONE', outcome: { outcome: 'PENDING', reason: 'position is no longer ACTIVE (another worker moved it on) -- exit not started' } });
+        continue;
+      }
       handledThisTick.add(position.id); // H15: never re-processed by the RESUME pass below, this tick
-
-      const updatedPosition = await deps.positions.findById(position.id);
-      if (!updatedPosition) throw new Error(`position ${position.id} vanished immediately after markClosing`);
 
       const outcome = await executeExit(updatedPosition, deps);
       results.push({ positionId: position.id, action: 'CLOSE_STARTED', outcome });
@@ -396,8 +417,19 @@ async function tryRecoverFromUnstartedSafetyExit(position: PositionRecord, deps:
     // condition that triggered this SAFETY_EXIT has cleared, and nothing
     // on-chain was ever attempted (re-checked under the claim, not stale).
     // Safe to revert.
-    await deps.positions.markExitFailed(position.id);
-    await deps.exitStates.update(position.id, { metricsFailureSince: null, pendingCloseReason: null });
+    // Stale-writer fix: conditional on THIS close attempt, so a revert can
+    // never land on a newer close or a CLOSED position.
+    const reverted = await deps.positions.markExitFailed(position.id, position.closeIdempotencyKey);
+    if (!reverted) return false;
+    // Version-checked like every other decision-state write. Under the
+    // CLOSING claim no other exit writer should touch this row, but if one
+    // did, re-read and apply the same clear to the newer version rather
+    // than overwrite it.
+    let state = exitState;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (await deps.exitStates.updateDecisionState(position.id, state.version, { metricsFailureSince: null, pendingCloseReason: null })) break;
+      state = await deps.exitStates.getOrCreate(position.id);
+    }
     return true;
   } finally {
     // Released whether or not we reverted -- if we return `false` here,

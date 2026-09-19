@@ -60,6 +60,26 @@ function jsonReviver(_key: string, value: unknown): unknown {
 const TERMINAL_STATUSES = ['VERIFIED', 'FAILED'];
 
 /**
+ * H2: every attempt whose idempotencyKey starts with one of `prefixes` --
+ * used by capital accounting to read a CLOSING position's exit legs
+ * (`${closeIdempotencyKey}:removeLiquidity`, `...:swap:N`, `...:approve:N`)
+ * in one query. Takes the Prisma client (or an interactive-transaction
+ * client) explicitly so `PositionRepository.createIfCapitalAllows` can run
+ * the IDENTICAL read inside its CapitalLock transaction. An empty prefix
+ * list reads nothing (never "everything").
+ */
+export async function findAttemptsByKeyPrefixes(
+  client: Pick<PrismaClient, 'transactionAttempt'>,
+  prefixes: readonly string[],
+): Promise<TransactionAttemptRecord[]> {
+  if (prefixes.length === 0) return [];
+  const rows = await client.transactionAttempt.findMany({
+    where: { OR: prefixes.map((prefix) => ({ idempotencyKey: { startsWith: prefix } })) },
+  });
+  return rows.map(toRecord);
+}
+
+/**
  * Persistent (never in-memory-only, per the project's storage principles
  * -- this is the state a crashed process resumes from) backing store for
  * `executeCriticalTransaction`'s idempotency/resume logic.
@@ -122,6 +142,10 @@ export class PrismaTransactionAttemptRepository implements TransactionAttemptRep
     }
     const row = await this.prisma.transactionAttempt.findUniqueOrThrow({ where: { id } });
     return toRecord(row);
+  }
+
+  findByKeyPrefixes(prefixes: readonly string[]): Promise<TransactionAttemptRecord[]> {
+    return findAttemptsByKeyPrefixes(this.prisma, prefixes);
   }
 
   async findNonTerminal(): Promise<TransactionAttemptRecord[]> {

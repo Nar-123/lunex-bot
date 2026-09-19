@@ -50,10 +50,12 @@ describe('buildSwapDeps -- takes an already-fetched quote, builds calldata for i
 
     expect(swapExecutor.getQuote).not.toHaveBeenCalled();
     expect(swapExecutor.buildSwapTx).toHaveBeenCalledWith(TOKEN, quote);
-    expect(tx).toEqual(SWAP_TX);
+    // The calldata is exactly the builder's; the quote snapshot rides along (never sent on-chain).
+    expect({ to: tx.to, data: tx.data, value: tx.value }).toEqual(SWAP_TX);
+    expect(tx.buildContext).toMatchObject({ kind: 'exit-swap/v1', positionId: 'pos-1' });
   });
 
-  it('persists the USDG balance baseline and the quote\'s minOutputAmountRaw before returning calldata', async () => {
+  it('same-attempt race fix: returns the USDG baseline and the quote-derived values WITH the calldata (persisted atomically at BUILT) and writes NOTHING to shared ExitState', async () => {
     const exitStates = new InMemoryExitStateRepository();
     const quote = makeQuote({ minOutputAmountRaw: USDG(42) });
     const swapExecutor: SwapExecutor = { getQuote: vi.fn(), checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })), buildSwapTx: vi.fn(async () => SWAP_TX) };
@@ -62,11 +64,24 @@ describe('buildSwapDeps -- takes an already-fetched quote, builds calldata for i
       readBalance: vi.fn(async () => USDG(1000)),
       walletAddress: WALLET,
     });
-    await deps.buildTransaction();
+    const versionBefore = (await exitStates.getOrCreate('pos-1')).version;
+    const tx = await deps.buildTransaction();
 
+    expect(tx.buildContext).toEqual({
+      kind: 'exit-swap/v1',
+      positionId: 'pos-1',
+      swapAttemptCount: 0,
+      amountInRaw: quote.amountInRaw,
+      expectedAmountOutRaw: quote.expectedAmountOutRaw,
+      minOutputAmountRaw: USDG(42),
+      priceImpactPct: quote.priceImpactPct,
+      slippageBps: quote.slippageBps,
+      usdgBalanceBeforeRaw: USDG(1000),
+    });
     const exitState = await exitStates.getOrCreate('pos-1');
-    expect(exitState.swapUsdgBalanceBeforeRaw).toBe(USDG(1000));
-    expect(exitState.swapMinOutputAmountRaw).toBe(USDG(42));
+    expect(exitState.version).toBe(versionBefore); // no shared write at all
+    expect(exitState.swapUsdgBalanceBeforeRaw).toBeNull();
+    expect(exitState.swapMinOutputAmountRaw).toBeNull();
   });
 });
 
@@ -247,14 +262,17 @@ describe('buildSwapDeps -- P1: a failed proceeds read after the balance check pa
     expect((await exitStates.getOrCreate('pos-1')).swapVerifiedUsdgIncreaseRaw).toBeNull();
   });
 
-  it('buildTransaction resets swapVerifiedUsdgIncreaseRaw for every new attempt', async () => {
+  it('a snapshot-built attempt never picks up a shared swapVerifiedUsdgIncreaseRaw left over from an earlier attempt -- its balance delta comes from its OWN baseline', async () => {
     const exitStates = new InMemoryExitStateRepository();
     await exitStates.update('pos-1', { swapVerifiedUsdgIncreaseRaw: USDG(77) }); // left over from an earlier attempt
-    const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), noopExecutor(), exitStates, { readBalance: vi.fn(async () => USDG(1000)), walletAddress: WALLET });
-
-    await deps.buildTransaction();
-
-    expect((await exitStates.getOrCreate('pos-1')).swapVerifiedUsdgIncreaseRaw).toBeNull();
+    const deps = buildSwapDeps('pos-1', TOKEN, makeQuote(), noopExecutor(), exitStates, {
+      readBalance: vi.fn().mockResolvedValueOnce(USDG(1000)).mockResolvedValue(USDG(1030)),
+      readUsdgTransfersTo: vi.fn(async () => USDG(30)),
+      walletAddress: WALLET,
+    });
+    const tx = await deps.buildTransaction();
+    const result = await deps.verifyOnChain(HASH, { id: 'a1', txRequest: tx });
+    expect(result).toEqual({ ok: true, data: { usdgIncreaseRaw: USDG(30), usdgProceedsRaw: USDG(30) } });
   });
 
   it('resume-only deps (quote null) refuse to build calldata and never call buildSwapTx or read a balance', async () => {
@@ -279,7 +297,7 @@ describe('buildSwapDeps -- restart-safety of the verification baseline', () => {
       readBalance: vi.fn(async () => USDG(1000)),
       walletAddress: WALLET,
     });
-    await beforeRestartDeps.buildTransaction();
+    const builtTx = await beforeRestartDeps.buildTransaction();
 
     // "After restart": a completely SEPARATE buildSwapDeps call (simulating
     // a new process), whose readBalance now returns a DIFFERENT ("current")
@@ -290,7 +308,12 @@ describe('buildSwapDeps -- restart-safety of the verification baseline', () => {
       readUsdgTransfersTo: vi.fn(async () => USDG(75)), // receipt decoder, independently injectable (a restarted process re-reads the same receipt)
       walletAddress: WALLET,
     });
-    const result = await afterRestartDeps.verifyOnChain('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`);
+    // The attempt row's real JSON round-trip (TransactionAttemptRepository's bigint tagging).
+    const persistedTx = JSON.parse(
+      JSON.stringify(builtTx, (_k, v: unknown) => (typeof v === 'bigint' ? `bigint:${v.toString()}` : v)),
+      (_k, v: unknown) => (typeof v === 'string' && v.startsWith('bigint:') ? BigInt(v.slice(7)) : v),
+    );
+    const result = await afterRestartDeps.verifyOnChain('0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' as `0x${string}`, { id: 'a1', txRequest: persistedTx });
 
     expect(result).toEqual({ ok: true, data: { usdgIncreaseRaw: USDG(75), usdgProceedsRaw: USDG(75) } }); // 1075 - 1000 (the ORIGINAL baseline), not recomputed from scratch
   });

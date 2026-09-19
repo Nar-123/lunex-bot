@@ -3,6 +3,7 @@ import { runExitCycle } from '../exits/runExitCycle';
 import type { ExitCycleResult } from '../exits/runExitCycle';
 import { resumeOpenPosition } from '../positions/openPosition';
 import type { OpenPositionOutcome } from '../positions/openPosition';
+import { enforceOpeningTimeout } from '../positions/openingTimeout';
 import { isStuckAttempt } from '../execution/stuckAttempt';
 import { filterToClosingPositions } from '../exits/stuckSwapRetries';
 import { runReconciliation } from '../reconciliation/runReconciliation';
@@ -66,11 +67,14 @@ export async function runExitAndOpenResumeCycle(deps: AppDeps): Promise<ExitCycl
   });
 
   const closed = exitResults.filter((r) => r.outcome?.outcome === 'CLOSED');
-  for (const result of closed) {
-    const position = await deps.positions.findById(result.positionId);
-    // The row still exists (CLOSED is a terminal status, never deleted) -- if it's somehow gone, skip rather than throw, this is a best-effort cooldown record, not a safety-critical one.
-    if (position) await deps.cooldown.recordExit(position.tokenAddress);
-  }
+  // Cooldown crash-gap fix: the exit cooldown is NO LONGER recorded here.
+  // It used to be a separate best-effort `cooldown.recordExit()` after the
+  // position had already committed CLOSED, so a crash in between left a
+  // CLOSED position with no cooldown row. It is now written by
+  // `PositionRepository.markClosed` itself, in the SAME database
+  // transaction as the CLOSED transition and from the same `closedAt` --
+  // there is exactly one cooldown writer for exits, and it cannot be
+  // separated from the close.
 
   // H1 fix: each OPENING position is isolated -- a throw resuming one
   // (an RPC blip, a bug) must never abort the rest of this pass, exactly
@@ -83,6 +87,17 @@ export async function runExitAndOpenResumeCycle(deps: AppDeps): Promise<ExitCycl
   const openResumeResults: OpenResumeResult[] = [];
   for (const position of openingPositions) {
     try {
+      // H3: bounded OPENING lifetime -- checked BEFORE resuming, so an aged
+      // OPENING whose mint never broadcast is released instead of building
+      // and signing a fresh mint this tick. Never releases a possibly
+      // broadcast or already-verified mint (see positions/openingTimeout.ts).
+      const timeout = await enforceOpeningTimeout(position, { positions: deps.positions, logger: deps.logger });
+      if (timeout.skipResume) {
+        if (timeout.result.outcome === 'EXPIRED') {
+          openResumeResults.push({ positionId: position.id, outcome: { outcome: 'FAILED', reason: 'OPENING_TIMEOUT: entry never broadcast within OPENING_MAX_AGE_MS -- reservation released' } });
+        }
+        continue;
+      }
       const outcome = await resumeOpenPosition(position, {
         positions: deps.positions,
         txAttempts: deps.txAttempts,
@@ -94,6 +109,9 @@ export async function runExitAndOpenResumeCycle(deps: AppDeps): Promise<ExitCycl
         walletAddress: deps.walletAddress,
       });
       openResumeResults.push({ positionId: position.id, outcome });
+      if (timeout.result.outcome === 'MINT_VERIFIED' && outcome.outcome === 'ACTIVE') {
+        deps.logger.info('opening_recovered', { positionId: position.id, positionTokenId: outcome.position.positionTokenId });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       deps.logger.error('open_resume_error', { positionId: position.id, message });

@@ -3,11 +3,13 @@ import { getAddress } from 'viem';
 import type { Address } from 'viem';
 import type { PrismaClient } from '@prisma/client';
 import { getPrismaClient } from '../storage/prismaClient';
-import type { CreateIfCapitalAllowsResult, CreatePositionInput, PositionRecord, PositionRepository, PositionStatus } from './types';
-import { DuplicateActiveTokenPositionError } from './types';
+import type { CreateIfCapitalAllowsResult, CreatePositionInput, OpeningExpiryResult, PositionRecord, PositionRepository, PositionStatus } from './types';
+import { DuplicateActiveTokenPositionError, openMintAttemptKey } from './types';
 import { decideCapitalAllocation } from '../capital/decideCapitalAllocation';
-import { checkCapitalStateConsistent, deriveCapitalSnapshot } from '../capital/freshCapitalSnapshot';
+import { checkCapitalStateConsistent, deriveCapitalSnapshot, exitLegKeyPrefix } from '../capital/freshCapitalSnapshot';
+import { findAttemptsByKeyPrefixes } from '../execution/transactionAttemptRepository';
 import type { CapitalRules } from '../capital/types';
+import { computeCooldownEndsAt } from '../cooldown/cooldownLogic';
 
 interface PrismaRow {
   id: string;
@@ -81,6 +83,9 @@ function toRecord(row: PrismaRow): PositionRecord {
 
 /** Any status other than CLOSED still occupies the token's "1 coin = 1 position" slot. */
 const NON_CLOSED_STATUSES = ['OPENING', 'ACTIVE', 'CLOSING'];
+
+/** H3: mint-attempt statuses at which the mint MAY have been broadcast (SIGNED is persisted before broadcasting) but is not yet resolved -- an OPENING in this state is never expired. */
+const MINT_POSSIBLY_BROADCAST = new Set(['SIGNED', 'SENT', 'CONFIRMED']);
 
 export class PrismaPositionRepository implements PositionRepository {
   constructor(private readonly prisma: PrismaClient = getPrismaClient()) {}
@@ -218,16 +223,27 @@ export class PrismaPositionRepository implements PositionRepository {
         const freshRows = (
           await tx.position.findMany({
             where: { status: { in: NON_CLOSED_STATUSES } },
-            select: { id: true, status: true, entryUsdgRaw: true },
+            select: { id: true, status: true, entryUsdgRaw: true, closeIdempotencyKey: true },
           })
-        ).map((r) => ({ id: r.id, status: r.status, entryUsdgRaw: BigInt(r.entryUsdgRaw) }));
+        ).map((r) => ({ id: r.id, status: r.status, entryUsdgRaw: BigInt(r.entryUsdgRaw), closeIdempotencyKey: r.closeIdempotencyKey }));
 
         const consistency = checkCapitalStateConsistent(observedBefore, freshRows);
         if (!consistency.ok) {
           return { ok: false as const, reason: `capital reservation aborted (fail-closed, retry next cycle): ${consistency.reason}` };
         }
 
-        const decision = decideCapitalAllocation(deriveCapitalSnapshot(onChainBalance, freshRows), rules);
+        // H2: CLOSING rows' exit legs, read inside the SAME locked
+        // transaction and AFTER the balance read above -- any exit leg that
+        // could have moved USDG into that balance is already persisted at
+        // SIGNED or later (SIGNED is written before broadcast), so it shows
+        // up here as either unresolved (fail closed) or VERIFIED with a
+        // measured amount that deriveCapitalSnapshot then removes from the
+        // deployed figure. Returned USDG is never counted as both wallet
+        // capital and deployed capital.
+        const closePrefixes = freshRows.filter((r) => r.status === 'CLOSING' && r.closeIdempotencyKey).map((r) => exitLegKeyPrefix(r.closeIdempotencyKey as string));
+        const exitLegAttempts = await findAttemptsByKeyPrefixes(tx, closePrefixes);
+
+        const decision = decideCapitalAllocation(deriveCapitalSnapshot(onChainBalance, freshRows, exitLegAttempts), rules);
         if (!decision.ok) {
           return { ok: false as const, reason: `capital reservation conflict (re-checked at write time): ${decision.reason}` };
         }
@@ -336,35 +352,81 @@ export class PrismaPositionRepository implements PositionRepository {
     return this.prisma.position.count({ where: { status: { in: NON_CLOSED_STATUSES } } });
   }
 
-  async markActive(id: string, positionTokenId: string, openedAt: Date): Promise<PositionRecord> {
-    const row = await this.prisma.position.update({
-      where: { id },
-      data: { status: 'ACTIVE', positionTokenId, openedAt },
-    });
-    return toRecord(row);
+  /**
+   * Stale-writer fix: every lifecycle transition below is ONE conditional
+   * UPDATE on the expected prior state (`WHERE id = ? AND status = ?`, plus
+   * the close key where one exists), returning `null` -- nothing written --
+   * when the row has already moved on. A stale worker can therefore never
+   * move a position backwards (e.g. CLOSING -> ACTIVE via a late
+   * markActive, CLOSED -> ACTIVE via a late markExitFailed) or re-key an
+   * exit another worker already started.
+   */
+  private async transition(where: Record<string, unknown>, data: Record<string, unknown>): Promise<PositionRecord | null> {
+    const result = await this.prisma.position.updateMany({ where, data });
+    if (result.count !== 1) return null;
+    return toRecord(await this.prisma.position.findUniqueOrThrow({ where: { id: where.id as string } }));
   }
 
-  async markClosing(id: string, closeIdempotencyKey: string): Promise<PositionRecord> {
-    const row = await this.prisma.position.update({
-      where: { id },
-      data: { status: 'CLOSING', closeIdempotencyKey },
-    });
-    return toRecord(row);
+  async markActive(id: string, positionTokenId: string, openedAt: Date): Promise<PositionRecord | null> {
+    return this.transition({ id, status: 'OPENING' }, { status: 'ACTIVE', positionTokenId, openedAt });
   }
 
-  async markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null): Promise<PositionRecord> {
-    // Omitted -> null ("not measured") via Prisma's default-null on ADD COLUMN:
-    // legacy callers that don't pass proceeds keep the honest unavailable state.
-    const row = await this.prisma.position.update({
-      where: { id },
-      data: {
-        status: 'CLOSED',
-        closedAt,
-        closeReason,
-        ...(realizedUsdgRaw !== undefined && { realizedUsdgRaw: realizedUsdgRaw === null ? null : realizedUsdgRaw.toString() }),
+  async markClosing(id: string, closeIdempotencyKey: string): Promise<PositionRecord | null> {
+    return this.transition({ id, status: 'ACTIVE' }, { status: 'CLOSING', closeIdempotencyKey });
+  }
+
+  /**
+   * Cooldown crash-gap fix: the CLOSED transition, the realized proceeds and
+   * the token's exit cooldown are committed in ONE database transaction.
+   * Before this, the cooldown row was written by a separate, later
+   * `recordExit()` call in `composition/exitCycle.ts`, AFTER this update had
+   * already committed -- a crash in between left a CLOSED position with no
+   * `TokenCooldown` row (screening still reconstructed the cooldown from
+   * `closedAt` -- the H17 read-side fallback, kept -- but the durable record
+   * and everything that lists it did not have it).
+   *
+   * Order inside the transaction: the conditional CLOSING -> CLOSED update
+   * runs FIRST (a write, so SQLite takes the write lock immediately, same
+   * pattern as CapitalLock); ONLY if it actually won (count === 1) is the
+   * cooldown written, from the SAME `closedAt` -- never "now", so a retry,
+   * restart or recovery can never shift it. If anything in here fails, the
+   * whole transaction rolls back: the position stays CLOSING (retried by the
+   * next exit tick), no proceeds, no cooldown. A losing / stale / repeated
+   * finalization matches zero rows and writes NOTHING -- no second cooldown,
+   * no timestamp moved.
+   *
+   * The cooldown only ever moves FORWARD: a row whose `exitedAt` is already
+   * at or after this close is left untouched (a same-token close can only
+   * follow the previous one, so this never loses a later cooldown).
+   */
+  async markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null, expectedCloseIdempotencyKey?: string): Promise<PositionRecord | null> {
+    return this.prisma.$transaction(
+      async (tx) => {
+        // Omitted -> null ("not measured") via Prisma's default-null on ADD COLUMN:
+        // legacy callers that don't pass proceeds keep the honest unavailable state.
+        const moved = await tx.position.updateMany({
+          where: { id, status: 'CLOSING', ...(expectedCloseIdempotencyKey !== undefined && { closeIdempotencyKey: expectedCloseIdempotencyKey }) },
+          data: {
+            status: 'CLOSED',
+            closedAt,
+            closeReason,
+            ...(realizedUsdgRaw !== undefined && { realizedUsdgRaw: realizedUsdgRaw === null ? null : realizedUsdgRaw.toString() }),
+          },
+        });
+        if (moved.count !== 1) return null;
+        const row = await tx.position.findUniqueOrThrow({ where: { id } });
+
+        const cooldownEndsAt = computeCooldownEndsAt(closedAt);
+        const existing = await tx.tokenCooldown.findUnique({ where: { tokenAddress: row.tokenAddress } });
+        if (!existing) {
+          await tx.tokenCooldown.create({ data: { tokenAddress: row.tokenAddress, exitedAt: closedAt, cooldownEndsAt } });
+        } else if (existing.exitedAt.getTime() < closedAt.getTime()) {
+          await tx.tokenCooldown.update({ where: { tokenAddress: row.tokenAddress }, data: { exitedAt: closedAt, cooldownEndsAt } });
+        }
+        return toRecord(row);
       },
-    });
-    return toRecord(row);
+      { timeout: 15_000, maxWait: 15_000 },
+    );
   }
 
   async backfillRealizedUsdgRaw(id: string, realizedUsdgRaw: bigint): Promise<PositionRecord | null> {
@@ -377,20 +439,12 @@ export class PrismaPositionRepository implements PositionRepository {
     return toRecord(row);
   }
 
-  async markFailed(id: string): Promise<PositionRecord> {
-    const row = await this.prisma.position.update({
-      where: { id },
-      data: { status: 'FAILED' },
-    });
-    return toRecord(row);
+  async markFailed(id: string): Promise<PositionRecord | null> {
+    return this.transition({ id, status: 'OPENING' }, { status: 'FAILED' });
   }
 
-  async markExitFailed(id: string): Promise<PositionRecord> {
-    const row = await this.prisma.position.update({
-      where: { id },
-      data: { status: 'ACTIVE', closeIdempotencyKey: null },
-    });
-    return toRecord(row);
+  async markExitFailed(id: string, closeIdempotencyKey: string): Promise<PositionRecord | null> {
+    return this.transition({ id, status: 'CLOSING', closeIdempotencyKey }, { status: 'ACTIVE', closeIdempotencyKey: null });
   }
 
   async claimForResume(id: string, expectedStatus: 'OPENING' | 'CLOSING', freshnessMs: number): Promise<string | null> {
@@ -429,5 +483,58 @@ export class PrismaPositionRepository implements PositionRepository {
       data: { resumeClaimedAt: null, resumeClaimToken: null },
     });
     return result.count === 1;
+  }
+
+  async expireStaleOpening(id: string, maxAgeMs: number, now: Date): Promise<OpeningExpiryResult> {
+    // Cheap pre-check outside the lock: most calls are young/non-OPENING
+    // rows and must not contend for the database write lock every tick.
+    const peek = await this.prisma.position.findUnique({ where: { id }, select: { status: true, createdAt: true } });
+    if (!peek || peek.status !== 'OPENING') return { outcome: 'NOT_OPENING' };
+    const peekAge = now.getTime() - peek.createdAt.getTime();
+    if (peekAge < maxAgeMs) return { outcome: 'TOO_YOUNG', ageMs: peekAge };
+
+    return this.prisma.$transaction(async (tx) => {
+      // Same write-first lock escalation as createIfCapitalAllows: every
+      // read below happens under SQLite's RESERVED write lock, so no other
+      // writer (another process's SIGNED CAS write, a concurrent expiry,
+      // a capital reservation) can interleave until this commits.
+      await tx.capitalLock.update({ where: { id: 'singleton' }, data: { touchedAt: new Date() } });
+
+      const row = await tx.position.findUnique({ where: { id }, select: { status: true, createdAt: true, openIdempotencyKey: true } });
+      if (!row || row.status !== 'OPENING') return { outcome: 'NOT_OPENING' as const };
+      const ageMs = now.getTime() - row.createdAt.getTime();
+      if (ageMs < maxAgeMs) return { outcome: 'TOO_YOUNG' as const, ageMs };
+
+      const mintKey = openMintAttemptKey(row.openIdempotencyKey);
+      const mint = await tx.transactionAttempt.findUnique({ where: { idempotencyKey: mintKey }, select: { id: true, status: true, version: true } });
+      const lastError = `OPENING expired after ${ageMs}ms (max ${maxAgeMs}ms) with no broadcast mint -- reservation released`;
+
+      if (mint === null) {
+        // Fence the key: a worker that has not created its mint attempt yet
+        // (e.g. still on the approve leg) will find this FAILED row -- or
+        // collide with it on the unique key -- and can never build a mint.
+        await tx.transactionAttempt.create({ data: { idempotencyKey: mintKey, purpose: 'deploy:mint', status: 'FAILED', failureCode: 'OPENING_TIMEOUT', lastError } });
+      } else if (mint.status === 'VERIFIED') {
+        return { outcome: 'MINT_VERIFIED' as const };
+      } else if (MINT_POSSIBLY_BROADCAST.has(mint.status)) {
+        return { outcome: 'BLOCKED_UNRESOLVED_TX' as const, mintStatus: mint.status };
+      } else if (mint.status !== 'FAILED') {
+        // Before SIGNED: nothing was ever broadcast. CAS on version so an
+        // in-flight worker's next checkpoint write (SIGNED is written
+        // BEFORE broadcasting) fails with a stale-version error.
+        const fenced = await tx.transactionAttempt.updateMany({
+          where: { id: mint.id, version: mint.version, status: mint.status },
+          data: { status: 'FAILED', failureCode: 'OPENING_TIMEOUT', lastError, version: { increment: 1 } },
+        });
+        if (fenced.count !== 1) {
+          // Unreachable under the write lock; never release on a failed fence.
+          return { outcome: 'BLOCKED_UNRESOLVED_TX' as const, mintStatus: mint.status };
+        }
+      }
+
+      const moved = await tx.position.updateMany({ where: { id, status: 'OPENING' }, data: { status: 'FAILED' } });
+      if (moved.count !== 1) return { outcome: 'NOT_OPENING' as const };
+      return { outcome: 'EXPIRED' as const, mintStatusBefore: mint?.status ?? null };
+    }, { timeout: 15_000, maxWait: 15_000 });
   }
 }

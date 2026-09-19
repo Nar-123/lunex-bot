@@ -1,7 +1,7 @@
 import type { PrismaClient } from '@prisma/client';
 import { getPrismaClient } from '../storage/prismaClient';
-import type { ExitStateFields, ExitStateRecord, ExitStateRepository, ExitTriggerReason } from './types';
-import { EMPTY_EXIT_STATE } from './types';
+import type { DecisionStatePatch, ExitStateFields, ExitStateRecord, ExitStateRepository, ExitTriggerReason, SwapLegBlockReason, SwapLegPatch } from './types';
+import { EMPTY_EXIT_STATE, assertMonotonicDecisionPatch } from './types';
 
 interface PrismaRow {
   positionId: string;
@@ -16,6 +16,10 @@ interface PrismaRow {
   swapMinOutputAmountRaw: string | null;
   swapVerifiedUsdgIncreaseRaw: string | null;
   pendingCloseReason: string | null;
+  version: number;
+  swapLegBlockedReason: string | null;
+  swapLegBlockedSince: Date | null;
+  swapLegLastCheckedAt: Date | null;
 }
 
 /** Same BigInt-as-decimal-string convention as `positions/positionRepository.ts` -- SQLite's signed-INTEGER range overflows for routine 18-decimal USDG amounts. */
@@ -41,6 +45,10 @@ function toRecord(row: PrismaRow): ExitStateRecord {
     swapMinOutputAmountRaw: fromPrismaBigIntString(row.swapMinOutputAmountRaw),
     swapVerifiedUsdgIncreaseRaw: fromPrismaBigIntString(row.swapVerifiedUsdgIncreaseRaw),
     pendingCloseReason: row.pendingCloseReason as ExitTriggerReason | null,
+    version: row.version,
+    swapLegBlockedReason: row.swapLegBlockedReason as SwapLegBlockReason | null,
+    swapLegBlockedSince: row.swapLegBlockedSince,
+    swapLegLastCheckedAt: row.swapLegLastCheckedAt,
   };
 }
 
@@ -74,23 +82,74 @@ export class PrismaExitStateRepository implements ExitStateRepository {
     return toRecord(row);
   }
 
-  async update(positionId: string, patch: Partial<ExitStateFields>): Promise<ExitStateRecord> {
-    const prismaPatch = toPrismaPatch(patch);
-    const row = await this.prisma.exitState.upsert({
-      where: { positionId },
-      update: prismaPatch,
-      create: { positionId, ...EMPTY_EXIT_STATE_PRISMA, ...prismaPatch },
+  /**
+   * Stale-writer fix. The check below reads the row at `expectedVersion`
+   * only to validate monotonicity; the WRITE itself is a single conditional
+   * UPDATE (`WHERE positionId = ? AND version = ?`), so if any other writer
+   * commits in between, it matches zero rows and nothing is written -- the
+   * database, not this process, decides who wins.
+   */
+  async updateDecisionState(positionId: string, expectedVersion: number, patch: DecisionStatePatch): Promise<ExitStateRecord | null> {
+    const current = await this.prisma.exitState.findUnique({ where: { positionId } });
+    if (!current || current.version !== expectedVersion) return null;
+    assertMonotonicDecisionPatch(positionId, toRecord(current), patch);
+    const result = await this.prisma.exitState.updateMany({
+      where: { positionId, version: expectedVersion },
+      data: { ...toPrismaPatch(patch), version: { increment: 1 } },
     });
-    return toRecord(row);
+    if (result.count !== 1) return null;
+    return toRecord(await this.prisma.exitState.findUniqueOrThrow({ where: { positionId } }));
   }
 
-  async incrementSwapAttempt(positionId: string): Promise<ExitStateRecord> {
-    const row = await this.prisma.exitState.upsert({
-      where: { positionId },
-      update: { swapAttemptCount: { increment: 1 } },
-      create: { positionId, ...EMPTY_EXIT_STATE_PRISMA, swapAttemptCount: 1 },
+  async incrementSwapAttemptFrom(positionId: string, expectedCount: number): Promise<boolean> {
+    const result = await this.prisma.exitState.updateMany({
+      where: { positionId, swapAttemptCount: expectedCount },
+      data: { swapAttemptCount: { increment: 1 }, version: { increment: 1 } },
     });
-    return toRecord(row);
+    return result.count === 1;
+  }
+
+  async updateSwapLegFields(positionId: string, expectedSwapAttemptCount: number, patch: SwapLegPatch): Promise<boolean> {
+    const result = await this.prisma.exitState.updateMany({
+      where: { positionId, swapAttemptCount: expectedSwapAttemptCount },
+      data: { ...toPrismaPatch(patch), version: { increment: 1 } },
+    });
+    return result.count === 1;
+  }
+
+  /**
+   * Two statements, each a single conditional UPDATE on the current attempt
+   * number (so a stale worker on an older attempt writes nothing): the
+   * first stamps `swapLegBlockedSince` only if it is still null (set once
+   * per continuous block, never moved), the second refreshes reason and
+   * last-checked. Both are idempotent, so concurrent callers converge.
+   */
+  async recordSwapLegBlocked(positionId: string, expectedSwapAttemptCount: number, reason: SwapLegBlockReason, at: Date): Promise<'NEW' | 'UNCHANGED' | 'STALE'> {
+    // Each step is ONE conditional UPDATE (atomic in SQLite), so concurrent
+    // workers / processes cannot both observe the transition: exactly one
+    // gets NEW (and logs), the rest UNCHANGED; a worker on an older swap
+    // attempt matches no row and gets STALE.
+    await this.prisma.exitState.updateMany({
+      where: { positionId, swapAttemptCount: expectedSwapAttemptCount, swapLegBlockedSince: null },
+      data: { swapLegBlockedSince: at },
+    });
+    const transitioned = await this.prisma.exitState.updateMany({
+      where: { positionId, swapAttemptCount: expectedSwapAttemptCount, OR: [{ swapLegBlockedReason: null }, { NOT: { swapLegBlockedReason: reason } }] },
+      data: { swapLegBlockedReason: reason, swapLegLastCheckedAt: at, version: { increment: 1 } },
+    });
+    if (transitioned.count === 1) return 'NEW';
+    const refreshed = await this.prisma.exitState.updateMany({
+      where: { positionId, swapAttemptCount: expectedSwapAttemptCount, swapLegBlockedReason: reason },
+      data: { swapLegLastCheckedAt: at },
+    });
+    return refreshed.count === 1 ? 'UNCHANGED' : 'STALE';
+  }
+
+  async clearSwapLegBlocked(positionId: string, expectedSwapAttemptCount: number): Promise<void> {
+    await this.prisma.exitState.updateMany({
+      where: { positionId, swapAttemptCount: expectedSwapAttemptCount, NOT: { swapLegBlockedReason: null } },
+      data: { swapLegBlockedReason: null, swapLegBlockedSince: null, swapLegLastCheckedAt: null, version: { increment: 1 } },
+    });
   }
 
   async findStuckSwapRetries(threshold: number): Promise<string[]> {

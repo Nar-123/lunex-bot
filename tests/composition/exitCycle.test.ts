@@ -1,3 +1,4 @@
+import type { InMemoryExitStateRepository } from '../exits/inMemoryExitStateRepository';
 import { describe, expect, it, vi } from 'vitest';
 import { runExitAndOpenResumeCycle } from '../../src/composition/exitCycle';
 import { runMonitoringLoggingCycle } from '../../src/composition/monitoringCycle';
@@ -19,12 +20,13 @@ describe('runExitAndOpenResumeCycle', () => {
     const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000002', entryUsdgRaw: USDG(300) }));
     await deps.positions.markActive(created.id, '1', new Date());
     await deps.positions.markClosing(created.id, `exit:${created.id}:1`);
-    await deps.exitStates.update(created.id, { pendingCloseReason: 'HARD_STOP_LOSS' });
+    await (deps.exitStates as InMemoryExitStateRepository).update(created.id, { pendingCloseReason: 'HARD_STOP_LOSS' });
 
     const summary = await runExitAndOpenResumeCycle(deps);
 
     expect(summary.closedCount).toBe(1);
-    expect(deps.cooldown.recordExit).toHaveBeenCalledWith('0x0000000000000000000000000000000000000002');
+    // Recorded atomically by markClosed, stamped with the close time (cooldown crash-gap fix).
+    expect(deps.cooldown.recordExit).toHaveBeenCalledWith('0x0000000000000000000000000000000000000002', expect.any(Date));
   });
 
   it('resumes every OPENING position independently of the exit decide/resume passes -- "dua resume pass, bukan satu"', async () => {
@@ -57,7 +59,7 @@ describe('runExitAndOpenResumeCycle', () => {
     const closingPosition = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000004' }));
     await deps.positions.markActive(closingPosition.id, '1', new Date());
     await deps.positions.markClosing(closingPosition.id, `exit:${closingPosition.id}:1`);
-    await deps.exitStates.update(closingPosition.id, { swapAttemptCount: 5, pendingCloseReason: 'HARD_STOP_LOSS' }); // at the configured STUCK_THRESHOLD
+    await (deps.exitStates as InMemoryExitStateRepository).update(closingPosition.id, { swapAttemptCount: 5, pendingCloseReason: 'HARD_STOP_LOSS' }); // at the configured STUCK_THRESHOLD
 
     const summary = await runExitAndOpenResumeCycle(deps);
 
@@ -74,7 +76,7 @@ describe('runExitAndOpenResumeCycle', () => {
       const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000030' }));
       await deps.positions.markActive(created.id, '1', new Date());
       await deps.positions.markClosing(created.id, `exit:${created.id}:1`);
-      await deps.exitStates.update(created.id, { swapAttemptCount: 10 });
+      await (deps.exitStates as InMemoryExitStateRepository).update(created.id, { swapAttemptCount: 10 });
       await deps.positions.markClosed(created.id, new Date(), 'HARD_STOP_LOSS');
 
       const summary = await runExitAndOpenResumeCycle(deps);
@@ -92,12 +94,13 @@ describe('runExitAndOpenResumeCycle', () => {
       const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000031' }));
       await deps.positions.markActive(created.id, '1', new Date());
       await deps.positions.markClosing(created.id, `exit:${created.id}:1`);
-      await deps.exitStates.update(created.id, { swapAttemptCount: 5, pendingCloseReason: 'HARD_STOP_LOSS' }); // at STUCK_THRESHOLD
+      await (deps.exitStates as InMemoryExitStateRepository).update(created.id, { swapAttemptCount: 5, pendingCloseReason: 'HARD_STOP_LOSS' }); // at STUCK_THRESHOLD
 
       const whileClosing = await runExitAndOpenResumeCycle(deps);
       expect(whileClosing.stuckSwapRetryPositionIds).toContain(created.id);
       expect((await deps.positions.findById(created.id))?.status).toBe('CLOSING'); // confirms it genuinely stayed CLOSING
 
+      await deps.positions.markClosing(created.id, `exit:${created.id}:setup`); // stale-writer fix: CLOSED is only reachable from CLOSING
       await deps.positions.markClosed(created.id, new Date(), 'HARD_STOP_LOSS');
 
       const afterClosed = await runExitAndOpenResumeCycle(deps);
@@ -156,12 +159,12 @@ describe('runExitAndOpenResumeCycle', () => {
     // Manually drive it to CLOSING the way runExitCycle would, to isolate this test to the cooldown-recording behavior.
     if (!active) throw new Error('unreachable');
     await deps.positions.markClosing(active.id, `exit:${active.id}:1`);
-    await deps.exitStates.update(active.id, { pendingCloseReason: 'HARD_STOP_LOSS' });
+    await (deps.exitStates as InMemoryExitStateRepository).update(active.id, { pendingCloseReason: 'HARD_STOP_LOSS' });
 
     const summary = await runExitAndOpenResumeCycle(deps);
 
     expect(summary.closedCount).toBe(1);
-    expect(deps.cooldown.recordExit).toHaveBeenCalledWith(active.tokenAddress);
+    expect(deps.cooldown.recordExit).toHaveBeenCalledWith(active.tokenAddress, expect.any(Date));
   });
 
   describe('Module 10 -- pause NEVER affects monitoring or exit (explicit, dual proof, not assumed)', () => {
@@ -180,7 +183,7 @@ describe('runExitAndOpenResumeCycle', () => {
 
       // Half 2: the exit cycle (decide + CLOSING resume + OPENING resume, all three sub-passes) still runs normally too -- forcing a definitive close via a pre-set CLOSING state to prove the resume pass isn't skipped either.
       await deps.positions.markClosing(created.id, `exit:${created.id}:1`);
-      await deps.exitStates.update(created.id, { pendingCloseReason: 'HARD_STOP_LOSS' });
+      await (deps.exitStates as InMemoryExitStateRepository).update(created.id, { pendingCloseReason: 'HARD_STOP_LOSS' });
 
       const exitSummary = await runExitAndOpenResumeCycle(deps);
 

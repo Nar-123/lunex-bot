@@ -1,10 +1,11 @@
 import type { Address } from 'viem';
 import { getAddress } from 'viem';
-import type { CreateIfCapitalAllowsResult, CreatePositionInput, PositionRecord, PositionRepository } from '../../src/positions/types';
-import { DuplicateActiveTokenPositionError } from '../../src/positions/types';
+import type { CreateIfCapitalAllowsResult, CreatePositionInput, OpeningExpiryResult, PositionRecord, PositionRepository } from '../../src/positions/types';
+import { DuplicateActiveTokenPositionError, openMintAttemptKey } from '../../src/positions/types';
 import { decideCapitalAllocation } from '../../src/capital/decideCapitalAllocation';
 import type { CapitalRules } from '../../src/capital/types';
-import { checkCapitalStateConsistent, deriveCapitalSnapshot } from '../../src/capital/freshCapitalSnapshot';
+import { checkCapitalStateConsistent, deriveCapitalSnapshot, exitLegKeyPrefix } from '../../src/capital/freshCapitalSnapshot';
+import type { TransactionAttemptRepository } from '../../src/execution/types';
 
 const NON_CLOSED = new Set(['OPENING', 'ACTIVE', 'CLOSING']);
 
@@ -15,6 +16,20 @@ export class InMemoryPositionRepository implements PositionRepository {
   private claimToken = new Map<string, string>();
   private nextId = 1;
   private nextTokenSeq = 1;
+  /** H3: mirrors the real `Position.createdAt` column (set once at insert, never touched again). */
+  private createdAt = new Map<string, Date>();
+
+  /** H2: optional -- lets `createIfCapitalAllows` account for CLOSING positions' exit legs exactly like the real repository (without it, a CLOSING row makes capital unresolved, fail closed -- also exactly like the real derivation). */
+  /**
+   * Cooldown crash-gap fix: `cooldown` mirrors the real repository writing
+   * the exit cooldown inside `markClosed`'s transaction -- when given, a
+   * winning `markClosed` records it (from `closedAt`), and a failed record
+   * rolls the close back, exactly like the real transaction.
+   */
+  constructor(
+    private readonly txAttempts?: TransactionAttemptRepository,
+    private readonly cooldown?: { recordExit(tokenAddress: string, exitedAt?: Date): Promise<void> },
+  ) {}
 
   async create(input: CreatePositionInput): Promise<PositionRecord> {
     const normalizedToken = getAddress(input.tokenAddress).toLowerCase() as Address;
@@ -42,13 +57,20 @@ export class InMemoryPositionRepository implements PositionRepository {
     } catch (err) {
       return { ok: false, reason: `capital reservation aborted (fail-closed): could not read the on-chain USDG balance: ${err instanceof Error ? err.message : String(err)}` };
     }
+    // H2: exit legs of the CLOSING rows, read AFTER the balance (same order
+    // as the real repository). Any status change during this await is
+    // caught by the consistency check on the re-read below.
+    const closePrefixes = this.nonClosedRows()
+      .filter((r) => r.status === 'CLOSING' && r.closeIdempotencyKey)
+      .map((r) => exitLegKeyPrefix(r.closeIdempotencyKey as string));
+    const exitLegAttempts = this.txAttempts ? await this.txAttempts.findByKeyPrefixes(closePrefixes) : null;
     const freshRows = this.nonClosedRows();
     const consistency = checkCapitalStateConsistent(observedBefore, freshRows);
     if (!consistency.ok) {
       return { ok: false, reason: `capital reservation aborted (fail-closed, retry next cycle): ${consistency.reason}` };
     }
 
-    const decision = decideCapitalAllocation(deriveCapitalSnapshot(onChainBalance, freshRows), rules);
+    const decision = decideCapitalAllocation(deriveCapitalSnapshot(onChainBalance, freshRows, exitLegAttempts), rules);
     if (!decision.ok) {
       return { ok: false, reason: `capital reservation conflict (re-checked at write time): ${decision.reason}` };
     }
@@ -62,8 +84,10 @@ export class InMemoryPositionRepository implements PositionRepository {
     return { ok: true, record: this.insert(normalizedToken, input) };
   }
 
-  private nonClosedRows(): Array<{ id: string; status: string; entryUsdgRaw: bigint }> {
-    return [...this.byId.values()].filter((p) => NON_CLOSED.has(p.status)).map((p) => ({ id: p.id, status: p.status, entryUsdgRaw: p.entryUsdgRaw }));
+  private nonClosedRows(): Array<{ id: string; status: string; entryUsdgRaw: bigint; closeIdempotencyKey: string | null }> {
+    return [...this.byId.values()]
+      .filter((p) => NON_CLOSED.has(p.status))
+      .map((p) => ({ id: p.id, status: p.status, entryUsdgRaw: p.entryUsdgRaw, closeIdempotencyKey: p.closeIdempotencyKey }));
   }
 
   private assertNoActiveDuplicate(normalizedToken: Address): void {
@@ -96,6 +120,7 @@ export class InMemoryPositionRepository implements PositionRepository {
       realizedUsdgRaw: null,
     };
     this.byId.set(record.id, record);
+    this.createdAt.set(record.id, new Date());
     return record;
   }
 
@@ -139,29 +164,44 @@ export class InMemoryPositionRepository implements PositionRepository {
     return [...this.byId.values()].filter((r) => NON_CLOSED.has(r.status)).length;
   }
 
-  async markActive(id: string, positionTokenId: string, openedAt: Date): Promise<PositionRecord> {
+  // Stale-writer fix: lifecycle transitions mirror the real repository's
+  // conditional UPDATEs -- `null` (nothing written) when the row is not in
+  // the expected prior state.
+  async markActive(id: string, positionTokenId: string, openedAt: Date): Promise<PositionRecord | null> {
     const record = this.get(id);
+    if (record.status !== 'OPENING') return null;
     record.status = 'ACTIVE';
     record.positionTokenId = positionTokenId;
     record.openedAt = openedAt;
     return record;
   }
 
-  async markClosing(id: string, closeIdempotencyKey: string): Promise<PositionRecord> {
+  async markClosing(id: string, closeIdempotencyKey: string): Promise<PositionRecord | null> {
     const record = this.get(id);
+    if (record.status !== 'ACTIVE') return null;
     record.status = 'CLOSING';
     record.closeIdempotencyKey = closeIdempotencyKey;
     return record;
   }
 
-  async markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null): Promise<PositionRecord> {
+  async markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null, expectedCloseIdempotencyKey?: string): Promise<PositionRecord | null> {
     const record = this.get(id);
-    record.status = 'CLOSED';
+    if (record.status !== 'CLOSING') return null;
+    if (expectedCloseIdempotencyKey !== undefined && record.closeIdempotencyKey !== expectedCloseIdempotencyKey) return null;
+    const before = { ...record };
+    record.status = 'CLOSED'; // claimed synchronously -- a concurrent call now sees CLOSED and returns null
     record.closedAt = closedAt;
     record.closeReason = closeReason;
     record.realizedUsdgRaw = realizedUsdgRaw !== undefined ? realizedUsdgRaw : null;
+    try {
+      await this.cooldown?.recordExit(record.tokenAddress, closedAt);
+    } catch (err) {
+      Object.assign(record, before); // "transaction" rollback: not CLOSED, no proceeds
+      throw err;
+    }
     return record;
   }
+
 
   async backfillRealizedUsdgRaw(id: string, realizedUsdgRaw: bigint): Promise<PositionRecord | null> {
     const record = this.byId.get(id);
@@ -170,14 +210,16 @@ export class InMemoryPositionRepository implements PositionRepository {
     return record;
   }
 
-  async markFailed(id: string): Promise<PositionRecord> {
+  async markFailed(id: string): Promise<PositionRecord | null> {
     const record = this.get(id);
+    if (record.status !== 'OPENING') return null;
     record.status = 'FAILED';
     return record;
   }
 
-  async markExitFailed(id: string): Promise<PositionRecord> {
+  async markExitFailed(id: string, closeIdempotencyKey: string): Promise<PositionRecord | null> {
     const record = this.get(id);
+    if (record.status !== 'CLOSING' || record.closeIdempotencyKey !== closeIdempotencyKey) return null;
     record.status = 'ACTIVE';
     record.closeIdempotencyKey = null;
     return record;
@@ -208,6 +250,55 @@ export class InMemoryPositionRepository implements PositionRepository {
     this.claimedAt.delete(id);
     this.claimToken.delete(id);
     return true;
+  }
+
+  /** Test helper (H3): back-date a row's persisted creation time, as if it had been created at `at` (e.g. before a restart). */
+  setCreatedAtForTest(id: string, at: Date): void {
+    this.get(id);
+    this.createdAt.set(id, at);
+  }
+
+  /**
+   * H3: mirrors `PrismaPositionRepository.expireStaleOpening` -- same checks,
+   * same fence (create the mint key FAILED, or version-CAS it to FAILED
+   * while it is still before SIGNED), same conditional OPENING -> FAILED.
+   * Requires the attempts repository this double was constructed with.
+   */
+  async expireStaleOpening(id: string, maxAgeMs: number, now: Date): Promise<OpeningExpiryResult> {
+    // Mirrors the real repository's CapitalLock write-lock transaction: the
+    // whole check-and-fence runs serialized, so a concurrent caller only
+    // starts once the first has committed (and then sees NOT_OPENING).
+    const run = this.expiryLock.then(() => this.expireStaleOpeningLocked(id, maxAgeMs, now));
+    this.expiryLock = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private expiryLock: Promise<void> = Promise.resolve();
+
+  private async expireStaleOpeningLocked(id: string, maxAgeMs: number, now: Date): Promise<OpeningExpiryResult> {
+    if (!this.txAttempts) throw new Error('InMemoryPositionRepository.expireStaleOpening needs the txAttempts repository (constructor argument)');
+    const row = this.byId.get(id);
+    if (!row || row.status !== 'OPENING') return { outcome: 'NOT_OPENING' };
+    const ageMs = now.getTime() - (this.createdAt.get(id) ?? now).getTime();
+    if (ageMs < maxAgeMs) return { outcome: 'TOO_YOUNG', ageMs };
+
+    const mintKey = openMintAttemptKey(row.openIdempotencyKey);
+    const mint = await this.txAttempts.find(mintKey);
+    if (row.status !== 'OPENING') return { outcome: 'NOT_OPENING' }; // re-check after the await
+    const lastError = `OPENING expired after ${ageMs}ms (max ${maxAgeMs}ms) with no broadcast mint -- reservation released`;
+    if (mint === null) {
+      const created = await this.txAttempts.create(mintKey, 'deploy:mint');
+      await this.txAttempts.update(created.id, { status: 'FAILED', failureCode: 'OPENING_TIMEOUT', lastError }, created.version);
+    } else if (mint.status === 'VERIFIED') {
+      return { outcome: 'MINT_VERIFIED' };
+    } else if (mint.status === 'SIGNED' || mint.status === 'SENT' || mint.status === 'CONFIRMED') {
+      return { outcome: 'BLOCKED_UNRESOLVED_TX', mintStatus: mint.status };
+    } else if (mint.status !== 'FAILED') {
+      await this.txAttempts.update(mint.id, { status: 'FAILED', failureCode: 'OPENING_TIMEOUT', lastError }, mint.version);
+    }
+    if (row.status !== 'OPENING') return { outcome: 'NOT_OPENING' };
+    row.status = 'FAILED';
+    return { outcome: 'EXPIRED', mintStatusBefore: mint?.status ?? null };
   }
 
   private get(id: string): PositionRecord {

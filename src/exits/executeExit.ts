@@ -1,13 +1,13 @@
 import type { Address } from 'viem';
 import { config } from '../config';
-import { readErc20Allowance, readErc20Balance } from '../blockchain/erc20';
+import { readErc20Allowance, readErc20Balance, readErc20TransfersTo } from '../blockchain/erc20';
 import { getExecutorAddress } from '../blockchain/walletClient';
 import { executeCriticalTransaction } from '../execution/executeCriticalTransaction';
 import type { ExecutionResult, TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
 import type { PositionRecord, PositionRepository } from '../positions/types';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring/types';
 import type { SwapExecutor, SwapQuote } from '../swap/types';
-import type { ExitStateRepository } from './types';
+import type { ExitStateRepository, SwapLegBlockReason } from './types';
 import { buildRemoveLiquidityDeps as realBuildRemoveLiquidityDeps, type RemoveLiquidityVerifyData } from './removeLiquidityTx';
 import { buildSwapDeps as realBuildSwapDeps, defaultLogImpact, shouldBlockForPriceImpact, type SwapVerifyData } from './swapTx';
 import { buildApproveDeps as realBuildApproveDeps, needsApproval, type ApproveVerifyData } from './approveTx';
@@ -26,6 +26,75 @@ export function exitSlippageBpsForAttempt(swapAttemptCount: number): number {
   const tiers = config.rules.exits.SLIPPAGE_TIERS_BPS;
   const index = Math.min(Math.max(0, Math.floor(swapAttemptCount)), tiers.length - 1);
   return tiers[index] ?? tiers[tiers.length - 1] ?? 0;
+}
+
+/**
+ * H1 fix: decides whether a remove-liquidity whose OWN receipt paid the
+ * wallet exactly 0 TOKEN is a genuine, complete USDG-only close.
+ *
+ * Why 0 TOKEN is legitimate: every entry is a ONE-SIDED USDG position
+ * deliberately placed out of range (`computeLpRange.ts`, P0-4's mint
+ * guard). If price never trades into the range, the liquidity is still
+ * 100% USDG when OOR_TIMEOUT (or any other trigger) closes it, and the
+ * burn pays out USDG only -- 0 TOKEN principal and 0 TOKEN fees (fees only
+ * accrue while in range).
+ *
+ * What is NOT USDG-only: a position that traded INTO its range and back
+ * out on the USDG side. Its principal converts back to USDG along the
+ * curve, but while it was in range it earned fees in whichever token
+ * traders paid in -- typically TOKEN on the way in -- and the burn pays
+ * those accrued TOKEN fees out together with the USDG. Its receipt
+ * therefore normally shows `tokenProceedsRaw > 0` and it takes the regular
+ * TOKEN swap path, never this one. (It only lands here in the unusual case
+ * where every in-range fee happened to be paid in USDG.)
+ *
+ * Why the USDG amount is ALSO checked: with 0 TOKEN out, the liquidity sat
+ * entirely on the USDG side, where the burn of liquidity L returns
+ * amount(L) rounded DOWN. The mint sized L from `entryUsdgRaw` itself
+ * (`Position.fromAmount0`/`fromAmount1` in `positions/mintTx.ts`), so
+ * amount(L) is the deposited USDG minus wei-level rounding, and any
+ * USDG-denominated fees only ADD to it. A genuine USDG-only burn therefore
+ * returns >= `entryUsdgRaw` minus a few wei. A USDG-only receipt that
+ * returns materially LESS (or nothing) is inconsistent with a one-sided
+ * close -- TOKEN that should exist went somewhere else, or the
+ * position/receipt is not what the DB believes -- so it is an ANOMALY,
+ * never auto-closed.
+ *
+ * The 99% floor is an APPLICATION-LEVEL classification bound, not an
+ * on-chain guarantee. It is NOT what the remove-liquidity calldata
+ * enforces: the SDK's `burnAmountsWithSlippage` derives the calldata's
+ * `amount0Min`/`amount1Min` from the position's amounts at a price moved
+ * by +/- `REMOVE_LIQUIDITY_SLIPPAGE_BPS`, which for a fully out-of-range
+ * position is 100% of the amount when the price is far from the range but
+ * can be FAR lower than 99% when the price sits near the range edge. The
+ * floor only reuses that constant's NUMBER (1%) as a margin. It is
+ * conservative for the USDG-only case because the expected shortfall
+ * (rounding) is many orders of magnitude smaller than 1% of any real
+ * entry, so no genuine USDG-only close is ever rejected by it. It is a
+ * SECONDARY sanity check: the primary proof is the receipt's
+ * `tokenProceedsRaw === 0n` (only zero-hook pools are ever selected, and
+ * TAKE_PAIR pays the wallet itself, so the burn's TOKEN cannot be routed
+ * elsewhere). The floor catches gross inconsistencies (nothing or far too
+ * little USDG came back); it cannot by itself detect a SMALL missing TOKEN
+ * amount, and does not claim to.
+ *
+ * Pure and exported for direct unit testing.
+ */
+export function classifyUsdgOnlyRemoval(
+  entryUsdgRaw: bigint,
+  usdgProceedsRaw: bigint,
+): { ok: true } | { ok: false; reason: string } {
+  if (usdgProceedsRaw <= 0n) {
+    return { ok: false, reason: `remove-liquidity paid 0 TOKEN and ${usdgProceedsRaw} USDG -- a one-sided USDG close must return USDG; manual review required` };
+  }
+  const minUsdg = (entryUsdgRaw * BigInt(10_000 - config.rules.exits.REMOVE_LIQUIDITY_SLIPPAGE_BPS)) / 10_000n;
+  if (usdgProceedsRaw < minUsdg) {
+    return {
+      ok: false,
+      reason: `remove-liquidity paid 0 TOKEN but only ${usdgProceedsRaw} USDG (< ${minUsdg}, the one-sided floor for entry ${entryUsdgRaw}) -- inconsistent with a USDG-only close; manual review required`,
+    };
+  }
+  return { ok: true };
 }
 
 export type ExitExecutionOutcome =
@@ -59,11 +128,22 @@ export interface ExecuteExitDeps {
     quote: SwapQuote | null,
     swap: SwapExecutor,
     exitStates: ExitStateRepository,
+    /** Stale-writer fix: the swap attempt number these deps belong to -- see `swapTx.ts`'s `BuildSwapDepsOptions.swapAttemptCount`. */
+    options: { swapAttemptCount: number },
   ) => TxSafetyDeps<SwapVerifyData>;
   buildApproveDeps?: (tokenAddress: Address, spender: Address, amountInRaw: bigint) => TxSafetyDeps<ApproveVerifyData>;
   /** Injectable for tests -- defaults to the real on-chain ERC20 reads. */
   readTokenBalance?: (tokenAddress: Address, wallet: Address) => Promise<bigint>;
   readAllowance?: (tokenAddress: Address, owner: Address, spender: Address) => Promise<bigint>;
+  /**
+   * H1: injectable for tests -- defaults to the real receipt-scoped ERC20
+   * `Transfer(... -> wallet)` decoder (`blockchain/erc20.ts`). Used ONLY to
+   * recover a legacy remove-liquidity attempt (verified by an older build,
+   * so its verifyData has no `tokenProceedsRaw`) whose wallet TOKEN balance
+   * reads 0: the attempt's own confirmed receipt is re-read to PROVE the
+   * burn paid 0 TOKEN before it is treated as a USDG-only close.
+   */
+  readTransfersTo?: (txHash: `0x${string}`, tokenAddress: Address, wallet: Address) => Promise<bigint>;
   walletAddress?: Address;
   /** TIER 3: `priceImpactPct` is nullable -- a provider that omits the field is reported as UNAVAILABLE rather than logged as 0.000%. */
   logImpact?: (positionId: string, priceImpactPct: number | null) => void;
@@ -203,7 +283,12 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
   const removeResult = await executeCriticalTransaction(removeKey, 'exit:removeLiquidity', removeDeps, deps.txAttempts);  if (!removeResult.ok) {
     if (!removeResult.resumable) {
       // Definitive, and Tx A never reached VERIFIED -- LP fully intact.
-      await deps.positions.markExitFailed(position.id);
+      // Conditional on THIS close attempt (stale-writer fix): a worker whose
+      // close has already been superseded or finalized reverts nothing.
+      const reverted = await deps.positions.markExitFailed(position.id, position.closeIdempotencyKey);
+      if (!reverted) {
+        return { outcome: 'PENDING', reason: 'position is no longer CLOSING under this close attempt (another worker moved it on) -- nothing reverted' };
+      }
       return { outcome: 'REVERTED_TO_ACTIVE', reason: removeResult.reason };
     }
     // Ambiguous (broadcast uncertain, etc.) -- retry the SAME key next tick, executeCriticalTransaction resumes from the last checkpoint.
@@ -240,14 +325,67 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
   // swap. Resume-only deps carry no quote, so the pipeline can only re-run
   // the steps this attempt has not completed yet.
   if (existingSwapAttempt && existingSwapAttempt.status !== 'FAILED' && existingSwapAttempt.txHash !== null) {
-    const resumeSwapDeps = buildSwapDeps(position.id, position.tokenAddress, null, deps.swapExecutor, deps.exitStates);
+    const resumeSwapDeps = buildSwapDeps(position.id, position.tokenAddress, null, deps.swapExecutor, deps.exitStates, { swapAttemptCount: exitState.swapAttemptCount });
     const resumedSwap = await executeCriticalTransaction(swapKey, 'exit:swap', resumeSwapDeps, deps.txAttempts);
     return settleSwapLeg(resumedSwap, position, exitState, deps, removeKey, swapKey);
   }
 
-  const amountInRaw = await readTokenBalance(position.tokenAddress, wallet);
+  // H1 fix: "is there TOKEN to swap" is decided from the remove-liquidity
+  // leg's OWN receipt (`tokenProceedsRaw`), not inferred from the live
+  // wallet balance. The old code read the live balance and threw on 0 --
+  // but a one-sided USDG position that never traded into its range burns
+  // to USDG only, so 0 TOKEN is the NORMAL outcome of the strategy's most
+  // common "never filled" close (OOR_TIMEOUT), and every such position was
+  // stranded at CLOSING forever: slot and token never freed, its returned
+  // USDG counted both in the wallet and as deployed. Three cases:
+  //   - receipt says 0 TOKEN   -> USDG-only close, validated by
+  //                               `classifyUsdgOnlyRemoval`, no swap;
+  //   - receipt says > 0 TOKEN -> the existing swap flow, unchanged
+  //                               (including the invariant throw below if
+  //                               that TOKEN is somehow no longer in the
+  //                               wallet -- still a genuine anomaly);
+  //   - legacy attempt (no tokenProceedsRaw recorded) -> the old
+  //                               live-balance behavior, EXCEPT that a 0
+  //                               balance is now checked against the
+  //                               attempt's own receipt instead of thrown.
+  const removal = removeResult.data;
+  let removalTokenProceedsRaw: bigint | undefined = removal.tokenProceedsRaw;
+  let removalUsdgProceedsRaw: bigint | undefined = (removal as Partial<RemoveLiquidityVerifyData>).usdgProceedsRaw;
+  let amountInRaw: bigint | null = null;
+  if (removalTokenProceedsRaw === undefined) {
+    amountInRaw = await readTokenBalance(position.tokenAddress, wallet);
+    if (amountInRaw <= 0n) {
+      const txHash = removeResult.attempt.txHash;
+      if (!txHash) {
+        return { outcome: 'PENDING', reason: `remove-liquidity is VERIFIED with no recorded TOKEN proceeds and no txHash to re-read them from -- manual review required` };
+      }
+      const readTransfersTo = deps.readTransfersTo ?? readErc20TransfersTo;
+      try {
+        removalTokenProceedsRaw = await readTransfersTo(txHash, position.tokenAddress, wallet);
+        removalUsdgProceedsRaw ??= await readTransfersTo(txHash, config.quoteAsset.ADDRESS as Address, wallet);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { outcome: 'PENDING', reason: `could not re-read the remove-liquidity receipt to prove its TOKEN proceeds: ${message}` };
+      }
+    }
+  }
+
+  if (removalTokenProceedsRaw === 0n) {
+    const usdgProceedsRaw = removalUsdgProceedsRaw ?? 0n;
+    const check = classifyUsdgOnlyRemoval(position.entryUsdgRaw, usdgProceedsRaw);
+    if (!check.ok) {
+      const warnLog = deps.warnLog ?? ((event, data) => { console.warn(event, data); });
+      warnLog('exit_usdg_only_close_anomaly', { positionId: position.id, reason: check.reason });
+      // Stays CLOSING (still counted as deployed -- conservative) and is
+      // surfaced by reconciliation's CLOSING_ALREADY_REMOVED check.
+      return { outcome: 'PENDING', reason: check.reason };
+    }
+    return finalizeClose(position, exitState, deps, removeKey, null, usdgProceedsRaw);
+  }
+
+  amountInRaw ??= await readTokenBalance(position.tokenAddress, wallet);
   if (amountInRaw <= 0n) {
-    throw new Error(`position ${position.id}: remove-liquidity is VERIFIED but TOKEN balance reads 0 -- invariant violated`);
+    throw new Error(`position ${position.id}: remove-liquidity is VERIFIED and paid ${removalTokenProceedsRaw ?? 'unknown'} TOKEN, but TOKEN balance reads 0 -- invariant violated`);
   }
   // TIER 3 — slippage ladder. The tier is `swapAttemptCount`, which Module
   // 8 increments ONLY on a DEFINITIVE failure, so:
@@ -262,9 +400,61 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
   // No new persisted state: the tier IS the attempt counter.
   const slippageBps = exitSlippageBpsForAttempt(exitState.swapAttemptCount);
 
-  const quote = await deps.swapExecutor.getQuote(position.tokenAddress, amountInRaw, slippageBps);
+  // TOKEN-leg unactionability (e.g. residual TOKEN fees too small for the
+  // Trading API to route, "no route", or an unverifiable price impact):
+  // deliberately NOT resolved by skipping the swap. There is no vetted,
+  // safe way today to call an amount "negligible" -- no configured dust
+  // value, no oracle beyond this pool's own manipulable spot price, no
+  // ETH->USDG price to weigh against gas, opaque API error bodies, and no
+  // Position field to record retained TOKEN -- so dropping the swap could
+  // silently discard real value and under-report realized proceeds. The
+  // TOKEN is instead RETAINED in the wallet, the position stays CLOSING
+  // (its capital still counted as deployed -- conservative), no gas is
+  // spent, `swapAttemptCount` is NOT bumped (nothing was attempted), and
+  // the SAME attempt is retried next tick. What changed is only that this
+  // is an explicit, structured, logged deferral (`exit_token_leg_unactionable`,
+  // carrying the receipt-proven TOKEN amount) instead of an exception
+  // surfacing through `runExitCycle`'s catch -- the outcome it produced
+  // (PENDING, stays CLOSING) is unchanged. An operator-approved dust
+  // policy would be required to go further; see the H1 follow-up report.
+  const warnLog = deps.warnLog ?? ((event: string, data?: Record<string, unknown>) => { console.warn(event, data); });
+  const tokenLegContext = {
+    positionId: position.id,
+    receiptTokenProceedsRaw: removalTokenProceedsRaw === undefined ? null : removalTokenProceedsRaw.toString(),
+    walletTokenAmountRaw: amountInRaw.toString(),
+    tokenDecimals: position.tokenDecimals,
+  };
+  // Unroutable TOKEN leg: the block is recorded DURABLY on ExitState (for
+  // THIS swap attempt only) so it survives restarts and is operator-visible
+  // (GET /positions/stuck, Telegram /stuck) -- classified
+  // OPERATOR_ACTION_REQUIRED once it has lasted longer than the existing
+  // stuck-surfacing policy (see exits/closingRecovery.ts). The position
+  // still stays CLOSING and is still retried every tick; nothing is closed,
+  // settled or valued. Logged only when a block STARTS or CHANGES reason --
+  // not on every 15s retry.
+  const noteBlocked = async (cause: SwapLegBlockReason, extra: Record<string, unknown>): Promise<void> => {
+    let change: 'NEW' | 'UNCHANGED' | 'STALE' = 'NEW';
+    try {
+      change = await deps.exitStates.recordSwapLegBlocked(position.id, exitState.swapAttemptCount, cause, new Date());
+    } catch {
+      // Recording is observability only -- never turns a safe deferral into a failure.
+    }
+    if (change === 'NEW') warnLog('exit_token_leg_unactionable', { ...tokenLegContext, cause, ...extra });
+  };
+  let quote: SwapQuote;
+  try {
+    quote = await deps.swapExecutor.getQuote(position.tokenAddress, amountInRaw, slippageBps);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await noteBlocked('QUOTE_UNAVAILABLE', { error: message });
+    return {
+      outcome: 'PENDING',
+      reason: `exit swap quote unavailable for ${amountInRaw} TOKEN (${message}) -- TOKEN retained in the wallet, position stays CLOSING, retried next tick`,
+    };
+  }
   logImpact(position.id, quote.priceImpactPct);
   if (shouldBlockForPriceImpact(quote.priceImpactPct, config.rules.exits.IMPACT_CHECK_ENABLED, config.rules.priceImpact.MAX_EXIT_IMPACT_PCT)) {
+    await noteBlocked('PRICE_IMPACT_BLOCKED', { priceImpactPct: quote.priceImpactPct });
     // Not a definitive failure -- conditions right now are bad, not
     // permanently invalid; no TransactionAttempt is even created for this
     // tick, and `swapAttemptCount` is NOT incremented (so this deferral
@@ -280,6 +470,8 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
       reason: `exit swap price impact ${measured} -- IMPACT_CHECK_ENABLED is on, deferring this swap`,
     };
   }
+  // The swap can proceed now -- the TOKEN leg is no longer blocked.
+  await deps.exitStates.clearSwapLegBlocked(position.id, exitState.swapAttemptCount);
 
   // C5 fix: the quote response has no `allowanceTarget` field on the real
   // API -- the real mechanism is this separate check, which also returns
@@ -299,7 +491,9 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
 
       if (!approveResult.ok) {
         if (!approveResult.resumable) {
-          await deps.exitStates.incrementSwapAttempt(position.id);
+          // From THIS attempt's count only: if another worker already
+          // recorded this same failure, the counter is not bumped twice.
+          await deps.exitStates.incrementSwapAttemptFrom(position.id, exitState.swapAttemptCount);
           return { outcome: 'SWAP_FAILED_RETRY_PENDING', reason: approveResult.reason };
         }
         return { outcome: 'PENDING', reason: approveResult.reason };
@@ -307,7 +501,7 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
     }
   }
 
-  const swapDeps = buildSwapDeps(position.id, position.tokenAddress, quote, deps.swapExecutor, deps.exitStates);
+  const swapDeps = buildSwapDeps(position.id, position.tokenAddress, quote, deps.swapExecutor, deps.exitStates, { swapAttemptCount: exitState.swapAttemptCount });
   const swapResult = await executeCriticalTransaction(swapKey, 'exit:swap', swapDeps, deps.txAttempts);
   return settleSwapLeg(swapResult, position, exitState, deps, removeKey, swapKey);
 }
@@ -316,7 +510,7 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
 async function settleSwapLeg(
   swapResult: ExecutionResult<SwapVerifyData>,
   position: PositionRecord,
-  exitState: { pendingCloseReason: string | null },
+  exitState: { pendingCloseReason: string | null; swapAttemptCount: number },
   deps: ExecuteExitDeps,
   removeKey: string,
   swapKey: string,
@@ -326,11 +520,23 @@ async function settleSwapLeg(
       // Definitive, but Tx A is ALREADY VERIFIED -- LP is gone, cannot
       // revert to ACTIVE. Bump the counter so the next retry gets fresh
       // approve/swap keys; position stays CLOSING (correct -- see doc comment above).
-      await deps.exitStates.incrementSwapAttempt(position.id);
+      // From THIS attempt's count only (stale-writer fix): two workers that
+      // both observe the same definitive failure advance the counter once,
+      // never skipping a slippage tier.
+      await deps.exitStates.incrementSwapAttemptFrom(position.id, exitState.swapAttemptCount);
       return { outcome: 'SWAP_FAILED_RETRY_PENDING', reason: swapResult.reason };
     }
     // Ambiguous, including "confirmed but proceeds not yet measured" --
     // same key next tick, which resumes via the signed-attempt path above.
+    // Same-attempt swap race: a worker that lost ownership of this attempt
+    // (its checkpoint write failed the version check, or its attempt number
+    // is no longer current) stopped BEFORE building on it, signing or
+    // broadcasting -- not a failure, no gas spent. Surfaced once per
+    // occurrence, never on a quiet tick.
+    if (/not at expected version|stale worker, not building/.test(swapResult.reason)) {
+      const warnLog = deps.warnLog ?? ((event: string, data?: Record<string, unknown>) => { console.warn(event, data); });
+      warnLog('exit_swap_attempt_ownership_lost', { positionId: position.id, swapKey, reason: swapResult.reason });
+    }
     return { outcome: 'PENDING', reason: swapResult.reason };
   }
 
@@ -376,6 +582,14 @@ export function computeRealizedProceeds(
         typeof removeProceeds === 'object' && removeProceeds !== null && 'usdgProceedsRaw' in removeProceeds
           ? (removeProceeds as RemoveLiquidityVerifyData).usdgProceedsRaw
           : null;
+      // H1: a remove-liquidity whose own receipt paid 0 TOKEN had nothing to
+      // swap -- its USDG is the WHOLE realized amount; there is no swap leg
+      // to wait for (or to add, so nothing can be counted twice).
+      const removeTokenProceeds =
+        typeof removeProceeds === 'object' && removeProceeds !== null && 'tokenProceedsRaw' in removeProceeds
+          ? (removeProceeds as RemoveLiquidityVerifyData).tokenProceedsRaw
+          : undefined;
+      if (removeTokenProceeds === 0n) return removeUsdg;
       const swapUsdg =
         typeof swapProceeds === 'object' && swapProceeds !== null && 'usdgProceedsRaw' in swapProceeds
           ? (swapProceeds as SwapVerifyData).usdgProceedsRaw
@@ -390,15 +604,19 @@ export function computeRealizedProceeds(
 
 /**
  * The final step of a successful exit -- shared by the normal swap-just-
- * completed path and the C3 resume path (swap already found VERIFIED on
- * entry, before any live balance read).
+ * completed path, the C3 resume path (swap already found VERIFIED on
+ * entry, before any live balance read), and the H1 USDG-only path
+ * (`swapKey === null`: no swap leg exists, and `usdgOnlyProceedsRaw` is the
+ * remove-liquidity receipt's already-validated USDG amount -- the ENTIRE
+ * realized proceeds, taken as-is, never summed with anything).
  */
 async function finalizeClose(
   position: PositionRecord,
   exitState: { pendingCloseReason: string | null },
   deps: Pick<ExecuteExitDeps, 'positions' | 'warnLog' | 'txAttempts'>,
   removeKey: string,
-  swapKey: string,
+  swapKey: string | null,
+  usdgOnlyProceedsRaw?: bigint,
 ): Promise<ExitExecutionOutcome> {
   // C4 defense-in-depth: `runExitCycle.ts` now writes `pendingCloseReason`
   // BEFORE `markClosing` (reordered specifically so a crash between the
@@ -419,7 +637,17 @@ async function finalizeClose(
   // proceeds: a null here (unmeasurable) still closes the position -- the
   // number is reported as unavailable for THIS row, never blocks the
   // state transition.
-  const realizedUsdgRaw = await computeRealizedProceeds(deps, removeKey, swapKey);
-  await deps.positions.markClosed(position.id, new Date(), closeReason, realizedUsdgRaw);
+  // `markClosed` SETS the value (never increments), so a retried
+  // finalization after a crash writes the same deterministic number again
+  // -- there is no path that adds proceeds on top of a persisted value.
+  const realizedUsdgRaw = swapKey === null ? (usdgOnlyProceedsRaw ?? null) : await computeRealizedProceeds(deps, removeKey, swapKey);
+  // Conditional on still CLOSING under THIS close attempt (stale-writer
+  // fix): a late duplicate finalization -- e.g. a worker that outlived its
+  // claim lease -- writes nothing and reports PENDING instead of CLOSED, so
+  // the close (and its cooldown) is recorded exactly once.
+  const closed = await deps.positions.markClosed(position.id, new Date(), closeReason, realizedUsdgRaw, position.closeIdempotencyKey ?? undefined);
+  if (!closed) {
+    return { outcome: 'PENDING', reason: 'position was already finalized (or moved on) by another worker -- nothing written' };
+  }
   return { outcome: 'CLOSED' };
 }
