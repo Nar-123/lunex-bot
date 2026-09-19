@@ -1,7 +1,7 @@
 import type { Address } from 'viem';
 import { getAddress } from 'viem';
-import type { CreateIfCapitalAllowsResult, CreatePositionInput, OpeningExpiryResult, PositionRecord, PositionRepository } from '../../src/positions/types';
-import { DuplicateActiveTokenPositionError, openMintAttemptKey } from '../../src/positions/types';
+import type { CreateIfCapitalAllowsResult, CreatePositionInput, ManualSettlementEvidence, ManualSettlementRecord, OpeningExpiryResult, PositionRecord, PositionRepository } from '../../src/positions/types';
+import { DuplicateActiveTokenPositionError, ManualSettlementTxAlreadyUsedError, openMintAttemptKey } from '../../src/positions/types';
 import { decideCapitalAllocation } from '../../src/capital/decideCapitalAllocation';
 import type { CapitalRules } from '../../src/capital/types';
 import { checkCapitalStateConsistent, deriveCapitalSnapshot, exitLegKeyPrefix } from '../../src/capital/freshCapitalSnapshot';
@@ -184,7 +184,17 @@ export class InMemoryPositionRepository implements PositionRepository {
     return record;
   }
 
-  async markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null, expectedCloseIdempotencyKey?: string): Promise<PositionRecord | null> {
+  /** Manual TOKEN settlement via receipt: mirrors the `ManualTokenSettlement` table (txHash primary key). */
+  readonly manualSettlements = new Map<string, ManualSettlementRecord>();
+
+  async markClosed(
+    id: string,
+    closedAt: Date,
+    closeReason: string,
+    realizedUsdgRaw?: bigint | null,
+    expectedCloseIdempotencyKey?: string,
+    manualSettlement?: ManualSettlementEvidence,
+  ): Promise<PositionRecord | null> {
     const record = this.get(id);
     if (record.status !== 'CLOSING') return null;
     if (expectedCloseIdempotencyKey !== undefined && record.closeIdempotencyKey !== expectedCloseIdempotencyKey) return null;
@@ -195,6 +205,10 @@ export class InMemoryPositionRepository implements PositionRepository {
     record.realizedUsdgRaw = realizedUsdgRaw !== undefined ? realizedUsdgRaw : null;
     try {
       await this.cooldown?.recordExit(record.tokenAddress, closedAt);
+      if (manualSettlement) {
+        if (this.manualSettlements.has(manualSettlement.txHash)) throw new ManualSettlementTxAlreadyUsedError(manualSettlement.txHash);
+        this.manualSettlements.set(manualSettlement.txHash, { ...manualSettlement, positionId: id, closeIdempotencyKey: record.closeIdempotencyKey ?? '', settledAt: closedAt });
+      }
     } catch (err) {
       Object.assign(record, before); // "transaction" rollback: not CLOSED, no proceeds
       throw err;
@@ -202,6 +216,10 @@ export class InMemoryPositionRepository implements PositionRepository {
     return record;
   }
 
+  async findManualSettlementByTxHash(txHash: string): Promise<ManualSettlementRecord | null> {
+    const found = this.manualSettlements.get(txHash.toLowerCase());
+    return found ? { ...found } : null;
+  }
 
   async backfillRealizedUsdgRaw(id: string, realizedUsdgRaw: bigint): Promise<PositionRecord | null> {
     const record = this.byId.get(id);

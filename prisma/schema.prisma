@@ -412,3 +412,21 @@ model BotSettings {
   trailingTpTriggerPct Float    @default(0.06)
   updatedAt            DateTime @updatedAt
 }
+
+/// Manual TOKEN settlement via receipt: the operator-supplied transaction
+/// that disposed of a CLOSING position's receipt-proven residual TOKEN for
+/// USDG, as verified from that transaction's own receipt. Written ONLY
+/// inside `PositionRepository.markClosed`'s transaction (together with
+/// CLOSED, the realized proceeds and the cooldown), so it exists iff the
+/// settlement finalized. `txHash` is the primary key -- one transaction can
+/// settle at most one position -- and `positionId` is unique -- a position
+/// is settled at most once. Amounts are receipt-measured raw units.
+model ManualTokenSettlement {
+  txHash              String   @id
+  positionId          String   @unique
+  closeIdempotencyKey String
+  tokenDisposedRaw    String
+  usdgProceedsRaw     String
+  blockNumber         String
+  settledAt           DateTime
+}

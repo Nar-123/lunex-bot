@@ -11,6 +11,7 @@ import type { AppDeps } from '../composition/types';
 import { createStatusRouter } from './routes/status';
 import { createPositionsRouter } from './routes/positions';
 import { createStuckRouter } from './routes/stuck';
+import { createSettleTokenRouter } from './routes/settleToken';
 import { createCooldownsRouter } from './routes/cooldowns';
 import { createLogsRouter } from './routes/logs';
 import { createControlRouter } from './routes/control';
@@ -68,6 +69,7 @@ export function createApiServer(deps: AppDeps, options: CreateApiServerOptions =
   app.use(authMiddleware);
   app.use('/status', createStatusRouter(deps));
   app.use('/positions/stuck', createStuckRouter(deps));
+  app.use('/positions', createSettleTokenRouter(deps));
   app.use('/positions', createPositionsRouter(deps));
   app.use('/cooldowns', createCooldownsRouter(deps));
   app.use('/logs', createLogsRouter(options.logFilePath));

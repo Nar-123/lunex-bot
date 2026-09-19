@@ -4,7 +4,8 @@ import type { Address } from 'viem';
 import type { PrismaClient } from '@prisma/client';
 import { getPrismaClient } from '../storage/prismaClient';
 import type { CreateIfCapitalAllowsResult, CreatePositionInput, OpeningExpiryResult, PositionRecord, PositionRepository, PositionStatus } from './types';
-import { DuplicateActiveTokenPositionError, openMintAttemptKey } from './types';
+import { DuplicateActiveTokenPositionError, ManualSettlementTxAlreadyUsedError, openMintAttemptKey } from './types';
+import type { ManualSettlementEvidence, ManualSettlementRecord } from './types';
 import { decideCapitalAllocation } from '../capital/decideCapitalAllocation';
 import { checkCapitalStateConsistent, deriveCapitalSnapshot, exitLegKeyPrefix } from '../capital/freshCapitalSnapshot';
 import { findAttemptsByKeyPrefixes } from '../execution/transactionAttemptRepository';
@@ -399,7 +400,35 @@ export class PrismaPositionRepository implements PositionRepository {
    * at or after this close is left untouched (a same-token close can only
    * follow the previous one, so this never loses a later cooldown).
    */
-  async markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null, expectedCloseIdempotencyKey?: string): Promise<PositionRecord | null> {
+  async markClosed(
+    id: string,
+    closedAt: Date,
+    closeReason: string,
+    realizedUsdgRaw?: bigint | null,
+    expectedCloseIdempotencyKey?: string,
+    manualSettlement?: ManualSettlementEvidence,
+  ): Promise<PositionRecord | null> {
+    try {
+      return await this.markClosedTx(id, closedAt, closeReason, realizedUsdgRaw, expectedCloseIdempotencyKey, manualSettlement);
+    } catch (err) {
+      // Same precise field-list match as `create` above (verified against
+      // the real error in manualTokenSettlement.integration.test.ts).
+      const message = err instanceof Error ? err.message : String(err);
+      if (manualSettlement && /unique constraint failed on the fields:\s*\(`txHash`\)/i.test(message)) {
+        throw new ManualSettlementTxAlreadyUsedError(manualSettlement.txHash);
+      }
+      throw err;
+    }
+  }
+
+  private async markClosedTx(
+    id: string,
+    closedAt: Date,
+    closeReason: string,
+    realizedUsdgRaw: bigint | null | undefined,
+    expectedCloseIdempotencyKey: string | undefined,
+    manualSettlement: ManualSettlementEvidence | undefined,
+  ): Promise<PositionRecord | null> {
     return this.prisma.$transaction(
       async (tx) => {
         // Omitted -> null ("not measured") via Prisma's default-null on ADD COLUMN:
@@ -423,10 +452,40 @@ export class PrismaPositionRepository implements PositionRepository {
         } else if (existing.exitedAt.getTime() < closedAt.getTime()) {
           await tx.tokenCooldown.update({ where: { tokenAddress: row.tokenAddress }, data: { exitedAt: closedAt, cooldownEndsAt } });
         }
+        // Manual TOKEN settlement via receipt: the association is part of
+        // the same commit -- it exists iff this close did. The txHash
+        // primary key makes a transaction settle at most one position.
+        if (manualSettlement) {
+          await tx.manualTokenSettlement.create({
+            data: {
+              txHash: manualSettlement.txHash,
+              positionId: id,
+              closeIdempotencyKey: row.closeIdempotencyKey ?? '',
+              tokenDisposedRaw: manualSettlement.tokenDisposedRaw.toString(),
+              usdgProceedsRaw: manualSettlement.usdgProceedsRaw.toString(),
+              blockNumber: manualSettlement.blockNumber.toString(),
+              settledAt: closedAt,
+            },
+          });
+        }
         return toRecord(row);
       },
       { timeout: 15_000, maxWait: 15_000 },
     );
+  }
+
+  async findManualSettlementByTxHash(txHash: string): Promise<ManualSettlementRecord | null> {
+    const row = await this.prisma.manualTokenSettlement.findUnique({ where: { txHash: txHash.toLowerCase() } });
+    if (!row) return null;
+    return {
+      txHash: row.txHash,
+      positionId: row.positionId,
+      closeIdempotencyKey: row.closeIdempotencyKey,
+      tokenDisposedRaw: BigInt(row.tokenDisposedRaw),
+      usdgProceedsRaw: BigInt(row.usdgProceedsRaw),
+      blockNumber: BigInt(row.blockNumber),
+      settledAt: row.settledAt,
+    };
   }
 
   async backfillRealizedUsdgRaw(id: string, realizedUsdgRaw: bigint): Promise<PositionRecord | null> {

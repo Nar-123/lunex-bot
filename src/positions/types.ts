@@ -235,7 +235,17 @@ export interface PositionRepository {
    * CLOSING -> CLOSED only (conditional, and only for `expectedCloseIdempotencyKey` when given); `null` if already moved on -- a late duplicate finalization writes nothing.
    * Cooldown crash-gap fix: in the SAME atomic transaction, and only when this call's transition wins, also records the token's exit cooldown (`TokenCooldown`, the configured duration from `closedAt` -- never "now"). A successful close and its cooldown are therefore committed together or not at all.
    */
-  markClosed(id: string, closedAt: Date, closeReason: string, realizedUsdgRaw?: bigint | null, expectedCloseIdempotencyKey?: string): Promise<PositionRecord | null>;
+  markClosed(
+    id: string,
+    closedAt: Date,
+    closeReason: string,
+    realizedUsdgRaw?: bigint | null,
+    expectedCloseIdempotencyKey?: string,
+    /** Manual TOKEN settlement via receipt: recorded in the SAME transaction, only when this call's transition wins. A txHash already recorded (for any position) aborts the whole close. */
+    manualSettlement?: ManualSettlementEvidence,
+  ): Promise<PositionRecord | null>;
+  /** Manual TOKEN settlement via receipt: the settlement that used `txHash` (lowercased), if any -- read-only. */
+  findManualSettlementByTxHash(txHash: string): Promise<ManualSettlementRecord | null>;
   /**
    * P1-13 fix: idempotently backfills `realizedUsdgRaw` for a position
    * that is ALREADY CLOSED and whose value is still null (a legacy row,
@@ -372,4 +382,27 @@ export interface PositionRepository {
    * second caller sees NOT_OPENING.
    */
   expireStaleOpening(id: string, maxAgeMs: number, now: Date): Promise<OpeningExpiryResult>;
+}
+
+/** Manual TOKEN settlement via receipt: the receipt-measured facts `markClosed` persists with the close (see `ManualTokenSettlement` in schema.prisma). */
+export interface ManualSettlementEvidence {
+  /** Lowercased 0x-prefixed transaction hash. */
+  txHash: string;
+  tokenDisposedRaw: bigint;
+  usdgProceedsRaw: bigint;
+  blockNumber: bigint;
+}
+
+export interface ManualSettlementRecord extends ManualSettlementEvidence {
+  positionId: string;
+  closeIdempotencyKey: string;
+  settledAt: Date;
+}
+
+/** Thrown by `markClosed` when the settlement's txHash is already recorded -- the whole close rolled back. */
+export class ManualSettlementTxAlreadyUsedError extends Error {
+  constructor(public readonly txHash: string) {
+    super(`manual settlement transaction ${txHash} is already recorded`);
+    this.name = 'ManualSettlementTxAlreadyUsedError';
+  }
 }

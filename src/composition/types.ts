@@ -19,6 +19,7 @@ import type { ApproveVerifyData as ExitApproveVerifyData } from '../exits/approv
 import type { RemoveLiquidityVerifyData } from '../exits/removeLiquidityTx';
 import type { SwapVerifyData } from '../exits/swapTx';
 import type { Logger } from './logger';
+import type { ManualSettlementChainReader } from '../exits/manualTokenSettlement';
 
 /**
  * Everything the three live cycles (screening, monitoring, exit+open-resume)
@@ -70,6 +71,8 @@ export interface AppDeps {
   ownedNftLister: OwnedNftLister;
   nftOwnerChecker: NftOwnerChecker;
   positionIdentityChecker: PositionIdentityChecker;
+  /** Manual TOKEN settlement via receipt: read-only chain access for `POST /positions/:id/settle-token`. Unset in production -- the route uses the real viem reader. */
+  settlementChain?: ManualSettlementChainReader;
 
   /**
    * Optional overrides for the on-chain leg builders `openPosition`/

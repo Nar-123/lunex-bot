@@ -27,6 +27,8 @@ export interface ClosingRecoveryReport {
   tokenAddress: string;
   tokenSymbol: string;
   closeReason: string | null;
+  /** The close lifecycle -- what a manual settlement request (`POST /positions/:id/settle-token`) must name. */
+  closeIdempotencyKey: string | null;
   phase: ClosingRecoveryPhase;
   /**
    * TRUE when the exit cannot finish on its own within the repository's
@@ -75,6 +77,7 @@ export function assessClosingRecovery(
     tokenAddress: position.tokenAddress,
     tokenSymbol: position.tokenSymbol,
     closeReason: exitState.pendingCloseReason,
+    closeIdempotencyKey: position.closeIdempotencyKey,
     swapAttemptCount: exitState.swapAttemptCount,
     blockedSince: exitState.swapLegBlockedSince ?? null,
     lastCheckedAt: exitState.swapLegLastCheckedAt ?? null,

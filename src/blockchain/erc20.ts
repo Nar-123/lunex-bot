@@ -1,4 +1,4 @@
-import type { Address } from 'viem';
+import type { Address, Log } from 'viem';
 import { decodeFunctionData, encodeFunctionData, parseEventLogs } from 'viem';
 import { getPublicClient } from './viemClient';
 
@@ -193,20 +193,37 @@ export async function readErc20TransfersTo(
 ): Promise<bigint> {
   const client = getPublicClient();
   const receipt = await client.getTransactionReceipt({ hash: txHash });
-  const events = parseEventLogs({
-    abi: [ERC20_TRANSFER_EVENT],
-    logs: receipt.logs,
-    eventName: 'Transfer',
-  });
-
   let total = 0n;
-  for (const event of events) {
-    if (
-      event.address.toLowerCase() === tokenAddress.toLowerCase() &&
-      event.args.to.toLowerCase() === walletAddress.toLowerCase()
-    ) {
-      total += event.args.value;
+  for (const t of decodeErc20Transfers(receipt.logs)) {
+    if (t.token === tokenAddress.toLowerCase() && t.to === walletAddress.toLowerCase()) {
+      total += t.value;
     }
   }
   return total;
+}
+
+/** One decoded ERC20 `Transfer` from a receipt; addresses lowercased. */
+export interface DecodedErc20Transfer {
+  token: string;
+  from: string;
+  to: string;
+  value: bigint;
+  logIndex: number | null;
+}
+
+/**
+ * The receipt-log decoder shared by `readErc20TransfersTo` (above) and the
+ * manual TOKEN settlement proof (`exits/manualTokenSettlement.ts`): every
+ * well-formed ERC20 `Transfer` (3 topics) in `logs`, in log order. Logs
+ * that are not an ERC20 Transfer -- including ERC721 `Transfer` (4 topics,
+ * same selector) -- are skipped by viem's strict decoding.
+ */
+export function decodeErc20Transfers(logs: readonly Log[]): DecodedErc20Transfer[] {
+  return parseEventLogs({ abi: [ERC20_TRANSFER_EVENT], logs: logs as Log[], eventName: 'Transfer' }).map((e) => ({
+    token: e.address.toLowerCase(),
+    from: e.args.from.toLowerCase(),
+    to: e.args.to.toLowerCase(),
+    value: e.args.value,
+    logIndex: e.logIndex,
+  }));
 }
