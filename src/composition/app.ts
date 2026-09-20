@@ -1,4 +1,5 @@
 import { config } from '../config';
+import { getExecutionTargetVerification } from '../swap/executionTargetGate';
 import { scheduleInterval } from '../discovery/scheduler';
 import { runScreeningCycle } from './screeningCycle';
 import { runMonitoringLoggingCycle } from './monitoringCycle';
@@ -12,6 +13,9 @@ export interface StartAppOptions {
   exitIntervalMs?: number;
   /** How long `stop()` WAITS for an in-flight cycle to finish before giving up on waiting (never cancels the work itself -- see `stop()`'s doc comment). Defaults to `config.composition.shutdownTimeoutMs`. */
   shutdownTimeoutMs?: number;
+  /** Injected by the real entry point: re-runs the READ-ONLY execution-target identity assertion while it is not VERIFIED. Omitted in tests. */
+  verifyExecutionTargets?: () => Promise<unknown>;
+  verifyIntervalMs?: number;
 }
 
 export interface StopResult {
@@ -66,7 +70,28 @@ function trackable(task: () => Promise<void>): { run: () => Promise<void>; waitF
  * its very first (immediate) invocation, no separate startup-only code
  * path needed.
  */
+/** How often a non-VERIFIED execution-target assertion is retried. */
+const DEFAULT_VERIFY_INTERVAL_MS = 5 * 60 * 1000;
+
 export function startApp(deps: AppDeps, options: StartAppOptions = {}): RunningApp {
+  // Execution-target identity re-assertion (read-only). Only the real entry
+  // point injects it; tests and the integration smoke test never make these
+  // calls. It exists so a verification that failed because the RPC was briefly
+  // unreachable at boot can recover on its own instead of blocking exits until
+  // the next restart -- it is skipped entirely once the gate reads VERIFIED.
+  const stopVerify = options.verifyExecutionTargets
+    ? scheduleInterval(
+        async () => {
+          if (getExecutionTargetVerification() === 'VERIFIED') return;
+          await options.verifyExecutionTargets?.();
+        },
+        {
+          intervalMs: options.verifyIntervalMs ?? DEFAULT_VERIFY_INTERVAL_MS,
+          runImmediately: false,
+          onError: (err) => { deps.logger.error('execution_target_verification_error', { message: err instanceof Error ? err.message : String(err) }); },
+        },
+      )
+    : null;
   const screeningIntervalMs = options.screeningIntervalMs ?? config.rules.discovery.CYCLE_INTERVAL_MS;
   const monitoringIntervalMs = options.monitoringIntervalMs ?? config.rules.monitoring.INTERVAL_MS;
   const exitIntervalMs = options.exitIntervalMs ?? config.rules.monitoring.INTERVAL_MS;
@@ -129,6 +154,7 @@ export function startApp(deps: AppDeps, options: StartAppOptions = {}): RunningA
    */
   const stop = async (): Promise<StopResult> => {
     stopScreening();
+    stopVerify?.();
     stopMonitoring();
     stopExit();
 

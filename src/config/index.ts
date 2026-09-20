@@ -1,5 +1,6 @@
 import { env, parseTelegramUserIds } from './env';
 import * as constants from './constants';
+import type { ExecutionTargetPolicy } from '../swap/executionTargets';
 import type {
   ChainConfig,
   UniswapAddressBook,
@@ -56,6 +57,26 @@ const gmgn: GmgnConfig = {
   apiKey: env.GMGN_API_KEY,
 };
 
+/**
+ * Execution targets for the ACTIVE chain: the audited defaults from
+ * `constants.EXECUTION_TARGETS`, replaced per list by env (CSV) when set, with
+ * the legacy single-router env var merged into the router list so an existing
+ * deployment keeps working unchanged. An unknown chain with no override yields
+ * empty lists, which `swap/executionTargets.ts` treats as fail-closed.
+ */
+function resolveExecutionTargets(chainId: number): ExecutionTargetPolicy {
+  const defaults = constants.EXECUTION_TARGETS[chainId] ?? { universalRouters: [], swapProxies: [] };
+  const routerOverride = splitCsv(env.UNISWAP_ALLOWED_UNIVERSAL_ROUTERS);
+  const proxyOverride = splitCsv(env.UNISWAP_ALLOWED_SWAP_PROXIES);
+  const legacy = env.UNISWAP_ALLOWED_SWAP_ROUTER_ADDRESS.trim();
+  const merged = [...defaults.universalRouters, ...(legacy ? [legacy] : [])].map((a) => a.trim()).filter(Boolean);
+  return {
+    chainId,
+    universalRouters: routerOverride.length > 0 ? routerOverride : [...new Set(merged.map((a) => a.toLowerCase()))].map((lower) => merged.find((a) => a.toLowerCase() === lower) ?? lower),
+    swapProxies: proxyOverride.length > 0 ? proxyOverride : [...defaults.swapProxies],
+  };
+}
+
 const uniswapTradingApi: UniswapTradingApiConfig = {
   baseUrl: env.UNISWAP_TRADING_API_BASE_URL,
   apiKey: env.UNISWAP_API_KEY,
@@ -63,6 +84,7 @@ const uniswapTradingApi: UniswapTradingApiConfig = {
   // Empty means "not confirmed yet," and validateSwapQuote.ts fails
   // closed (rejects every swap) rather than skip the check.
   allowedRouterAddress: env.UNISWAP_ALLOWED_SWAP_ROUTER_ADDRESS,
+  executionTargets: resolveExecutionTargets(env.CHAIN_ID),
 };
 
 const database: DatabaseConfig = {

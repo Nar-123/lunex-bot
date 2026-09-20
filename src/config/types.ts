@@ -1,3 +1,5 @@
+import type { ExecutionTargetPolicy } from '../swap/executionTargets';
+
 /** Shared config-shaped types, consumed by config/index.ts and downstream modules. */
 
 export interface ChainConfig {
@@ -51,8 +53,15 @@ export interface GmgnConfig {
 export interface UniswapTradingApiConfig {
   baseUrl: string;
   apiKey: string;
-  /** H9: the ONLY contract address exit-swap calldata is allowed to target. Empty means unconfirmed -- `swap/validateSwapQuote.ts` fails closed in that case, never skips the check. */
+  /** H9 (legacy single-address form): merged into `executionTargets.universalRouters` for the active chain. Empty means "no legacy override". */
   allowedRouterAddress: string;
+  /**
+   * Chain-scoped execution-target policy for exit swaps: which Universal
+   * Routers may be targeted (directly, or named INSIDE SwapProxy calldata) and
+   * which SwapProxies may be targeted. No approved router = fail closed; see
+   * `swap/executionTargets.ts`.
+   */
+  executionTargets: ExecutionTargetPolicy;
 }
 
 export interface DatabaseConfig {

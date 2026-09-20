@@ -334,6 +334,43 @@ export const MONITORING = {
  *   7. LOW_YIELD           age >= 30min AND fee yield below floor
  *   8. OOR_TIMEOUT / INFRA_SAFETY_EXIT  (pre-existing Lunex protections)
  */
+/**
+ * Chain-scoped EXIT execution targets -- the only contracts exit-swap calldata
+ * may be sent to, and the only routers a SwapProxy payload may name.
+ *
+ * Robinhood Chain (4663); every address below was confirmed from Uniswap's own
+ * published sources AND on-chain before being listed:
+ *
+ *  - UniversalRouter 0x8876...0904: listed as "Universal Router 2.1.1" for
+ *    chain 4663 in Uniswap's Trading API supported-chains table (that chain has
+ *    no 2.0 deployment); on-chain it carries Universal Router bytecode and its
+ *    `poolManager()` returns the configured PoolManager.
+ *  - SwapProxy 0x0000000085E1...Affad: the deterministic CREATE2 SwapProxy
+ *    documented for the `x-permit2-disabled` proxy approval flow ("the same
+ *    address on every chain"), listed as SwapProxy for chain 4663 in Uniswap's
+ *    deployments.json, and deployed on chain 4663 with bytecode identical to
+ *    the proxy the API currently targets.
+ *
+ * DELIBERATELY NOT LISTED (see the exit-router investigation):
+ *  - 0x02E5be68D46DAc0B524905bfF209cf47EE6dB2a9 -- the previous,
+ *    non-deterministic SwapProxy. Uniswap's own documentation says it "is
+ *    deprecated. Integrators still pointing at it should migrate". The live API
+ *    still returns it for this chain; that is a provider-side migration gap,
+ *    not a reason to authorise it here.
+ *  - 0x204FAca1764B154221e35c0d20aBb3c525710498 -- the router the API currently
+ *    embeds in proxy calldata. It is Universal-Router-shaped and bound to the
+ *    correct PoolManager on-chain, but NO official Uniswap source lists it for
+ *    chain 4663 (the docs name 0x8876..., deployments.json names 0x06AfBA43...).
+ *    Unverified provenance is not approval.
+ * Either may be added only by a separately verified deployment decision.
+ */
+export const EXECUTION_TARGETS: Record<number, { universalRouters: readonly string[]; swapProxies: readonly string[] }> = {
+  4663: {
+    universalRouters: ['0x8876789976dEcBfCbBbe364623C63652db8C0904'],
+    swapProxies: ['0x0000000085E102724e78eCd2F45DC9cA239Affad'],
+  },
+};
+
 export const EXITS = {
   // ---- Priority 1 ---------------------------------------------------
   /**
@@ -530,6 +567,29 @@ export const EXITS = {
    */
   SWAP_RETRY: {
     STUCK_THRESHOLD: 3, // = SLIPPAGE_TIERS_BPS.length: all tiers spent
+  },
+
+  /**
+   * Backoff for a DETERMINISTIC swap-leg block (unapproved execution target,
+   * unapproved embedded router, undecodable proxy calldata, unapproved
+   * approval spender). Such a failure states something about CONFIGURATION,
+   * not about market conditions: retrying identical inputs every 15s cannot
+   * succeed, and each attempt costs two Trading API calls. The ladder is a
+   * function of how long the SAME failure fingerprint has stood, so it needs
+   * no extra persisted state and survives restarts. Transient blocks
+   * (QUOTE_UNAVAILABLE, PRICE_IMPACT_BLOCKED) are NOT affected -- their cause
+   * can change on its own, so they keep retrying every tick.
+   */
+  DETERMINISTIC_BLOCK_BACKOFF: {
+    /** [blocked-for-at-least-ms, retry-no-more-often-than-ms]; the last matching step wins. */
+    LADDER_MS: [
+      [0, 15 * 1000],
+      [60 * 1000, 60 * 1000],
+      [5 * 60 * 1000, 5 * 60 * 1000],
+      [15 * 60 * 1000, 15 * 60 * 1000],
+    ] as readonly (readonly [number, number])[],
+    /** Once the same deterministic block has stood this long, the position is surfaced as OPERATOR_ACTION_REQUIRED (same age policy the existing stuck surfacing uses). */
+    OPERATOR_ACTION_AFTER_MS: 10 * 60 * 1000,
   },
 
   /**

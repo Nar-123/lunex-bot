@@ -1,5 +1,6 @@
 import type { Address } from 'viem';
 import { config } from './config';
+import { assertExecutionTargetsAtStartup } from './swap/verifyExecutionTargets';
 import { createRealAppDeps, startApp } from './composition';
 import { startApiServer } from './api';
 import { startTelegramBot } from './telegram';
@@ -30,7 +31,14 @@ async function main(): Promise<void> {
   const deps = createRealAppDeps();
   deps.logger.info('startup', { chainId: config.chain.chainId, env: config.nodeEnv, db: config.database.provider });
 
-  const { stop } = startApp(deps);
+  // READ-ONLY identity assertion for the exit-swap execution targets (approved
+  // Universal Routers / SwapProxies). Never throws and never transacts: a
+  // failure blocks exit-swap SIGNING via the execution-target gate (surfaced as
+  // a deterministic block on the position) while monitoring keeps running.
+  const verifyTargets = (): Promise<unknown> => assertExecutionTargetsAtStartup((event, data) => { deps.logger.info(event, data); });
+  await verifyTargets();
+
+  const { stop } = startApp(deps, { verifyExecutionTargets: verifyTargets });
   const httpServer = await startApiServer(deps);
   deps.logger.info('api_server_started', { port: config.api.port, host: config.api.host });
 

@@ -1,5 +1,6 @@
 import type { Address } from 'viem';
 import { config } from '../config';
+import { getExecutionTargetVerification } from './executionTargetGate';
 import { QUOTE_ASSET } from '../config/constants';
 import { getExecutorAddress } from '../blockchain/walletClient';
 import type { TxRequest } from '../execution/types';
@@ -135,7 +136,7 @@ export class TradingApiSwapClient implements SwapExecutor {
     return parseApprovalResponse(body);
   }
 
-  async buildSwapTx(_tokenIn: Address, quote: SwapQuote): Promise<TxRequest> {
+  async buildSwapTx(tokenIn: Address, quote: SwapQuote): Promise<TxRequest> {
     const res = await this.fetchFn(`${this.baseUrl}/v1/swap`, {
       method: 'POST',
       headers: this.headers(),
@@ -156,7 +157,9 @@ export class TradingApiSwapClient implements SwapExecutor {
       amountInRaw: quote.amountInRaw,
       chainId: config.chain.chainId,
       minReceivedRequired: config.rules.exits.MIN_RECEIVED_PROTECTION_ENABLED,
-      allowedRouterAddress: config.uniswapTradingApi.allowedRouterAddress,
+      targets: config.uniswapTradingApi.executionTargets,
+      tokenIn,
+      identityGate: getExecutionTargetVerification(),
     });
   }
 }

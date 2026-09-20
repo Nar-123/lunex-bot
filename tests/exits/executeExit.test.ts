@@ -16,7 +16,9 @@ import { config } from '../../src/config';
 const TX: TxRequest = { to: '0x1111111111111111111111111111111111111111', data: '0xabcdef', value: 0n };
 const WALLET = '0x9999999999999999999999999999999999999999' as Address;
 const TOKEN = '0x0000000000000000000000000000000000000002' as Address;
-const SPENDER = '0x3333333333333333333333333333333333333333' as Address;
+// An APPROVED execution target (the chain's configured SwapProxy): the exit flow
+// now refuses to approve any spender that is not an approved router/proxy.
+const SPENDER = config.uniswapTradingApi.executionTargets.swapProxies[0] as Address;
 const USDG = (n: number): bigint => BigInt(n) * 10n ** 18n;
 
 function fakeTxDeps<T>(data: T, overrides: Partial<TxSafetyDeps<T>> = {}): TxSafetyDeps<T> {

@@ -11,6 +11,18 @@ import type { ExitStateRepository, SwapLegBlockReason } from './types';
 import { buildRemoveLiquidityDeps as realBuildRemoveLiquidityDeps, type RemoveLiquidityVerifyData } from './removeLiquidityTx';
 import { buildSwapDeps as realBuildSwapDeps, defaultLogImpact, shouldBlockForPriceImpact, type SwapVerifyData } from './swapTx';
 import { buildApproveDeps as realBuildApproveDeps, needsApproval, type ApproveVerifyData } from './approveTx';
+import { classifyApprovalSpender } from '../swap/executionTargets';
+import { evaluateSuppression, fingerprintDeterministicFailure, recordDeterministicBlock } from './swapLegBackoff';
+
+/**
+ * Recognises a swap leg that was refused by `validateSwapQuote`'s
+ * execution-target rules. The executor surfaces a BUILD failure as text, so the
+ * marker is the validation error's own class name, which `safeErrorMessage`
+ * preserves verbatim.
+ */
+export function isSwapTargetValidationFailure(reason: string): boolean {
+  return reason.includes('SwapQuoteValidationError');
+}
 
 /**
  * TIER 3 — maps a definitive-failure count to a slippage tier, clamping at
@@ -441,6 +453,36 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
     }
     if (change === 'NEW') warnLog('exit_token_leg_unactionable', { ...tokenLegContext, cause, ...extra });
   };
+  // Deterministic-block backoff: a swap leg blocked by CONFIGURATION (an
+  // unapproved execution target/embedded router, undecodable proxy calldata, an
+  // unapproved approval spender) cannot recover by being retried with identical
+  // inputs. While such a block stands, most ticks are suppressed entirely --
+  // no quote call, no swap call, no transaction attempt, nothing signed. The
+  // position is untouched and keeps being monitored; only the provider traffic
+  // stops. See swapLegBackoff.ts.
+  const suppression = evaluateSuppression(exitState, new Date());
+  if (suppression.suppressed) {
+    return {
+      outcome: 'PENDING',
+      reason:
+        `exit swap blocked (${suppression.reason}) for ${Math.floor(suppression.blockedForMs / 1000)}s -- ` +
+        `retry suppressed until ${suppression.nextAttemptAt?.toISOString() ?? 'the next window'}` +
+        `${suppression.operatorActionRequired ? ' -- OPERATOR ACTION REQUIRED' : ''}; TOKEN retained, position stays CLOSING`,
+    };
+  }
+
+  /** Records a deterministic (configuration) block and reports it the same way a transient block is reported. */
+  const noteDeterministicBlock = async (reason: 'TARGET_NOT_APPROVED' | 'APPROVAL_SPENDER_NOT_APPROVED', detail: string, extra: Record<string, unknown>): Promise<void> => {
+    const fingerprint = fingerprintDeterministicFailure({ errorClass: reason, detail, ...extra });
+    let change: 'NEW' | 'UNCHANGED' | 'STALE' = 'NEW';
+    try {
+      change = await recordDeterministicBlock(deps.exitStates, position.id, exitState.swapAttemptCount, reason, fingerprint, new Date(), exitState.swapLegBlockedReason ?? null);
+    } catch {
+      // Observability only -- never turns a safe refusal into a failure.
+    }
+    if (change === 'NEW') warnLog('exit_token_leg_unactionable', { ...tokenLegContext, cause: reason, fingerprint, ...extra, detail });
+  };
+
   let quote: SwapQuote;
   try {
     quote = await deps.swapExecutor.getQuote(position.tokenAddress, amountInRaw, slippageBps);
@@ -483,6 +525,27 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
   const approvalCheck = await deps.swapExecutor.checkApproval(position.tokenAddress, amountInRaw);
   if (approvalCheck.needsApproval && approvalCheck.spender) {
     const spender = approvalCheck.spender;
+    // The spender the provider names is held to the SAME standard as a swap
+    // target: it must be an approved Universal Router or an approved SwapProxy
+    // for this chain. Granting an allowance to an unapproved contract is the
+    // one irreversible-ish step available before signing a swap, so it is
+    // refused here rather than validated later. (The embedded-router guarantee
+    // is enforced by validateSwapQuote before anything is signed; an allowance
+    // alone moves no funds.)
+    let spenderMatch: ReturnType<typeof classifyApprovalSpender>;
+    try {
+      spenderMatch = classifyApprovalSpender(spender, config.uniswapTradingApi.executionTargets);
+    } catch {
+      // malformed address / unusable policy -> treated as not approved
+      spenderMatch = null;
+    }
+    if (spenderMatch === null) {
+      const detail =
+        `provider asked to approve spender ${spender}, which is not an approved execution target for chain ` +
+        `${config.uniswapTradingApi.executionTargets.chainId} -- no approval sent`;
+      await noteDeterministicBlock('APPROVAL_SPENDER_NOT_APPROVED', detail, { spender });
+      return { outcome: 'PENDING', reason: `exit swap blocked: ${detail}` };
+    }
     const currentAllowance = await readAllowance(position.tokenAddress, wallet, spender);
     if (needsApproval(currentAllowance, amountInRaw)) {
       const approveKey = `${position.closeIdempotencyKey}:approve:${exitState.swapAttemptCount}`;
@@ -503,6 +566,13 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
 
   const swapDeps = buildSwapDeps(position.id, position.tokenAddress, quote, deps.swapExecutor, deps.exitStates, { swapAttemptCount: exitState.swapAttemptCount });
   const swapResult = await executeCriticalTransaction(swapKey, 'exit:swap', swapDeps, deps.txAttempts);
+  if (!swapResult.ok && isSwapTargetValidationFailure(swapResult.reason)) {
+    // The provider's calldata failed the two-layer execution-target check. The
+    // attempt never reached signing (it failed at BUILD), so nothing is on
+    // chain; what matters now is to stop asking the provider the same question
+    // every 15 seconds.
+    await noteDeterministicBlock('TARGET_NOT_APPROVED', swapResult.reason, {});
+  }
   return settleSwapLeg(swapResult, position, exitState, deps, removeKey, swapKey);
 }
 

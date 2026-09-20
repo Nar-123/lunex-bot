@@ -97,7 +97,7 @@ export async function runQuoteValidation(tokenAddressRaw: string, amountInRaw: b
   // never called in this phase).
   if (config.uniswapTradingApi.allowedRouterAddress) {
     const candidate: RawSwapTxCandidate = {
-      to: config.uniswapTradingApi.allowedRouterAddress,
+      to: config.uniswapTradingApi.executionTargets.universalRouters[0] ?? '0x',
       data: '0x' + 'ab'.repeat(4),
       value: '0',
       chainId: config.chain.chainId,
@@ -109,9 +109,10 @@ export async function runQuoteValidation(tokenAddressRaw: string, amountInRaw: b
         amountInRaw,
         chainId: config.chain.chainId,
         minReceivedRequired: config.rules.exits.MIN_RECEIVED_PROTECTION_ENABLED,
-        allowedRouterAddress: config.uniswapTradingApi.allowedRouterAddress,
+        targets: config.uniswapTradingApi.executionTargets,
+        tokenIn: config.quoteAsset.ADDRESS,
       });
-      console.log(`  router allow-list: configured router ${config.uniswapTradingApi.allowedRouterAddress} passes the exit flow's own validation`);
+      console.log(`  router allow-list: configured router ${config.uniswapTradingApi.executionTargets.universalRouters[0] ?? '(none)'} passes the exit flow's own validation`);
     } catch (err) {
       if (err instanceof SwapQuoteValidationError) {
         failures++;

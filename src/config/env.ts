@@ -171,6 +171,14 @@ const envSchema = z.object({
   // confirmed Robinhood Chain's real router address from here, and a
   // placeholder guess would be worse than refusing to swap at all.
   UNISWAP_ALLOWED_SWAP_ROUTER_ADDRESS: z.string().optional().default(''),
+  // Chain-scoped execution-target allowlists (comma-separated), applied to the
+  // ACTIVE chain. Either one, when set, REPLACES that chain's audited default
+  // list in constants.ts EXECUTION_TARGETS; unset means use the audited
+  // defaults. An approved Universal Router may be a direct swap target and is
+  // the only kind of address a SwapProxy payload may name -- see
+  // swap/executionTargets.ts for why both layers are checked.
+  UNISWAP_ALLOWED_UNIVERSAL_ROUTERS: z.string().optional().default(''),
+  UNISWAP_ALLOWED_SWAP_PROXIES: z.string().optional().default(''),
   // C5 fix: was an internal/undocumented interface-gateway host. This is
   // the real, documented public endpoint -- confirmed by fetching the live
   // OpenAPI spec at https://trade-api.gateway.uniswap.org/v1/api.json

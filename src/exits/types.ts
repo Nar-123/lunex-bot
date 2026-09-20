@@ -183,7 +183,22 @@ export interface ExitStateRecord extends ExitStateFields {
 }
 
 /** Why the TOKEN->USDG swap of a CLOSING position cannot proceed right now (it stays CLOSING and is retried every tick). */
-export type SwapLegBlockReason = 'QUOTE_UNAVAILABLE' | 'PRICE_IMPACT_BLOCKED';
+/**
+ * Why a TOKEN swap leg cannot proceed right now.
+ *
+ * TRANSIENT (retried every tick -- the cause can change on its own):
+ *   QUOTE_UNAVAILABLE, PRICE_IMPACT_BLOCKED
+ * DETERMINISTIC (backed off and surfaced to the operator -- the cause is
+ * configuration and identical retries cannot succeed; see swapLegBackoff.ts):
+ *   TARGET_NOT_APPROVED           the provider's swap target, its embedded
+ *                                 router, or its calldata failed the
+ *                                 two-layer execution-target validation
+ *   APPROVAL_SPENDER_NOT_APPROVED the provider asked us to approve a spender
+ *                                 that is not an approved execution target
+ *
+ * Persisted as `REASON#fingerprint`; read back with `decodeBlockReason`.
+ */
+export type SwapLegBlockReason = 'QUOTE_UNAVAILABLE' | 'PRICE_IMPACT_BLOCKED' | 'TARGET_NOT_APPROVED' | 'APPROVAL_SPENDER_NOT_APPROVED';
 
 /**
  * The fields the per-tick DECISION owns (resolveExitDecision's timers /

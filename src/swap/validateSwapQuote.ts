@@ -1,5 +1,7 @@
 import type { Address } from 'viem';
 import type { TxRequest } from '../execution/types';
+import { classifyExecutionTarget, decodeSwapProxyExecute, isApprovedUniversalRouter, type ExecutionTargetMatch, type ExecutionTargetPolicy } from './executionTargets';
+import type { ExecutionTargetVerificationState } from './executionTargetGate';
 
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const HEX_DATA_RE = /^0x[0-9a-fA-F]*$/;
@@ -39,6 +41,23 @@ export interface RawSwapTxCandidate {
  * a swap must fail loudly rather than sign something that doesn't match
  * what was actually requested.
  *
+ * ## Two-layer target validation (exit-router incident, 2026-09-20)
+ *
+ * The Trading API's proxy approval flow no longer targets a Universal Router
+ * directly: it targets a SwapProxy that takes the router to call as its FIRST
+ * CALLDATA ARGUMENT. Allowlisting the proxy alone would authorise arbitrary
+ * routers, so BOTH layers are checked here (see `executionTargets.ts`):
+ *
+ *   CASE A  to == approved Universal Router  -> direct-router rules
+ *   CASE B  to == approved SwapProxy         -> decode calldata, embedded
+ *                                               router must ALSO be approved,
+ *                                               and its token/amount must match
+ *                                               the quote this swap was built for
+ *   CASE C  to == anything else              -> reject (covers the deprecated
+ *                                               proxy and any unverified router)
+ *
+ * Proxy validation is never treated as equivalent to router validation.
+ *
  * ## H9 fix — target identity, not just address shape
  *
  * The previous version of this function only checked that `to` "looks
@@ -58,27 +77,74 @@ export interface RawSwapTxCandidate {
  * ERC20 (TOKEN) -> ERC20 (USDG); native ETH is never involved, so any
  * non-zero value is itself a red flag, not a normal variation to accept.
  */
-export function validateSwapQuote(
-  candidate: RawSwapTxCandidate,
-  expected: { amountInRaw: bigint; chainId: number; minReceivedRequired: boolean; allowedRouterAddress: string },
-): TxRequest {
+export interface SwapQuoteExpectation {
+  amountInRaw: bigint;
+  chainId: number;
+  minReceivedRequired: boolean;
+  /** Chain-scoped approved execution targets. Empty router list = fail closed. */
+  targets: ExecutionTargetPolicy;
+  /** The TOKEN being sold -- cross-checked against SwapProxy calldata so a proxy payload cannot swap a different asset. */
+  tokenIn: string;
+  /** Startup identity-assertion state; `FAILED` blocks every swap (see `executionTargetGate.ts`). */
+  identityGate?: ExecutionTargetVerificationState;
+}
+
+export function validateSwapQuote(candidate: RawSwapTxCandidate, expected: SwapQuoteExpectation): TxRequest {
   if (candidate.chainId !== expected.chainId) {
     throw new SwapQuoteValidationError(`swap tx chainId mismatch: got ${candidate.chainId}, expected ${expected.chainId}`);
   }
   if (!EVM_ADDRESS_RE.test(candidate.to)) {
     throw new SwapQuoteValidationError(`swap tx "to" is not a well-formed EVM address: ${candidate.to}`);
   }
-  if (!expected.allowedRouterAddress) {
-    // FAIL CLOSED: no confirmed router address is configured. Never
-    // downgrade to "shape looked fine" -- see this function's doc comment.
+  // Startup identity assertion: a FAILED verification blocks every swap.
+  if (expected.identityGate === 'FAILED') {
     throw new SwapQuoteValidationError(
-      'no allowed swap router address is configured (UNISWAP_ALLOWED_SWAP_ROUTER_ADDRESS) -- refusing to trust an unconfirmed swap target',
+      'execution-target identity verification FAILED at startup -- refusing to sign any exit swap until the configured router/proxy identities check out (fail closed)',
     );
   }
-  if (candidate.to.toLowerCase() !== expected.allowedRouterAddress.toLowerCase()) {
+
+  // Layer 1 -- the transaction target itself.
+  let match: ExecutionTargetMatch | null;
+  try {
+    match = classifyExecutionTarget(candidate.to, expected.targets);
+  } catch (err) {
+    // Unusable policy (no approved router configured) or a malformed allowlist entry: fail closed.
+    throw new SwapQuoteValidationError(err instanceof Error ? err.message : String(err));
+  }
+  if (match === null) {
     throw new SwapQuoteValidationError(
-      `swap tx "to" (${candidate.to}) is not the configured allowed router (${expected.allowedRouterAddress}) -- refusing to sign calldata for an unrecognized target`,
+      `swap tx "to" (${candidate.to}) is not an approved execution target for chain ${expected.targets.chainId} ` +
+        `-- approved routers: [${expected.targets.universalRouters.join(', ') || 'none'}], approved proxies: [${expected.targets.swapProxies.join(', ') || 'none'}]. ` +
+        'Refusing to sign calldata for an unrecognized target.',
     );
+  }
+
+  // Layer 2 -- when the target is a SwapProxy, the router it will call must be approved too.
+  if (match.kind === 'SWAP_PROXY') {
+    let decoded;
+    try {
+      decoded = decodeSwapProxyExecute(candidate.data);
+    } catch (err) {
+      throw new SwapQuoteValidationError(
+        `swap tx targets approved SwapProxy ${match.address} but its calldata could not be safely decoded: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!isApprovedUniversalRouter(decoded.router, expected.targets)) {
+      throw new SwapQuoteValidationError(
+        `SwapProxy calldata names router ${decoded.router}, which is NOT an approved Universal Router for chain ${expected.targets.chainId} ` +
+          `(approved: [${expected.targets.universalRouters.join(', ') || 'none'}]) -- refusing to sign a proxy call into an unrecognized router`,
+      );
+    }
+    if (decoded.token.toLowerCase() !== expected.tokenIn.toLowerCase()) {
+      throw new SwapQuoteValidationError(
+        `SwapProxy calldata sells token ${decoded.token}, but this swap was quoted for ${expected.tokenIn} -- refusing to sign a payload for a different asset`,
+      );
+    }
+    if (decoded.amount !== expected.amountInRaw) {
+      throw new SwapQuoteValidationError(
+        `SwapProxy calldata pulls ${decoded.amount} of the token, but ${expected.amountInRaw} was requested -- refusing to sign a payload for a different amount`,
+      );
+    }
   }
   if (!HEX_DATA_RE.test(candidate.data) || candidate.data.length < MIN_DATA_LENGTH) {
     throw new SwapQuoteValidationError(`swap tx "data" is not well-formed calldata (got length ${candidate.data.length})`);

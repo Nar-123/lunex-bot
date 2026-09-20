@@ -1,4 +1,5 @@
 import { config } from '../config';
+import { backoffDelayMs, decodeBlockReason, isDeterministicBlockReason } from './swapLegBackoff';
 import { isStuckAttempt } from '../execution/stuckAttempt';
 import type { TransactionAttemptRecord } from '../execution/types';
 import type { PositionRecord } from '../positions/types';
@@ -20,6 +21,8 @@ export type ClosingRecoveryPhase =
   | 'SWAP_PENDING'
   | 'QUOTE_UNAVAILABLE'
   | 'PRICE_IMPACT_BLOCKED'
+  | 'TARGET_NOT_APPROVED'
+  | 'APPROVAL_SPENDER_NOT_APPROVED'
   | 'SWAP_FAILED_RETRY_PENDING';
 
 export interface ClosingRecoveryReport {
@@ -120,12 +123,22 @@ export function assessClosingRecovery(
       ? report('READY_TO_FINALIZE', false, 'USDG-only removal -- finalizes on the next tick', 0n, recovered)
       : report('USDG_ONLY_ANOMALY', true, usdgOnly.reason, 0n, recovered);
   }
-  const blockReason = exitState.swapLegBlockedReason ?? null;
+  // The stored value may carry a failure fingerprint (`REASON#digest`) -- the
+  // operator-facing phase is always the bare reason.
+  const { reason: blockReason } = decodeBlockReason(exitState.swapLegBlockedReason ?? null);
   const blockedSince = exitState.swapLegBlockedSince ?? null;
   if (blockReason !== null) {
     const blockedForMs = blockedSince ? now.getTime() - blockedSince.getTime() : 0;
-    const stuck = blockedForMs >= config.rules.execution.STUCK_ATTEMPT_MAX_AGE_MS;
-    return report(blockReason, stuck, `TOKEN swap cannot proceed (${blockReason}) for ${Math.floor(blockedForMs / 1000)}s -- TOKEN retained, retried every tick`, removeToken, recovered);
+    const deterministic = isDeterministicBlockReason(blockReason);
+    // A deterministic block cannot resolve itself, so it reaches the operator on
+    // its own (shorter) policy; a transient one keeps the existing stuck age.
+    const stuck = deterministic
+      ? blockedForMs >= config.rules.exits.DETERMINISTIC_BLOCK_BACKOFF.OPERATOR_ACTION_AFTER_MS
+      : blockedForMs >= config.rules.execution.STUCK_ATTEMPT_MAX_AGE_MS;
+    const cadence = deterministic
+      ? `retries backed off to every ${Math.round(backoffDelayMs(blockedForMs) / 1000)}s -- operator action required to clear it`
+      : 'retried every tick';
+    return report(blockReason, stuck, `TOKEN swap cannot proceed (${blockReason}) for ${Math.floor(blockedForMs / 1000)}s -- TOKEN retained, ${cadence}`, removeToken, recovered);
   }
   if (exitState.swapAttemptCount > 0) {
     return report(

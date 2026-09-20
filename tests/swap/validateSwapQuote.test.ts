@@ -12,7 +12,9 @@ const VALID: RawSwapTxCandidate = {
   echoedAmountInRaw: 500n,
   minOutputAmountRaw: 0n,
 };
-const EXPECTED = { amountInRaw: 500n, chainId: 4663, minReceivedRequired: false, allowedRouterAddress: ALLOWED_ROUTER };
+const TOKEN_IN = '0x7777777777777777777777777777777777777777';
+const POLICY = { chainId: 4663, universalRouters: [ALLOWED_ROUTER], swapProxies: [] as string[] };
+const EXPECTED = { amountInRaw: 500n, chainId: 4663, minReceivedRequired: false, targets: POLICY, tokenIn: TOKEN_IN };
 
 describe('validateSwapQuote -- structural validation before trusting external swap calldata', () => {
   it('accepts a well-formed candidate targeting the configured allowed router, and returns a clean TxRequest', () => {
@@ -78,7 +80,7 @@ describe('validateSwapQuote -- structural validation before trusting external sw
 
     it('invalid router: a DIFFERENT, well-formed router address is rejected, not silently accepted', () => {
       const differentRouter = '0x2222222222222222222222222222222222222222';
-      expect(() => validateSwapQuote({ ...VALID, to: differentRouter }, EXPECTED)).toThrow(/not the configured allowed router/);
+      expect(() => validateSwapQuote({ ...VALID, to: differentRouter }, EXPECTED)).toThrow(/is not an approved execution target/);
     });
 
     it('random contract: an arbitrary, unrelated contract address is rejected', () => {
@@ -90,12 +92,12 @@ describe('validateSwapQuote -- structural validation before trusting external sw
     });
 
     it('FAIL CLOSED: an empty/unconfigured allowedRouterAddress rejects EVERY swap, never falls back to shape-only validation', () => {
-      expect(() => validateSwapQuote(VALID, { ...EXPECTED, allowedRouterAddress: '' })).toThrow(/no allowed swap router address is configured/);
+      expect(() => validateSwapQuote(VALID, { ...EXPECTED, targets: { ...POLICY, universalRouters: [] } })).toThrow(/no approved Universal Router is configured/);
     });
 
     it('wrong chain router: a real router address that only happens to be valid on a DIFFERENT chain is still just "not the configured router" here -- this project has exactly one configured address per deployment, never a multi-chain allowlist', () => {
       const otherChainRouterAddress = '0x3333333333333333333333333333333333333333';
-      expect(() => validateSwapQuote({ ...VALID, to: otherChainRouterAddress }, { ...EXPECTED, allowedRouterAddress: ALLOWED_ROUTER })).toThrow(
+      expect(() => validateSwapQuote({ ...VALID, to: otherChainRouterAddress }, EXPECTED)).toThrow(
         SwapQuoteValidationError,
       );
     });
