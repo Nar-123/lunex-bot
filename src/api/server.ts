@@ -18,6 +18,7 @@ import type { AiControlOptions } from './routes/aiControl';
 import { createCooldownsRouter } from './routes/cooldowns';
 import { createLogsRouter } from './routes/logs';
 import { createControlRouter } from './routes/control';
+import { createPermit2RenewRouter } from './routes/permit2Renew';
 import { createSettingsRouter } from './routes/settings';
 
 export interface CreateApiServerOptions {
@@ -85,6 +86,12 @@ export function createApiServer(deps: AppDeps, options: CreateApiServerOptions =
   app.use('/cooldowns', createCooldownsRouter(deps));
   app.use('/logs', createLogsRouter(options.logFilePath));
   app.use('/control', createControlRouter(deps));
+  // Operator-only Permit2 renewal (GET = read-only readiness, POST = the
+  // renewal itself). Mounted BEHIND authMiddleware, and the router additionally
+  // requires the configured operator identity -- the AI supervisor, whose
+  // router is mounted in front of the middleware with its own credential, can
+  // never reach it.
+  app.use('/control', createPermit2RenewRouter(deps));
   app.use('/settings', createSettingsRouter(deps));
 
   return app;

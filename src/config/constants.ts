@@ -807,4 +807,31 @@ export const EXECUTION = {
   /// one OPENING lifetime (OPENING_MAX_AGE_MS), the longest a reserved entry may
   /// still reach its mint. Anything shorter could expire between reservation and mint.
   PERMIT2_MIN_REMAINING_VALIDITY_SECONDS: DISCOVERY.CYCLE_INTERVAL_MS / 1000,
+  /// OPERATOR-AUTHORISED Permit2 renewal (positions/permit2Renewal.ts). Nothing
+  /// here is ever applied automatically: these only bound what an operator may
+  /// ask for. See docs/permit2-renewal-design.md.
+  PERMIT2_RENEWAL: {
+    /// The lifetime a renewal grants, measured from CHAIN time. 90 days: long
+    /// enough that renewal is a rare, deliberate act; short enough that an
+    /// abandoned key's standing authorisation to move USDG dies on its own.
+    /// Configurable rather than hard-coded, but bounded by MAX_LIFETIME_SECONDS.
+    DEFAULT_LIFETIME_SECONDS: 90 * 24 * 60 * 60,
+    /// Hard ceiling on any requested lifetime. `type(uint48).max` (a grant that
+    /// never expires) is deliberately unreachable: it would remove the only
+    /// time-bound on a standing permission to move USDG.
+    MAX_LIFETIME_SECONDS: 180 * 24 * 60 * 60,
+    /// A renewal is only *eligible* once the grant is at least this close to
+    /// expiry, so an operator cannot keep pushing the expiry out indefinitely
+    /// (each renewal is a real transaction and a real extension of authority).
+    ELIGIBLE_WHEN_REMAINING_SECONDS: 30 * 24 * 60 * 60,
+    /// Renewal is *recommended* from here on -- same 7 days the entry pre-flight
+    /// already warns at, so the two never disagree.
+    RECOMMEND_WHEN_REMAINING_SECONDS: 7 * 24 * 60 * 60,
+    /// A renewal must leave the grant meaningfully longer than it already is,
+    /// otherwise it is a no-op that spends gas for nothing.
+    MIN_IMPROVEMENT_SECONDS: 24 * 60 * 60,
+    /// uint48 max -- the value the implementation must REFUSE, kept named so the
+    /// refusal is explicit rather than an unexplained magic number.
+    FORBIDDEN_EXPIRATION: 2 ** 48 - 1,
+  },
 } as const;

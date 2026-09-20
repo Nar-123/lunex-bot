@@ -1,9 +1,21 @@
-# Permit2 grant renewal — design only, NOT implemented
+# Permit2 grant renewal
 
-**Status: design. No renewal code exists, and none should be added without an
-explicit operator decision.** The bot can only *observe* the Permit2
-authorization (`positions/permit2Preflight.ts`); every Permit2 module is
-read-only, which `tests/positions/permit2ExpiryAudit.test.ts` enforces.
+**Status: implemented as an OPERATOR-ONLY action, never automatic.** A renewal
+happens only when a human sends `POST /control/permit2/renew` with the exact
+confirmation string. Nothing schedules it, no cycle calls it, and the AI
+supervisor cannot reach it.
+
+The *entry* pre-flight (`positions/permit2Preflight.ts`) and the Permit2 readers
+(`blockchain/permit2.ts`) remain strictly read-only — they still contain no
+transaction construction at all, which `tests/positions/permit2ExpiryAudit.test.ts`
+enforces by scanning their source. All write-side code lives in separate modules:
+
+| Module | Role |
+|---|---|
+| `positions/permit2Renewal.ts` | pure policy: assessment, bounds, calldata, verification |
+| `positions/permit2RenewalTx.ts` | live reads + `TxSafetyDeps` for the existing executor |
+| `positions/permit2RenewalAction.ts` | the operator action and its idempotency |
+| `api/routes/permit2Renew.ts` | `GET` readiness (read-only) and `POST` renewal |
 
 ## Why a renewal is needed at all
 
@@ -101,9 +113,22 @@ critical transaction in this repo already follows.
 7. **No test ever sends a real transaction.** A live rehearsal, if wanted, is an
    operator action on a throwaway key, never in CI.
 
-## Until then
+## Entry behaviour is unchanged
 
-The pre-flight blocks entries the moment the grant is within 30 minutes of
-expiry, warns from 7 days out via `permit2_grant_expiring_soon`, and never
-repairs anything. Renewing the production grant before **2026-10-01 16:25 UTC**
-is a manual operator action.
+The entry pre-flight still blocks entries the moment the grant is within 30
+minutes of expiry, still warns from 7 days out via
+`permit2_grant_expiring_soon`, still judges on chain time, and still never
+repairs anything. Renewal is a separate, deliberate operator action.
+
+## Renewal windows
+
+| Window | Constant | Meaning |
+|---|---|---|
+| > 30 days left | — | `VALID_CURRENT`; a renewal is refused and no transaction is built |
+| <= 30 days left | `ELIGIBLE_WHEN_REMAINING_SECONDS` | `RENEWAL_NEEDED`; an operator *may* renew |
+| <= 7 days left | `RECOMMEND_WHEN_REMAINING_SECONDS` | `renewalRecommended: true`; an operator *should* renew |
+| lifetime granted | `DEFAULT_LIFETIME_SECONDS` (90 days) | bounded by `MAX_LIFETIME_SECONDS` (180 days) |
+
+Production's grant expires **2026-10-01 16:25 UTC**. As of 2026-09-20 it is
+already inside the eligibility window (~11 days remaining) and becomes
+*recommended* on 2026-09-24.
