@@ -78,6 +78,12 @@ export interface ApiConfig {
   corsOrigin: string;
 }
 
+/** AI Supervisor entry control -- see config/env.ts AI_SUPERVISOR_TOKEN_SHA256. */
+export interface AiSupervisorConfig {
+  /** lowercase hex SHA-256 of the dedicated AI token; null = AI control disabled */
+  tokenSha256: string | null;
+}
+
 export interface AuthConfig {
   adminUsername: string;
   adminPasswordHash: string;

@@ -102,7 +102,8 @@ export type OpeningExpiryResult =
 
 export type CreateIfCapitalAllowsResult =
   | { ok: true; record: PositionRecord }
-  | { ok: false; reason: string };
+  /** `entryPausedBy` is set when the entry gate (re-read under CapitalLock) refused the reservation -- the caller must stop deploying this cycle. */
+  | { ok: false; reason: string; entryPausedBy?: 'OPERATOR' | 'AI' };
 
 export interface PositionRepository {
   /** Throws `DuplicateActiveTokenPositionError` (P1-2) if a non-closed position for `input.tokenAddress` already exists -- see that error's doc comment. Never silently creates a second row for the same token. */

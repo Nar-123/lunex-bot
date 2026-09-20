@@ -410,6 +410,18 @@ model BotSettings {
   /// Fraction, always positive -- replaces EXITS.TRAILING_TP.TRIGGER_PEAK_PNL_PCT.
   /// TIER 3: default 0.05 -> 0.06, Meridian's measured trailing arm.
   trailingTpTriggerPct Float    @default(0.06)
+  /// AI Supervisor entry control -- SEPARATE from the operator's `paused`
+  /// (Telegram /pause, POST /control/pause). New entries are allowed only
+  /// when BOTH are false, so an AI resume can never undo an operator's
+  /// emergency pause. Changed ONLY by conditional (compare-and-set) updates
+  /// in SettingsRepository.aiPauseEntry/aiResumeEntry; re-checked inside the
+  /// capital-reservation transaction (under CapitalLock) before every
+  /// deployment. Never affects monitoring, exits or OPENING resumes.
+  aiEntryPaused        Boolean  @default(false)
+  /// When the AI entry flag last CHANGED (a no-op pause/resume leaves it).
+  aiEntryChangedAt     DateTime?
+  /// Correlation id of the AI request that last changed the flag.
+  aiEntryRequestId     String?
   updatedAt            DateTime @updatedAt
 }
 

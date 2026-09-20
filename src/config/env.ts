@@ -246,6 +246,15 @@ const envSchema = z.object({
   REFRESH_TOKEN_EXPIRY: z.string().default('7d'),
   LOGIN_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(900_000),
   LOGIN_RATE_LIMIT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  // AI Supervisor entry control (POST /internal/ai/*): the SHA-256 (hex) of
+  // the AI Supervisor's dedicated token -- NOT the token itself, and entirely
+  // separate from the admin password / JWT. The plaintext token lives only in
+  // the AI Supervisor's own configuration. Unset = the AI control endpoints
+  // are disabled (503). Generate: openssl rand -hex 32 | tee token | sha256sum
+  AI_SUPERVISOR_TOKEN_SHA256: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/, 'AI_SUPERVISOR_TOKEN_SHA256 must be a lowercase 64-char hex SHA-256 digest')
+    .optional(),
 
   // Telegram
   // Well-known Telegram bot-token shape (<bot_id>:<35-char secret>).

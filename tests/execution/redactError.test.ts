@@ -38,9 +38,9 @@ describe('safeErrorMessage / redactSecrets', () => {
     expect(redactSecrets(`rejected ${RAW_TX}`, [])).toMatch(/0x<redacted \d+ bytes>/);
   });
 
-  it('redacts Authorization / Bearer / API-key header values', () => {
-    const t = redactSecrets('Authorization: Bearer abc.def.ghi x-api-key=KEY123456 apiKey: "zzz999"', []);
-    expect(t).not.toMatch(/abc\.def\.ghi|KEY123456|zzz999/);
+  it('redacts Authorization / Bearer / API-key / AI-supervisor-token header values', () => {
+    const t = redactSecrets('Authorization: Bearer abc.def.ghi x-api-key=KEY123456 X-AI-Supervisor-Token: tok_supersecret_1 apiKey: "zzz999"', []);
+    expect(t).not.toMatch(/abc\.def\.ghi|KEY123456|tok_supersecret_1|zzz999/);
     expect(t).toContain('<redacted>');
   });
 

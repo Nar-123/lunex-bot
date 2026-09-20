@@ -13,6 +13,8 @@ import { createPositionsRouter } from './routes/positions';
 import { createStuckRouter } from './routes/stuck';
 import { createSettleDustRouter } from './routes/settleDust';
 import { createSettleTokenRouter } from './routes/settleToken';
+import { createAiControlRouter } from './routes/aiControl';
+import type { AiControlOptions } from './routes/aiControl';
 import { createCooldownsRouter } from './routes/cooldowns';
 import { createLogsRouter } from './routes/logs';
 import { createControlRouter } from './routes/control';
@@ -23,6 +25,8 @@ export interface CreateApiServerOptions {
   loginRateLimiterOptions?: LoginRateLimiterOptions;
   /** Test-only override -- points `GET /logs` at a throwaway log file instead of `logs/lunex-bot.log`. */
   logFilePath?: string;
+  /** Test-only override of the AI Supervisor control options (token digest / loopback check). */
+  aiControl?: Partial<AiControlOptions>;
 }
 
 /**
@@ -67,6 +71,10 @@ export function createApiServer(deps: AppDeps, options: CreateApiServerOptions =
 
   app.use('/auth', createAuthRouter(options.loginRateLimiterOptions));
 
+  // AI Supervisor entry control: its OWN narrow authorization (localhost +
+  // no proxy headers + dedicated token) -- mounted BEFORE the admin JWT
+  // middleware so the AI never needs, sees or can use admin credentials.
+  app.use('/internal/ai', createAiControlRouter(deps, { tokenSha256: config.aiSupervisor.tokenSha256, ...options.aiControl }));
 
   app.use(authMiddleware);
   app.use('/status', createStatusRouter(deps));

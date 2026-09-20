@@ -211,6 +211,19 @@ export class PrismaPositionRepository implements PositionRepository {
         // room without masking an actual stuck transaction.
         await tx.capitalLock.update({ where: { id: 'singleton' }, data: { touchedAt: new Date() } });
 
+        // AI Supervisor entry control: re-read the entry state with the lock
+        // HELD, immediately before the max-position/capital checks and the
+        // insert. A pause (operator or AI) is a write that needs this same
+        // SQLite write lock, so it is linearizable with this reservation:
+        // committed before -> seen here and nothing is reserved; committed
+        // after -> this position was admitted before the pause took effect.
+        // The screening-cycle-start check alone could not stop a cycle that
+        // was already iterating candidates.
+        const entry = await tx.botSettings.findUnique({ where: { id: 'singleton' }, select: { paused: true, aiEntryPaused: true } });
+        if (entry?.paused || entry?.aiEntryPaused) {
+          const by = entry.paused ? ('OPERATOR' as const) : ('AI' as const);
+          return { ok: false as const, reason: `entry paused (${by === 'AI' ? 'AI supervisor' : 'operator'}) -- no new position reserved`, entryPausedBy: by };
+        }
 
         // P1-1 cross-process fix, step 2 -- with the lock HELD: re-read the
         // rows, prove they are still compatible with the balance read

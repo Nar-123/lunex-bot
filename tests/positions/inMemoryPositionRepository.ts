@@ -31,6 +31,8 @@ export class InMemoryPositionRepository implements PositionRepository {
     private readonly cooldown?: { recordExit(tokenAddress: string, exitedAt?: Date): Promise<void> },
   ) {}
 
+  /** AI entry control: mirrors the real repository's entry-state re-read under CapitalLock (wired to the settings repository by fakeAppDeps). */
+  entryGate?: () => Promise<{ paused: boolean; aiEntryPaused: boolean }>;
 
   async create(input: CreatePositionInput): Promise<PositionRecord> {
     const normalizedToken = getAddress(input.tokenAddress).toLowerCase() as Address;
@@ -65,6 +67,12 @@ export class InMemoryPositionRepository implements PositionRepository {
       .filter((r) => r.status === 'CLOSING' && r.closeIdempotencyKey)
       .map((r) => exitLegKeyPrefix(r.closeIdempotencyKey as string));
     const exitLegAttempts = this.txAttempts ? await this.txAttempts.findByKeyPrefixes(closePrefixes) : null;
+    // Entry gate -- the LAST await: everything after it (checks + insert) is synchronous, i.e. "under the lock".
+    const entry = this.entryGate ? await this.entryGate() : null;
+    if (entry?.paused || entry?.aiEntryPaused) {
+      const by = entry.paused ? ('OPERATOR' as const) : ('AI' as const);
+      return { ok: false, reason: `entry paused (${by === 'AI' ? 'AI supervisor' : 'operator'}) -- no new position reserved`, entryPausedBy: by };
+    }
     const freshRows = this.nonClosedRows();
     const consistency = checkCapitalStateConsistent(observedBefore, freshRows);
     if (!consistency.ok) {

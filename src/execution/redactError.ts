@@ -23,7 +23,7 @@ import { config } from '../config';
  *  - signed raw transactions / signatures (long hex)
  *  - private-key-labelled 32-byte hex
  *  - the exact configured secret values (private key, admin password, JWT
- *    secret, API keys, Telegram bot token, RPC URLs)
+ *    secret, API keys, Telegram bot token, RPC URLs, AI supervisor digest)
  */
 
 const REDACTED = '<redacted>';
@@ -52,6 +52,7 @@ export function configuredSecrets(): string[] {
     config.gmgn.apiKey,
     config.uniswapTradingApi.apiKey,
     config.telegram.botToken,
+    config.aiSupervisor.tokenSha256,
     // RPC URLs: only the path+query carries the provider key -- the host stays
     // readable (rule 3 below also strips any URL path generically).
     ...[config.chain.rpcUrl, ...config.chain.rpcFallbackUrls].map(urlSecretPart),
@@ -74,7 +75,7 @@ export function redactSecrets(text: string, secrets: readonly string[] = configu
   // 3. exact configured secret values wherever else they appear
   for (const s of secrets) if (s.length >= MIN_SECRET_LENGTH) out = out.replace(new RegExp(escapeRegExp(s), 'g'), REDACTED);
   // 4. credentials in header-like / key-value form
-  out = out.replace(/\b(authorization|proxy-authorization|x-api-key|api[-_]?key|cookie)(\s*["']?\s*[:=]\s*["']?)(?:bearer\s+|basic\s+)?[^\s"',;}]+/gi, `$1$2${REDACTED}`);
+  out = out.replace(/\b(authorization|proxy-authorization|x-api-key|api[-_]?key|x-ai-supervisor-token|cookie)(\s*["']?\s*[:=]\s*["']?)(?:bearer\s+|basic\s+)?[^\s"',;}]+/gi, `$1$2${REDACTED}`);
   out = out.replace(/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, `Bearer ${REDACTED}`);
   // 5. JWTs anywhere
   out = out.replace(/\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]+/g, '<redacted-jwt>');

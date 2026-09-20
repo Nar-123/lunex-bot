@@ -27,7 +27,45 @@ export interface SettingsFields {
 }
 
 export interface SettingsRecord extends SettingsFields {
+  /** AI Supervisor entry control -- separate from the operator's `paused`; see `EntryState`. Never part of `SettingsPatch`. */
+  aiEntryPaused: boolean;
+  aiEntryChangedAt: Date | null;
+  aiEntryRequestId: string | null;
   updatedAt: Date;
+}
+
+/**
+ * Entry control (AI Supervisor interface). New positions may be opened only
+ * when BOTH flags are clear: `operatorPaused` (the existing `paused`, owned by
+ * the operator -- Telegram /pause, POST /control/pause) and `aiEntryPaused`
+ * (owned by the AI Supervisor). The AI can set/clear ONLY its own flag, so it
+ * can never lift an operator's emergency pause. Entry control never affects
+ * monitoring, exits, safety exits or the resume of an already-started OPENING.
+ */
+export interface EntryState {
+  operatorPaused: boolean;
+  aiEntryPaused: boolean;
+  /** true when new entries are blocked for either reason */
+  entryPaused: boolean;
+  aiEntryChangedAt: Date | null;
+  aiEntryRequestId: string | null;
+}
+
+export interface EntryTransition {
+  /** false = idempotent no-op (the flag already had the requested value) */
+  changed: boolean;
+  previous: EntryState;
+  current: EntryState;
+}
+
+export function toEntryState(s: Pick<SettingsRecord, 'paused' | 'aiEntryPaused' | 'aiEntryChangedAt' | 'aiEntryRequestId'>): EntryState {
+  return {
+    operatorPaused: s.paused,
+    aiEntryPaused: s.aiEntryPaused,
+    entryPaused: s.paused || s.aiEntryPaused,
+    aiEntryChangedAt: s.aiEntryChangedAt,
+    aiEntryRequestId: s.aiEntryRequestId,
+  };
 }
 
 /** Fields `PATCH /settings` may change. `paused` is deliberately excluded -- only `pause()`/`resume()` touch it, so a bug in one control surface can never accidentally flip the other. */
@@ -40,6 +78,12 @@ export interface SettingsRepository {
   update(patch: SettingsPatch): Promise<SettingsRecord>;
   pause(): Promise<SettingsRecord>;
   resume(): Promise<SettingsRecord>;
+  /** AI Supervisor: current entry state (read-only). */
+  getEntryState(): Promise<EntryState>;
+  /** AI Supervisor: set ONLY the AI entry flag. Atomic compare-and-set; idempotent (`changed: false` when already paused). */
+  aiPauseEntry(requestId: string): Promise<EntryTransition>;
+  /** AI Supervisor: clear ONLY the AI entry flag (never the operator's). Atomic compare-and-set; idempotent. */
+  aiResumeEntry(requestId: string): Promise<EntryTransition>;
 }
 
 /** Matches the Prisma model's `@default(...)` values exactly -- see `prisma/schema.prisma`'s `BotSettings`. Also what the in-memory test double starts from. */

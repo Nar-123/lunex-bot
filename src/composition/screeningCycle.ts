@@ -13,6 +13,8 @@ import type { CanaryRules } from '../capital/canary';
 import { openPosition } from '../positions/openPosition';
 import type { PositionPoolContext } from '../positions/types';
 import type { AppDeps } from './types';
+import type { EntryState } from '../settings/types';
+import { toEntryState } from '../settings/types';
 
 export interface ScreeningCycleSummary {
   candidatesEvaluated: number;
@@ -69,7 +71,8 @@ export interface ScreeningCycleSummary {
  */
 export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSummary> {
   const settings = await deps.settings.get();
-  if (settings.paused) {
+  if (settings.paused || settings.aiEntryPaused) {
+    logEntryBlockedByAi(deps, toEntryState(settings), 'cycle-start');
     deps.logger.info('screening_cycle', { paused: true, candidatesEvaluated: 0, passed: 0, failed: 0, deployed: 0 });
     return { candidatesEvaluated: 0, passed: 0, failed: 0, deployed: 0, skipped: [], paused: true };
   }
@@ -197,6 +200,17 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
   for (const candidate of passing) {
     if (summary.deployed >= config.rules.cycle.MAX_SUCCESSFUL_DEPLOYMENTS_PER_CYCLE) break;
 
+    // Entry control: a pause (operator or AI) that becomes effective while
+    // this cycle is iterating candidates stops it before the NEXT deployment
+    // -- not only at the start of the next cycle. (The reservation itself
+    // re-checks under CapitalLock too; see createIfCapitalAllows.)
+    const entry = await deps.settings.getEntryState();
+    if (entry.entryPaused) {
+      logEntryBlockedByAi(deps, entry, 'before-candidate', candidate.symbol);
+      summary.skipped.push({ symbol: candidate.symbol, stage: 'entry', reason: `entry paused (${entry.operatorPaused ? 'operator' : 'AI supervisor'}) -- cycle stopped before deployment` });
+      break;
+    }
+
     const snapshot = await deps.capitalSnapshot.getSnapshot();
     const capitalDecision = decideCapitalAllocation(snapshot, capitalRules);
     if (!capitalDecision.ok) {
@@ -293,6 +307,12 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
       deps.logger.warn('entry_blocked_permit2', { symbol: candidate.symbol, status: openOutcome.blockedByPermit2.status, reason: openOutcome.reason });
       summary.skipped.push({ symbol: candidate.symbol, stage: 'permit2', reason: openOutcome.reason });
       break;
+    } else if (openOutcome.entryPausedBy) {
+      // Refused by the entry gate under CapitalLock: nothing was reserved.
+      // Stop the cycle (never "try the next candidate" past a pause).
+      if (openOutcome.entryPausedBy === 'AI') logEntryBlockedByAi(deps, await deps.settings.getEntryState(), 'reservation', candidate.symbol);
+      summary.skipped.push({ symbol: candidate.symbol, stage: 'entry', reason: openOutcome.reason });
+      break;
     } else {
       summary.skipped.push({ symbol: candidate.symbol, stage: 'open', reason: openOutcome.reason });
       if (!tryNextCandidateOnFailure) break;
@@ -304,3 +324,23 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
   return summary;
 }
 
+/**
+ * AI Supervisor audit event: a screening cycle was stopped by the AI entry
+ * pause. Logged only when the AI flag is (part of) the reason -- an operator
+ * pause keeps its existing `screening_cycle { paused: true }` line. No
+ * secrets: the state flags and the correlation id of the pausing request.
+ */
+function logEntryBlockedByAi(deps: Pick<AppDeps, 'logger'>, entry: EntryState, stage: 'cycle-start' | 'before-candidate' | 'reservation', symbol?: string): void {
+  if (!entry.aiEntryPaused) return;
+  const state = { entryPaused: entry.entryPaused, aiEntryPaused: entry.aiEntryPaused, operatorPaused: entry.operatorPaused };
+  deps.logger.warn('AI_ENTRY_BLOCKED_BY_PAUSE', {
+    timestamp: new Date().toISOString(),
+    action: 'block-entry',
+    actor: 'ai-supervisor',
+    previousState: state,
+    newState: state,
+    requestId: entry.aiEntryRequestId,
+    stage,
+    ...(symbol !== undefined && { symbol }),
+  });
+}

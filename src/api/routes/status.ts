@@ -20,6 +20,9 @@ export function createStatusRouter(deps: AppDeps): Router {
 
     res.status(200).json({
       paused: settings.paused,
+      // AI Supervisor entry control -- entry is blocked when either flag is set.
+      aiEntryPaused: settings.aiEntryPaused,
+      entryPaused: settings.paused || settings.aiEntryPaused,
       capital: {
         freeUsdgBalance: snapshot.freeUsdgBalance.toString(),
         totalDeployedUsdg: snapshot.totalDeployedUsdg.toString(),

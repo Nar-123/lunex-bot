@@ -16,9 +16,11 @@ import { runPermit2Preflight, type Permit2PreflightResult } from './permit2Prefl
 
 export type OpenPositionOutcome =
   | { outcome: 'ACTIVE'; position: PositionRecord }
+  /** `entryPausedBy`: the reservation was refused by the entry gate -- nothing was created; the caller stops deploying. */
   | {
       outcome: 'FAILED';
       reason: string;
+      entryPausedBy?: 'OPERATOR' | 'AI';
       /** The v4 Permit2 pre-flight refused the entry BEFORE any capital reservation (wallet-level: every candidate would fail the same way). */
       blockedByPermit2?: Permit2PreflightResult;
     }
@@ -125,7 +127,7 @@ export async function openPosition(input: OpenPositionInput, deps: OpenPositionD
   try {
     const result = await deps.positions.createIfCapitalAllows(createInput, input.readOnChainUsdgBalance, input.capitalRules);
     if (!result.ok) {
-      return { outcome: 'FAILED', reason: result.reason };
+      return { outcome: 'FAILED', reason: result.reason, ...(result.entryPausedBy && { entryPausedBy: result.entryPausedBy }) };
     }
     created = result.record;
   } catch (err) {

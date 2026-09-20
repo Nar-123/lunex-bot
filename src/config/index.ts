@@ -8,6 +8,7 @@ import type {
   UniswapTradingApiConfig,
   DatabaseConfig,
   ApiConfig,
+  AiSupervisorConfig,
   AuthConfig,
   TelegramConfig,
   CompositionConfig,
@@ -112,6 +113,10 @@ const auth: AuthConfig = {
   loginRateLimitMaxAttempts: env.LOGIN_RATE_LIMIT_MAX_ATTEMPTS,
 };
 
+const aiSupervisor: AiSupervisorConfig = {
+  tokenSha256: env.AI_SUPERVISOR_TOKEN_SHA256 ?? null,
+};
+
 const composition: CompositionConfig = {
   shutdownTimeoutMs: env.SHUTDOWN_TIMEOUT_MS,
 };
@@ -145,6 +150,7 @@ export const config = {
   database,
   api,
   auth,
+  aiSupervisor,
   telegram,
   composition,
   rules: {

@@ -159,5 +159,10 @@ export function createFakeAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
     readTokenBalanceForExit: vi.fn(async () => USDG(500)),
   };
 
-  return { ...base, ...overrides };
+  const deps = { ...base, ...overrides };
+  // AI entry control: mirror the real repository re-reading BotSettings inside the reservation transaction.
+  if (deps.positions instanceof InMemoryPositionRepository && !deps.positions.entryGate) {
+    deps.positions.entryGate = () => deps.settings.get();
+  }
+  return deps;
 }
