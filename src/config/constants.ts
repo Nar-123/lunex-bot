@@ -565,6 +565,35 @@ export const EXITS = {
    * fires exactly when every slippage tier below has been exhausted,
    * rather than two definitive failures later. See SLIPPAGE_TIERS_BPS.
    */
+  /**
+   * OPERATOR-APPROVED DUST SETTLEMENT (exits/dustSettlement.ts).
+   *
+   * A TOKEN residual is "dust" only when selling it CANNOT PAY FOR ITS OWN
+   * GAS -- never because the quantity looks small. The value is always taken
+   * from a fresh read-only quote for the exact residual, so token decimals and
+   * price are handled by the quote itself rather than by any hardcoded scale.
+   *
+   * Economic rationale for the default (measured on Robinhood Chain,
+   * 2026-09-20): the cheapest possible exit swap is ~350k gas, and at the
+   * observed ~62.2 gwei that is ~0.056 USDG; a bare ERC20 approve is another
+   * ~0.009 USDG. A residual worth less than the gas needed to sell it can only
+   * LOSE value by being sold. 0.02 USDG sits at ~36% of that swap cost, so
+   * even if gas fell ~3x the threshold would still be below the cost of
+   * selling, while being far above the two residuals this policy exists for
+   * (0.008712 and 0.000536 USDG).
+   *
+   * Raising this is an economic decision, not a tuning knob: every raw unit of
+   * increase is value the bot may abandon instead of recovering.
+   */
+  DUST_SETTLEMENT: {
+    /** Raw USDG (quote-output units). A residual must be STRICTLY below this to qualify. */
+    MAX_USDG_VALUE_RAW: 20_000n, // 0.02 USDG at 6 decimals
+    /** A quote older than this is refused -- a dust decision is only ever made on a fresh price. */
+    QUOTE_MAX_AGE_MS: 60 * 1000,
+    /** Slippage tier used when ASKING for the valuation quote (nothing is executed; this only picks a quote shape). */
+    QUOTE_SLIPPAGE_BPS: 100,
+  },
+
   SWAP_RETRY: {
     STUCK_THRESHOLD: 3, // = SLIPPAGE_TIERS_BPS.length: all tiers spent
   },

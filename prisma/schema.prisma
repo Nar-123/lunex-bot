@@ -421,6 +421,34 @@ model BotSettings {
 /// settlement finalized. `txHash` is the primary key -- one transaction can
 /// settle at most one position -- and `positionId` is unique -- a position
 /// is settled at most once. Amounts are receipt-measured raw units.
+/// Operator-authorised DUST settlement: a CLOSING position whose receipt-proven
+/// TOKEN residual is worth LESS than it costs to sell is finalized WITHOUT any
+/// on-chain swap, and the residual is recorded here as explicitly ABANDONED.
+///
+/// This is an accounting record, never a claim that anything was sold: there is
+/// no txHash, no proceeds and no minReceived, and the abandoned amount is kept
+/// separate from `Position.realizedUsdgRaw` (which stays exactly the USDG the
+/// receipts actually paid). One row per position (primary key), written in the
+/// SAME transaction as the CLOSING -> CLOSED transition.
+model DustSettlement {
+  positionId          String   @id
+  closeIdempotencyKey String
+  tokenAddress        String
+  tokenDecimals       Int
+  /// The receipt-proven TOKEN residual abandoned by this settlement (raw units).
+  residualTokenRaw    String
+  /// Fresh read-only quote for EXACTLY `residualTokenRaw`, in raw USDG units.
+  quotedUsdgRaw       String
+  /// The configured threshold this settlement was judged against (raw USDG).
+  thresholdUsdgRaw    String
+  /// When that quote was taken (freshness is enforced before settling).
+  quotedAt            DateTime
+  settledAt           DateTime
+  /// The authenticated operator who authorised it.
+  actor               String
+  requestId           String?
+}
+
 model ManualTokenSettlement {
   txHash              String   @id
   positionId          String   @unique

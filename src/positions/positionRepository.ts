@@ -5,7 +5,7 @@ import type { PrismaClient } from '@prisma/client';
 import { getPrismaClient } from '../storage/prismaClient';
 import type { CreateIfCapitalAllowsResult, CreatePositionInput, OpeningExpiryResult, PositionRecord, PositionRepository, PositionStatus } from './types';
 import { DuplicateActiveTokenPositionError, ManualSettlementTxAlreadyUsedError, openMintAttemptKey } from './types';
-import type { ManualSettlementEvidence, ManualSettlementRecord } from './types';
+import type { DustSettlementEvidence, DustSettlementRecord, ManualSettlementEvidence, ManualSettlementRecord } from './types';
 import { decideCapitalAllocation } from '../capital/decideCapitalAllocation';
 import { checkCapitalStateConsistent, deriveCapitalSnapshot, exitLegKeyPrefix } from '../capital/freshCapitalSnapshot';
 import { findAttemptsByKeyPrefixes } from '../execution/transactionAttemptRepository';
@@ -211,6 +211,7 @@ export class PrismaPositionRepository implements PositionRepository {
         // room without masking an actual stuck transaction.
         await tx.capitalLock.update({ where: { id: 'singleton' }, data: { touchedAt: new Date() } });
 
+
         // P1-1 cross-process fix, step 2 -- with the lock HELD: re-read the
         // rows, prove they are still compatible with the balance read
         // above, and derive free/deployed/count from THIS SAME fresh row
@@ -407,9 +408,10 @@ export class PrismaPositionRepository implements PositionRepository {
     realizedUsdgRaw?: bigint | null,
     expectedCloseIdempotencyKey?: string,
     manualSettlement?: ManualSettlementEvidence,
+    dustSettlement?: DustSettlementEvidence,
   ): Promise<PositionRecord | null> {
     try {
-      return await this.markClosedTx(id, closedAt, closeReason, realizedUsdgRaw, expectedCloseIdempotencyKey, manualSettlement);
+      return await this.markClosedTx(id, closedAt, closeReason, realizedUsdgRaw, expectedCloseIdempotencyKey, manualSettlement, dustSettlement);
     } catch (err) {
       // Same precise field-list match as `create` above (verified against
       // the real error in manualTokenSettlement.integration.test.ts).
@@ -428,6 +430,7 @@ export class PrismaPositionRepository implements PositionRepository {
     realizedUsdgRaw: bigint | null | undefined,
     expectedCloseIdempotencyKey: string | undefined,
     manualSettlement: ManualSettlementEvidence | undefined,
+    dustSettlement?: DustSettlementEvidence,
   ): Promise<PositionRecord | null> {
     return this.prisma.$transaction(
       async (tx) => {
@@ -468,10 +471,49 @@ export class PrismaPositionRepository implements PositionRepository {
             },
           });
         }
+        // Operator-authorised DUST settlement: the abandonment record exists
+        // iff this close did. `positionId` is the primary key, so a repeated
+        // request can never write a second row (and never double-closes,
+        // because the conditional transition above already matched 0 rows).
+        if (dustSettlement) {
+          await tx.dustSettlement.create({
+            data: {
+              positionId: id,
+              closeIdempotencyKey: row.closeIdempotencyKey ?? '',
+              tokenAddress: dustSettlement.tokenAddress,
+              tokenDecimals: dustSettlement.tokenDecimals,
+              residualTokenRaw: dustSettlement.residualTokenRaw.toString(),
+              quotedUsdgRaw: dustSettlement.quotedUsdgRaw.toString(),
+              thresholdUsdgRaw: dustSettlement.thresholdUsdgRaw.toString(),
+              quotedAt: dustSettlement.quotedAt,
+              settledAt: closedAt,
+              actor: dustSettlement.actor,
+              requestId: dustSettlement.requestId,
+            },
+          });
+        }
         return toRecord(row);
       },
       { timeout: 15_000, maxWait: 15_000 },
     );
+  }
+
+  async findDustSettlementByPositionId(positionId: string): Promise<DustSettlementRecord | null> {
+    const row = await this.prisma.dustSettlement.findUnique({ where: { positionId } });
+    if (!row) return null;
+    return {
+      positionId: row.positionId,
+      closeIdempotencyKey: row.closeIdempotencyKey,
+      tokenAddress: row.tokenAddress,
+      tokenDecimals: row.tokenDecimals,
+      residualTokenRaw: BigInt(row.residualTokenRaw),
+      quotedUsdgRaw: BigInt(row.quotedUsdgRaw),
+      thresholdUsdgRaw: BigInt(row.thresholdUsdgRaw),
+      quotedAt: row.quotedAt,
+      settledAt: row.settledAt,
+      actor: row.actor,
+      requestId: row.requestId,
+    };
   }
 
   async findManualSettlementByTxHash(txHash: string): Promise<ManualSettlementRecord | null> {

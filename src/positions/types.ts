@@ -244,7 +244,11 @@ export interface PositionRepository {
     expectedCloseIdempotencyKey?: string,
     /** Manual TOKEN settlement via receipt: recorded in the SAME transaction, only when this call's transition wins. A txHash already recorded (for any position) aborts the whole close. */
     manualSettlement?: ManualSettlementEvidence,
+    /** Operator-authorised DUST settlement: recorded in the SAME transaction, only when this call's transition wins. One row per position, so a repeat can never double-write. */
+    dustSettlement?: DustSettlementEvidence,
   ): Promise<PositionRecord | null>;
+  /** Operator-authorised DUST settlement: the settlement recorded for this position, if any -- read-only. */
+  findDustSettlementByPositionId(positionId: string): Promise<DustSettlementRecord | null>;
   /** Manual TOKEN settlement via receipt: the settlement that used `txHash` (lowercased), if any -- read-only. */
   findManualSettlementByTxHash(txHash: string): Promise<ManualSettlementRecord | null>;
   /**
@@ -383,6 +387,33 @@ export interface PositionRepository {
    * second caller sees NOT_OPENING.
    */
   expireStaleOpening(id: string, maxAgeMs: number, now: Date): Promise<OpeningExpiryResult>;
+}
+
+/**
+ * Operator-authorised DUST settlement: the facts `markClosed` persists with the
+ * close (see `DustSettlement` in schema.prisma).
+ *
+ * There is deliberately NO txHash, NO proceeds and NO minReceived here: nothing
+ * was sold. `residualTokenRaw` is abandoned, and the position's
+ * `realizedUsdgRaw` still reports only the USDG the receipts actually paid.
+ */
+export interface DustSettlementEvidence {
+  tokenAddress: string;
+  tokenDecimals: number;
+  residualTokenRaw: bigint;
+  /** Fresh read-only quote for EXACTLY `residualTokenRaw`. */
+  quotedUsdgRaw: bigint;
+  thresholdUsdgRaw: bigint;
+  quotedAt: Date;
+  /** Authenticated operator who authorised the abandonment. */
+  actor: string;
+  requestId: string | null;
+}
+
+export interface DustSettlementRecord extends DustSettlementEvidence {
+  positionId: string;
+  closeIdempotencyKey: string;
+  settledAt: Date;
 }
 
 /** Manual TOKEN settlement via receipt: the receipt-measured facts `markClosed` persists with the close (see `ManualTokenSettlement` in schema.prisma). */

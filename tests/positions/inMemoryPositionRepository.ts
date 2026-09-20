@@ -1,6 +1,6 @@
 import type { Address } from 'viem';
 import { getAddress } from 'viem';
-import type { CreateIfCapitalAllowsResult, CreatePositionInput, ManualSettlementEvidence, ManualSettlementRecord, OpeningExpiryResult, PositionRecord, PositionRepository } from '../../src/positions/types';
+import type { CreateIfCapitalAllowsResult, CreatePositionInput, DustSettlementEvidence, DustSettlementRecord, ManualSettlementEvidence, ManualSettlementRecord, OpeningExpiryResult, PositionRecord, PositionRepository } from '../../src/positions/types';
 import { DuplicateActiveTokenPositionError, ManualSettlementTxAlreadyUsedError, openMintAttemptKey } from '../../src/positions/types';
 import { decideCapitalAllocation } from '../../src/capital/decideCapitalAllocation';
 import type { CapitalRules } from '../../src/capital/types';
@@ -30,6 +30,7 @@ export class InMemoryPositionRepository implements PositionRepository {
     private readonly txAttempts?: TransactionAttemptRepository,
     private readonly cooldown?: { recordExit(tokenAddress: string, exitedAt?: Date): Promise<void> },
   ) {}
+
 
   async create(input: CreatePositionInput): Promise<PositionRecord> {
     const normalizedToken = getAddress(input.tokenAddress).toLowerCase() as Address;
@@ -186,6 +187,7 @@ export class InMemoryPositionRepository implements PositionRepository {
 
   /** Manual TOKEN settlement via receipt: mirrors the `ManualTokenSettlement` table (txHash primary key). */
   readonly manualSettlements = new Map<string, ManualSettlementRecord>();
+  readonly dustSettlements = new Map<string, DustSettlementRecord>();
 
   async markClosed(
     id: string,
@@ -194,6 +196,7 @@ export class InMemoryPositionRepository implements PositionRepository {
     realizedUsdgRaw?: bigint | null,
     expectedCloseIdempotencyKey?: string,
     manualSettlement?: ManualSettlementEvidence,
+    dustSettlement?: DustSettlementEvidence,
   ): Promise<PositionRecord | null> {
     const record = this.get(id);
     if (record.status !== 'CLOSING') return null;
@@ -209,11 +212,21 @@ export class InMemoryPositionRepository implements PositionRepository {
         if (this.manualSettlements.has(manualSettlement.txHash)) throw new ManualSettlementTxAlreadyUsedError(manualSettlement.txHash);
         this.manualSettlements.set(manualSettlement.txHash, { ...manualSettlement, positionId: id, closeIdempotencyKey: record.closeIdempotencyKey ?? '', settledAt: closedAt });
       }
+      if (dustSettlement) {
+        // primary key = positionId in the real table: a repeat can never write twice
+        if (this.dustSettlements.has(id)) throw new Error(`dust settlement already recorded for position ${id}`);
+        this.dustSettlements.set(id, { ...dustSettlement, positionId: id, closeIdempotencyKey: record.closeIdempotencyKey ?? '', settledAt: closedAt });
+      }
     } catch (err) {
       Object.assign(record, before); // "transaction" rollback: not CLOSED, no proceeds
       throw err;
     }
     return record;
+  }
+
+  async findDustSettlementByPositionId(positionId: string): Promise<DustSettlementRecord | null> {
+    const found = this.dustSettlements.get(positionId);
+    return found ? { ...found } : null;
   }
 
   async findManualSettlementByTxHash(txHash: string): Promise<ManualSettlementRecord | null> {
