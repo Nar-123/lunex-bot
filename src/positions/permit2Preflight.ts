@@ -34,6 +34,16 @@ export type Permit2PreflightStatus = 'VALID' | 'INSUFFICIENT_ALLOWANCE' | 'INSUF
 
 export interface Permit2PreflightInput {
   configuredPermit2: Address;
+  /**
+   * The (owner, token, spender) tuple the on-chain reads were actually made
+   * for. Supplied by `runPermit2Preflight`; when it does not match what this
+   * chain's configuration expects, the reads describe a DIFFERENT authorization
+   * than the one about to be used, so the result is treated as unusable
+   * (UNAVAILABLE) rather than trusted. Omitted in pure unit tests of the policy.
+   */
+  readFor?: { owner: Address; token: Address; spender: Address };
+  expectedOwner?: Address;
+  expectedToken?: Address;
   /** `PositionManager.permit2()` as read on-chain */
   positionManagerPermit2: Address;
   erc20AllowanceToPermit2: bigint;
@@ -44,6 +54,8 @@ export interface Permit2PreflightInput {
   chainTimestamp: number;
   minRemainingValiditySeconds: number;
   expiryWarningSeconds: number;
+  /** The spender the v4 settlement pulls through -- the PositionManager. */
+  positionManagerPermit2Spender: Address;
 }
 
 export interface Permit2PreflightResult {
@@ -72,6 +84,22 @@ export function evaluatePermit2Preflight(i: Permit2PreflightInput): Permit2Prefl
   const expiresAt = new Date(i.grant.expiration * 1000).toISOString();
   const block = (status: Permit2PreflightStatus, reason: string): Permit2PreflightResult => ({ ...base, status, deployable: false, needsErc20Approval: false, reason });
 
+  // The reads must describe the authorization we are about to rely on: same
+  // owner (our executor wallet), same token (the configured quote asset) and
+  // same spender (the PositionManager). A mismatch means the answer is about
+  // something else entirely -- never "close enough", always fail closed.
+  if (i.readFor) {
+    const mismatch = [
+      i.expectedOwner && i.readFor.owner.toLowerCase() !== i.expectedOwner.toLowerCase() ? `owner ${i.readFor.owner} != expected ${i.expectedOwner}` : null,
+      i.expectedToken && i.readFor.token.toLowerCase() !== i.expectedToken.toLowerCase() ? `token ${i.readFor.token} != expected ${i.expectedToken}` : null,
+    ].filter(Boolean);
+    if (mismatch.length > 0) {
+      return block('UNAVAILABLE', `Permit2 state was read for a different subject (${mismatch.join('; ')}) -- refusing to judge this entry on it`);
+    }
+    if (i.readFor.spender.toLowerCase() !== i.positionManagerPermit2Spender.toLowerCase()) {
+      return block('WRONG_SPENDER', `Permit2 grant was read for spender ${i.readFor.spender}, but settlement pulls through ${i.positionManagerPermit2Spender}`);
+    }
+  }
   if (i.positionManagerPermit2.toLowerCase() !== i.configuredPermit2.toLowerCase()) {
     return block('WRONG_SPENDER', `PositionManager is bound to Permit2 ${i.positionManagerPermit2}, not the configured ${i.configuredPermit2} -- refusing to approve/deploy`);
   }
@@ -117,6 +145,10 @@ export async function runPermit2Preflight(requiredAmount: bigint, r: Permit2Pref
   return evaluatePermit2Preflight({
     configuredPermit2: permit2,
     positionManagerPermit2,
+    positionManagerPermit2Spender: pm,
+    readFor: { owner: wallet, token: usdg, spender: pm },
+    expectedOwner: wallet,
+    expectedToken: usdg,
     erc20AllowanceToPermit2,
     grant,
     requiredAmount,

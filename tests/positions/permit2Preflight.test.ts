@@ -6,6 +6,7 @@ import { buildApproveDeps as buildExitApproveDeps } from '../../src/exits/approv
 import { config } from '../../src/config';
 
 const PERMIT2 = '0x000000000022D473030F116dDEE9F6B43aC78BA3' as Address;
+const POSITION_MANAGER = '0x58daec3116aae6D93017bAAea7749052E8a04fA7' as Address;
 const OTHER = '0x1111111111111111111111111111111111111111' as Address;
 const WALLET = '0x9999999999999999999999999999999999999999' as Address;
 const UINT160_MAX = 2n ** 160n - 1n;
@@ -16,6 +17,7 @@ function input(o: Partial<Permit2PreflightInput> = {}): Permit2PreflightInput {
   return {
     configuredPermit2: PERMIT2,
     positionManagerPermit2: PERMIT2,
+    positionManagerPermit2Spender: POSITION_MANAGER,
     erc20AllowanceToPermit2: 2n ** 256n - 1n - 20_959_499_978n, // live post-mint value
     grant: { amount: UINT160_MAX, expiration: 1_790_871_926, nonce: 2 }, // live grant
     requiredAmount: REQUIRED,
