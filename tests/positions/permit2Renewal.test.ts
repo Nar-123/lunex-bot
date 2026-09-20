@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { decodeFunctionData, type Address } from 'viem';
+import { decodeFunctionData, getAddress, type Address } from 'viem';
 import {
   assessPermit2Renewal,
   encodePermit2Approve,
@@ -244,8 +244,10 @@ describe('19. exact transaction parameters', () => {
     // that -- not the read -- is the audited source of the spender.
     const r = assessPermit2Renewal(at(DAY, { readFor: { owner: WALLET.toLowerCase() as Address, token: USDG.toLowerCase() as Address, spender: POSITION_MANAGER.toLowerCase() as Address } }));
     expect(r.status).toBe('RENEWAL_NEEDED');
-    expect(r.txParams?.call.spender).toBe(POSITION_MANAGER);
-    expect(r.txParams?.call.token).toBe(USDG);
+    // reported checksummed, whatever form the read (or the config) used
+    expect(r.txParams?.call.spender).toBe(getAddress(POSITION_MANAGER));
+    expect(r.txParams?.call.token).toBe(getAddress(USDG));
+    expect(r.txParams?.from).toBe(getAddress(WALLET));
     expect(r.idempotencyKey).toBe(renewalIdempotencyKey(CHAIN, USDG, POSITION_MANAGER, NOW + R.DEFAULT_LIFETIME_SECONDS));
   });
 

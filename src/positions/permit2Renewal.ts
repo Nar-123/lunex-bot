@@ -203,7 +203,18 @@ export function assessPermit2Renewal(i: Permit2RenewalInput): Permit2RenewalAsse
     ...base,
     status: 'RENEWAL_NEEDED',
     reason: `grant expires in ${secondsUntilExpiry}s; a renewal would set expiration ${expiration} (chain time ${i.chainTimestamp} + ${lifetime}s)`,
-    txParams: { to, data, value, from: i.executorOwner, chainId: i.chainId, call: { token: i.configuredToken, spender: i.positionManagerSpender, amount, expiration } },
+    // Addresses are reported CHECKSUMMED regardless of the form configuration
+    // stores them in: an operator reviewing `wouldSend` before authorising a
+    // standing permission should always see the canonical address, matching
+    // what the calldata itself decodes to.
+    txParams: {
+      to,
+      data,
+      value,
+      from: getAddress(i.executorOwner),
+      chainId: i.chainId,
+      call: { token: getAddress(i.configuredToken), spender: getAddress(i.positionManagerSpender), amount, expiration },
+    },
     idempotencyKey: renewalIdempotencyKey(i.chainId, i.configuredToken, i.positionManagerSpender, expiration),
   };
 }
