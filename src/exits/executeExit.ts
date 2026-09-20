@@ -12,7 +12,7 @@ import { buildRemoveLiquidityDeps as realBuildRemoveLiquidityDeps, type RemoveLi
 import { buildSwapDeps as realBuildSwapDeps, defaultLogImpact, shouldBlockForPriceImpact, type SwapVerifyData } from './swapTx';
 import { buildApproveDeps as realBuildApproveDeps, needsApproval, type ApproveVerifyData } from './approveTx';
 import { classifyApprovalSpender } from '../swap/executionTargets';
-import { evaluateSuppression, fingerprintDeterministicFailure, recordDeterministicBlock } from './swapLegBackoff';
+import { decodeBlockReason, evaluateSuppression, fingerprintDeterministicFailure, isDeterministicBlockReason, recordDeterministicBlock } from './swapLegBackoff';
 
 /**
  * Recognises a swap leg that was refused by `validateSwapQuote`'s
@@ -512,8 +512,21 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
       reason: `exit swap price impact ${measured} -- IMPACT_CHECK_ENABLED is on, deferring this swap`,
     };
   }
-  // The swap can proceed now -- the TOKEN leg is no longer blocked.
-  await deps.exitStates.clearSwapLegBlocked(position.id, exitState.swapAttemptCount);
+  // The quote and the impact gate just passed, so a TRANSIENT block
+  // (QUOTE_UNAVAILABLE / PRICE_IMPACT_BLOCKED) is genuinely resolved and is
+  // cleared here exactly as before.
+  //
+  // A DETERMINISTIC block is NOT resolved by the market improving: an
+  // unapproved execution target, embedded router or approval spender is a
+  // configuration fact. Clearing it here would restart its backoff ladder on
+  // every tick that happens to clear the impact gate -- exactly the hammering
+  // the ladder exists to prevent (observed in production: the ladder never got
+  // past its first rung). It is cleared instead when its fingerprint changes
+  // (`recordDeterministicBlock`) or when the swap finally succeeds.
+  const storedBlock = decodeBlockReason(exitState.swapLegBlockedReason ?? null);
+  if (!isDeterministicBlockReason(storedBlock.reason)) {
+    await deps.exitStates.clearSwapLegBlocked(position.id, exitState.swapAttemptCount);
+  }
 
   // C5 fix: the quote response has no `allowanceTarget` field on the real
   // API -- the real mechanism is this separate check, which also returns
@@ -610,6 +623,9 @@ async function settleSwapLeg(
     return { outcome: 'PENDING', reason: swapResult.reason };
   }
 
+  // The swap succeeded: whatever was blocking this leg is over. The position is
+  // about to be CLOSED, so this only keeps the row honest.
+  await deps.exitStates.clearSwapLegBlocked(position.id, exitState.swapAttemptCount);
   return finalizeClose(position, exitState, deps, removeKey, swapKey);
 }
 
