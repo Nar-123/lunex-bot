@@ -18,8 +18,14 @@ export interface BuildApproveDepsOptions {
 
 /**
  * A conditional first leg of the open-position flow: an ordinary USDG
- * `approve()` for the v4 PositionManager, needed before it can pull USDG
- * into a new LP position via `mintTx.ts`. Same pattern as
+ * `approve()` for **Permit2** -- the contract that actually moves the USDG
+ * when the v4 PositionManager settles a mint (`SETTLE_PAIR` ->
+ * `permit2.transferFrom`). VERIFIED on the first live mint: the direct
+ * ERC20 allowance to the PositionManager was never consumed; the one to
+ * Permit2 dropped by exactly the deposit. Approving the PositionManager
+ * (the previous behaviour) left an unused allowance and did not provide
+ * what the mint needs. The separate Permit2 -> PositionManager grant is NOT
+ * created here (see `permit2Preflight.ts`). Same pattern as
  * `exits/approveTx.ts` -- deliberately NOT shared code between the two
  * modules (positions/ and exits/ each own their tx-builders, matching this
  * project's established per-module convention, and importing one from the
@@ -27,7 +33,7 @@ export interface BuildApproveDepsOptions {
  * which already depends on positions/ for `PositionRepository`).
  *
  * Unlike `exits/approveTx.ts`, the spender here is always the (fixed,
- * configured) PositionManager address, and the token is always USDG --
+ * configured) Permit2 address, and the token is always USDG --
  * both fixed by this module's purpose, not passed in as parameters.
  *
  * Approves for exactly `amountInRaw` (this deployment's decided position
@@ -39,11 +45,11 @@ export function buildApproveDeps(amountInRaw: bigint, options: BuildApproveDepsO
   const readAllowance = options.readAllowance ?? readErc20Allowance;
   const wallet = options.walletAddress ?? getExecutorAddress();
   const usdgAddress = config.quoteAsset.ADDRESS as Address;
-  const positionManagerAddress = config.uniswap.v4.positionManager as Address;
+  const permit2Address = config.uniswap.v4.permit2 as Address;
 
   return {
     buildTransaction: () => {
-      const { to, data } = encodeErc20Approve(usdgAddress, positionManagerAddress, amountInRaw);
+      const { to, data } = encodeErc20Approve(usdgAddress, permit2Address, amountInRaw);
       return Promise.resolve({ to, data, value: 0n });
     },
     simulate: txSteps.simulateTx,
@@ -56,9 +62,9 @@ export function buildApproveDeps(amountInRaw: bigint, options: BuildApproveDepsO
     waitForReceipt: txSteps.waitForTxReceipt,
     getReceiptIfAvailable: txSteps.getReceiptIfAvailable,
     verifyOnChain: async () => {
-      const allowanceRaw = await readAllowance(usdgAddress, wallet, positionManagerAddress);
+      const allowanceRaw = await readAllowance(usdgAddress, wallet, permit2Address);
       if (allowanceRaw < amountInRaw) {
-        return { ok: false, reason: `USDG allowance for PositionManager is only ${allowanceRaw}, need at least ${amountInRaw}` };
+        return { ok: false, reason: `USDG allowance for Permit2 is only ${allowanceRaw}, need at least ${amountInRaw}` };
       }
       return { ok: true, data: { allowanceRaw } };
     },

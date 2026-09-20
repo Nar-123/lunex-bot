@@ -10,6 +10,7 @@ import { PositionActivePositionChecker } from '../../src/positions/activePositio
 import { PositionCapitalSnapshotProvider } from '../../src/positions/capitalSnapshotProvider';
 import { POOL } from './fixtures';
 import type { CapitalRules } from '../../src/capital/types';
+import { validPermit2Preflight } from './permit2Fixtures';
 
 /** Matches the canonical base=1000/target=350 worked example used throughout this project's capital tests -- generous enough that P1-1's write-time re-check never spuriously rejects an unrelated mint/approve-state-machine test. */
 const CAPITAL_RULES: CapitalRules = {
@@ -88,6 +89,7 @@ function baseDeps(overrides: Partial<OpenPositionDeps> = {}): Omit<OpenPositionD
     livePositionState: { getLiveState: vi.fn() },
     poolPrice: { getPriceState: vi.fn() },
     readAllowance: vi.fn(async () => 0n), // insufficient by default -- most tests want the approve leg exercised unless overridden
+    permit2Preflight: validPermit2Preflight(),
     walletAddress: WALLET,
     ...overrides,
   };

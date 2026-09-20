@@ -126,6 +126,16 @@ const envSchema = z.object({
   // configured address -- cross-checked the same way as the PoolManager's
   // deploy block above.
   UNISWAP_V4_POSITION_MANAGER_DEPLOY_BLOCK: z.coerce.bigint().default(9073n),
+  // Uniswap Permit2 (canonical CREATE2 address, identical on every chain).
+  // The v4 PositionManager settles a mint's token debt through
+  // `permit2.transferFrom` -- VERIFIED on the first live mint (trace:
+  // PositionManager -> Permit2 -> USDG.transferFrom -> PoolManager) and via
+  // the on-chain `PositionManager.permit2()` getter, which
+  // positions/permit2Preflight.ts cross-checks against this value.
+  PERMIT2_ADDRESS: z
+    .string()
+    .regex(/^0x[0-9a-fA-F]{40}$/)
+    .default('0x000000000022D473030F116dDEE9F6B43aC78BA3'),
   UNISWAP_V4_STATE_VIEW_ADDRESS: z
     .string()
     .regex(/^0x[0-9a-fA-F]{40}$/)

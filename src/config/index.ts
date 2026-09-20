@@ -43,6 +43,7 @@ const uniswap: UniswapAddressBook = {
     positionManager: env.UNISWAP_V4_POSITION_MANAGER_ADDRESS,
     positionManagerDeployBlock: env.UNISWAP_V4_POSITION_MANAGER_DEPLOY_BLOCK,
     stateView: env.UNISWAP_V4_STATE_VIEW_ADDRESS,
+    permit2: env.PERMIT2_ADDRESS,
   },
   uniswapX: {
     reactor: env.UNISWAPX_REACTOR_ADDRESS,

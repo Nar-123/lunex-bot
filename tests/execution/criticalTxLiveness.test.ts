@@ -13,6 +13,7 @@ import type { MintVerifyData } from '../../src/positions/mintTx';
 import { InMemoryTransactionAttemptRepository } from './inMemoryTransactionAttemptRepository';
 import { InMemoryPositionRepository } from '../positions/inMemoryPositionRepository';
 import { POOL } from '../positions/fixtures';
+import { validPermit2Preflight } from '../positions/permit2Fixtures';
 
 // Stuck-transaction incident (production approve at NONCE_ASSIGNED, txHash
 // null, lastError null, retried every 15s): liveness + observability +
@@ -213,7 +214,7 @@ describe('E. ambiguous broadcast', () => {
 
   it('safeErrorMessage bounds length and keeps a 32-byte tx hash readable', () => {
     const msg = safeErrorMessage(new Error(`boom ${HASH} ${'x'.repeat(2000)}`));
-    expect(msg.length).toBeLessThanOrEqual(500);
+    expect(msg.length).toBeLessThanOrEqual(800); // raised from 500 so the provider Details line survives
     expect(msg).toContain(HASH);
   });
 
@@ -331,6 +332,7 @@ describe('J. a position that is no longer OPENING never proceeds to mint', () =>
       buildMintDeps: buildMintDeps as unknown as OpenPositionDeps['buildMintDeps'],
       buildApproveDeps: approveDeps as unknown as OpenPositionDeps['buildApproveDeps'],
       readAllowance: vi.fn(async () => 0n),
+      permit2Preflight: validPermit2Preflight(),
       walletAddress: WALLET,
     };
     const outcome = await openPosition({

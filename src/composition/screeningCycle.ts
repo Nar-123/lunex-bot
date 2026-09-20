@@ -272,6 +272,10 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
         buildMintDeps: deps.buildMintDeps,
         readAllowance: deps.readAllowance,
         walletAddress: deps.walletAddress,
+        permit2Preflight: deps.permit2Preflight,
+        onPermit2Warning: (r) => {
+          deps.logger.warn('permit2_grant_expiring_soon', { expiresAt: new Date(r.grantExpiration * 1000).toISOString(), secondsUntilExpiry: r.secondsUntilExpiry, grantNonce: r.grantNonce });
+        },
       },
     );
 
@@ -282,6 +286,13 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
       // count is simply never checked in that case, see `canaryAllowsNewEntry`
       // above), so this line has zero effect on production behavior.
       if (canaryRules.enabled) deps.canaryGuard.recordSuccess();
+    } else if (openOutcome.blockedByPermit2) {
+      // Permit2 pre-flight refused the entry BEFORE any reservation. The
+      // condition is wallet-level (same grant/allowance for every candidate),
+      // so trying the next candidate would only repeat the same refusal.
+      deps.logger.warn('entry_blocked_permit2', { symbol: candidate.symbol, status: openOutcome.blockedByPermit2.status, reason: openOutcome.reason });
+      summary.skipped.push({ symbol: candidate.symbol, stage: 'permit2', reason: openOutcome.reason });
+      break;
     } else {
       summary.skipped.push({ symbol: candidate.symbol, stage: 'open', reason: openOutcome.reason });
       if (!tryNextCandidateOnFailure) break;
@@ -292,3 +303,4 @@ export async function runScreeningCycle(deps: AppDeps): Promise<ScreeningCycleSu
   deps.logger.info('screening_cycle', { ...summary });
   return summary;
 }
+

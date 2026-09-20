@@ -1,3 +1,4 @@
+import { redactSecrets } from './redactError';
 import { TX_ATTEMPT_STATUS_ORDER } from './types';
 import type {
   ExecutionResult,
@@ -29,6 +30,7 @@ export type CriticalStepCode =
   | 'SIGNED_CHECKPOINT_PERSIST_FAILED'
   | 'BROADCAST_FAILED'
   | 'BROADCAST_AMBIGUOUS'
+  | 'BROADCAST_REJECTED_FEE_TOO_LOW'
   | 'RECEIPT_WAIT_FAILED'
   | 'VERIFICATION_FAILED'
   | 'CHECKPOINT_PERSIST_FAILED';
@@ -62,20 +64,21 @@ const defaultLog: CriticalTxLog = (event, data) => {
   console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', event, ...data }));
 };
 
-const MAX_ERROR_LENGTH = 500;
+const MAX_ERROR_LENGTH = 800; // room for viem's short message + the provider Details line
 
 /**
  * Bounded, secret-safe error text for persistence/logging. RPC errors from
  * viem embed the request URL (the provider API key lives in its path) and
  * the request body (for a broadcast: the signed payload) -- neither may be
- * written to the database or the journal.
+ * written to the database or the journal. The provider's own `Details:` text
+ * (the real cause) and its JSON-RPC code ARE kept -- see `redactError.ts`.
  */
 export function safeErrorMessage(err: unknown): string {
-  const raw = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-  return raw
-    .replace(/(https?:\/\/[^/\s"'`]+)[^\s"'`]*/gi, '$1/<redacted>')
-    .replace(/Request body:[\s\S]*$/i, 'Request body: <redacted>')
-    .replace(/0x[0-9a-fA-F]{130,}/g, (m) => `0x<redacted ${(m.length - 2) / 2} bytes>`)
+  // viem's RpcError carries the provider's JSON-RPC code (e.g. -32000); keep it.
+  const rpcCode = err instanceof Error ? (err as Error & { code?: unknown }).code : undefined;
+  const code = typeof rpcCode === 'number' ? ` [code ${String(rpcCode)}]` : '';
+  const raw = err instanceof Error ? `${err.name}${code}: ${err.message}` : String(err);
+  return redactSecrets(raw)
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, MAX_ERROR_LENGTH);
@@ -384,6 +387,31 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
               lastError: safeErrorMessage(classification.reason),
             }, attempt.version);
             return definitiveFailure(classification.reason, attempt);
+          } else if (classification.kind === 'FEE_TOO_LOW') {
+            // Deterministic node-side rejection: "max fee per gas less than
+            // block base fee". THIS broadcast was not accepted -- but an
+            // EARLIER broadcast of these exact bytes may have been, so the
+            // receipt under our own hash is still checked first. Otherwise
+            // the attempt stays SIGNED with the SAME payload (same nonce,
+            // same hash): the next tick re-broadcasts identical bytes, which
+            // the node accepts once the base fee is back under the signed
+            // price. Never FAILED (the payload is not dead), never re-signed
+            // (that would create a second payload for this nonce).
+            let receipt: Awaited<ReturnType<typeof deps.getReceiptIfAvailable>> = null;
+            try {
+              receipt = await deps.getReceiptIfAvailable(lockedTxHash);
+            } catch {
+              // Receipt lookup failed: the rejection itself is still known -- stay resumable with the specific code.
+            }
+            if (receipt) {
+              attempt = await repo.update(attempt.id, { status: 'SENT' }, attempt.version);
+            } else {
+              report('BROADCAST_REJECTED_FEE_TOO_LOW', message, attempt, { txHash: lockedTxHash, signedGasPrice: gasPrice.toString(), retry: 'same-signed-bytes' });
+              attempt = await repo.update(attempt.id, {
+                lastError: `[BROADCAST_REJECTED_FEE_TOO_LOW] rejected by node (not accepted); same signed tx re-broadcast next tick: ${message}`.slice(0, MAX_ERROR_LENGTH),
+              }, attempt.version);
+              return ambiguousFailure(`broadcast rejected: fee below current base fee -- same signed transaction retried next tick: ${message}`, attempt);
+            }
           } else if (classification.kind === 'POSSIBLY_OURS') {
             // "nonce too low" / "replacement underpriced" -- could mean an
             // unrelated tx consumed this nonce (payload permanently dead)

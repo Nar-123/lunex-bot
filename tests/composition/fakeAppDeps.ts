@@ -12,6 +12,7 @@ import { InMemorySettingsRepository } from '../settings/inMemorySettingsReposito
 import { PositionCapitalSnapshotProvider } from '../../src/positions/capitalSnapshotProvider';
 import { InMemoryCanaryGuard } from '../../src/capital/canary';
 import { createInMemoryLogger } from '../../src/composition/logger';
+import { validPermit2Preflight } from '../positions/permit2Fixtures';
 
 export const WALLET = '0x9999999999999999999999999999999999999999' as Address;
 export const USDG = (n: number): bigint => BigInt(n) * 10n ** 18n;
@@ -154,6 +155,7 @@ export function createFakeAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
     buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: USDG(10), usdgProceedsRaw: USDG(10) })),
     buildApproveDepsForExit: vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(1000) })),
     readAllowance: vi.fn(async () => USDG(1000)), // already sufficient -- approve legs skipped by default in tests unless a test overrides this
+    permit2Preflight: validPermit2Preflight(), // Permit2 path valid by default -- never an RPC in tests
     readTokenBalanceForExit: vi.fn(async () => USDG(500)),
   };
 

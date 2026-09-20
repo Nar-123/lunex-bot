@@ -1,3 +1,4 @@
+import type { Permit2PreflightResult } from '../positions/permit2Preflight';
 import type { Address } from 'viem';
 import type { PositionRecord, PositionRepository } from '../positions/types';
 import type { TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
@@ -95,4 +96,6 @@ export interface AppDeps {
   /** Same reasoning as the tx-builder overrides above -- unused in production (real reads apply), lets the integration smoke test avoid ever hitting a real RPC for allowance/balance checks. */
   readAllowance?: (tokenAddress: Address, owner: Address, spender: Address) => Promise<bigint>;
   readTokenBalanceForExit?: (tokenAddress: Address, wallet: Address) => Promise<bigint>;
+  /** v4 Permit2 entry pre-flight -- same override reasoning; production uses the real read-only on-chain check. */
+  permit2Preflight?: (requiredAmount: bigint) => Promise<Permit2PreflightResult>;
 }

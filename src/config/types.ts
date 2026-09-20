@@ -27,6 +27,8 @@ export interface UniswapAddressBook {
     positionManagerDeployBlock: bigint;
     /** Periphery StateView contract — the standard way to read v4 pool state (slot0/liquidity/ticks) off-chain. */
     stateView: string;
+    /** Uniswap Permit2 -- the contract the v4 PositionManager pulls settlement tokens through. */
+    permit2: string;
   };
   uniswapX: {
     reactor: string;

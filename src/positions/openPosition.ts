@@ -4,7 +4,7 @@ import { config } from '../config';
 import { readErc20Allowance } from '../blockchain/erc20';
 import { discoverMintedTokenId } from '../blockchain/erc721';
 import { getExecutorAddress } from '../blockchain/walletClient';
-import { executeCriticalTransaction } from '../execution/executeCriticalTransaction';
+import { executeCriticalTransaction, safeErrorMessage } from '../execution/executeCriticalTransaction';
 import type { TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring/types';
 import type { CreatePositionInput, PositionPoolContext, PositionRecord, PositionRepository } from './types';
@@ -12,10 +12,16 @@ import { DuplicateActiveTokenPositionError, openMintAttemptKey } from './types';
 import type { CapitalRules } from '../capital/types';
 import { buildApproveDeps as realBuildApproveDeps, needsApproval, type ApproveVerifyData } from './approveTx';
 import { buildMintDeps as realBuildMintDeps, type MintInput, type MintVerifyData } from './mintTx';
+import { runPermit2Preflight, type Permit2PreflightResult } from './permit2Preflight';
 
 export type OpenPositionOutcome =
   | { outcome: 'ACTIVE'; position: PositionRecord }
-  | { outcome: 'FAILED'; reason: string }
+  | {
+      outcome: 'FAILED';
+      reason: string;
+      /** The v4 Permit2 pre-flight refused the entry BEFORE any capital reservation (wallet-level: every candidate would fail the same way). */
+      blockedByPermit2?: Permit2PreflightResult;
+    }
   | { outcome: 'PENDING'; reason: string };
 
 export interface OpenPositionInput {
@@ -54,6 +60,10 @@ export interface OpenPositionDeps {
   buildMintDeps?: (input: MintInput, live: LivePositionStateProvider, pool: PoolPriceProvider) => TxSafetyDeps<MintVerifyData>;
   readAllowance?: (tokenAddress: Address, owner: Address, spender: Address) => Promise<bigint>;
   walletAddress?: Address;
+  /** v4 Permit2 pre-flight (read-only). Injectable for tests -- defaults to the real on-chain reads. */
+  permit2Preflight?: (requiredAmount: bigint) => Promise<Permit2PreflightResult>;
+  /** Receives a deployable-but-noteworthy pre-flight result (grant expiring soon). */
+  onPermit2Warning?: (result: Permit2PreflightResult) => void;
   /** Injectable for tests -- defaults to the real on-chain Transfer-log lookup (see the "defense-in-depth" fallback in `executeOpen`). */
   discoverTokenId?: (txHash: `0x${string}`, contractAddress: Address, recipient: Address) => Promise<bigint>;
 }
@@ -94,6 +104,23 @@ export async function openPosition(input: OpenPositionInput, deps: OpenPositionD
   // there is no position row here to retry against, and `screeningCycle.ts`'s
   // existing "try the next candidate on failure" policy already does the
   // right thing with it.
+  // v4 Permit2 pre-flight -- BEFORE any capital reservation: an entry whose
+  // mint is guaranteed to fail at settlement (expired/missing/insufficient
+  // Permit2 grant, or a PositionManager bound to a different Permit2) must
+  // not reserve capital, create a position, or spend gas on an approve.
+  // Fails CLOSED: an RPC error reading it blocks this entry too.
+  let preflight: Permit2PreflightResult;
+  try {
+    preflight = await (deps.permit2Preflight ?? runPermit2Preflight)(input.entryUsdgRaw);
+  } catch (err) {
+    const reason = `Permit2 pre-flight could not be read -- entry not attempted (fail closed): ${safeErrorMessage(err)}`;
+    return { outcome: 'FAILED', reason, blockedByPermit2: { status: 'UNAVAILABLE', deployable: false, needsErc20Approval: false, reason, grantExpiration: 0, secondsUntilExpiry: 0, expiringSoon: false, grantNonce: 0 } };
+  }
+  if (!preflight.deployable) {
+    return { outcome: 'FAILED', reason: `[PERMIT2_${preflight.status}] ${preflight.reason}`, blockedByPermit2: preflight };
+  }
+  if (preflight.expiringSoon) deps.onPermit2Warning?.(preflight);
+
   let created: PositionRecord;
   try {
     const result = await deps.positions.createIfCapitalAllows(createInput, input.readOnChainUsdgBalance, input.capitalRules);
@@ -129,7 +156,7 @@ export async function resumeOpenPosition(position: PositionRecord, deps: OpenPos
  * The failed-open state machine -- deliberately SIMPLER than `exits/`'s,
  * per explicit review: this is ONE mandatory transaction (mint) plus one
  * CONDITIONAL transaction (approve, only if the current USDG allowance
- * for the PositionManager is insufficient) -- never two mandatory legs
+ * for Permit2 -- the v4 settlement spender -- is insufficient) -- never two mandatory legs
  * where the first's success changes what "failure" means for the second.
  * A USDG-only one-sided deposit needs no swap up front (the decided size
  * is already USDG), so there is no analogue to `exits/`'s
@@ -203,8 +230,10 @@ async function executeOpenClaimed(position: PositionRecord, deps: OpenPositionDe
   const wallet = deps.walletAddress ?? getExecutorAddress();
   const usdgAddress = config.quoteAsset.ADDRESS as Address;
   const positionManagerAddress = config.uniswap.v4.positionManager as Address;
+  // The v4 mint settles through Permit2, so the ERC20 allowance that matters is the one to Permit2.
+  const permit2Address = config.uniswap.v4.permit2 as Address;
 
-  const currentAllowance = await readAllowance(usdgAddress, wallet, positionManagerAddress);
+  const currentAllowance = await readAllowance(usdgAddress, wallet, permit2Address);
   if (needsApproval(currentAllowance, position.entryUsdgRaw)) {
     const approveKey = `${position.openIdempotencyKey}:approve`;
     const approveDeps = buildApproveDeps(position.entryUsdgRaw);

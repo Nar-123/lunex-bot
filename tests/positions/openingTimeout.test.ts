@@ -14,6 +14,7 @@ import { config } from '../../src/config';
 import { InMemoryPositionRepository } from './inMemoryPositionRepository';
 import { InMemoryTransactionAttemptRepository } from '../execution/inMemoryTransactionAttemptRepository';
 import { POOL } from './fixtures';
+import { validPermit2Preflight } from './permit2Fixtures';
 
 // H3: bounded OPENING lifetime. These drive the REAL openPosition /
 // resumeOpenPosition / executeCriticalTransaction flows against in-memory
@@ -80,6 +81,7 @@ function setup() {
     poolPrice: { getPriceState: vi.fn() },
     buildMintDeps,
     readAllowance: vi.fn(async () => 10n ** 40n), // allowance already sufficient -- no approve leg
+    permit2Preflight: validPermit2Preflight(),
     walletAddress: WALLET,
   });
   return { txAttempts, positions, logger, deps };

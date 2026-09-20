@@ -698,4 +698,24 @@ export const EXECUTION = {
   /// already considers superseded. Change it here (or change the cadence)
   /// -- never hardcode a separate value elsewhere. See `positions/openingTimeout.ts`.
   OPENING_MAX_AGE_MS: DISCOVERY.CYCLE_INTERVAL_MS,
+  /// Legacy gasPrice headroom (see execution/gasPrice.ts). Robinhood Chain's
+  /// `eth_gasPrice` equals the current base fee exactly and the base fee moves
+  /// every block (observed spread ~4%); a tx priced below the base fee at
+  /// submission is rejected ("max fee per gas less than block base fee").
+  /// The chain charges the inclusion block's base fee, not the signed price,
+  /// so headroom is a ceiling rather than a payment. +20% covers the observed
+  /// intra-second swings with a wide margin.
+  GAS_PRICE_HEADROOM_BPS: 2000,
+  /// If the cap leaves less headroom than this, do not sign (retry next tick).
+  GAS_PRICE_MIN_HEADROOM_BPS: 500,
+  /// Absolute ceiling for any signed gasPrice: 1 gwei (~15x the observed ~0.067 gwei base fee).
+  MAX_GAS_PRICE_WEI: 1_000_000_000n,
+  /// Permit2 pre-flight (positions/permit2Preflight.ts): a grant expiring within
+  /// this window is still usable but logged as a warning so the operator can
+  /// renew it deliberately (never renewed automatically).
+  PERMIT2_EXPIRY_WARNING_SECONDS: 7 * 24 * 60 * 60,
+  /// A grant must stay valid at least this long past the pre-flight to be used:
+  /// one OPENING lifetime (OPENING_MAX_AGE_MS), the longest a reserved entry may
+  /// still reach its mint. Anything shorter could expire between reservation and mint.
+  PERMIT2_MIN_REMAINING_VALIDITY_SECONDS: DISCOVERY.CYCLE_INTERVAL_MS / 1000,
 } as const;

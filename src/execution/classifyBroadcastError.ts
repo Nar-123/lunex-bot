@@ -39,6 +39,7 @@
  */
 export type BroadcastErrorClassification =
   | { kind: 'ALREADY_KNOWN' }
+  | { kind: 'FEE_TOO_LOW' }
   | { kind: 'POSSIBLY_OURS' }
   | { kind: 'DEFINITIVE_REJECTED'; reason: string }
   | { kind: 'AMBIGUOUS' };
@@ -52,6 +53,18 @@ export function classifyBroadcastError(message: string): BroadcastErrorClassific
 
   if (lower.includes('nonce too low') || lower.includes('replacement transaction underpriced')) {
     return { kind: 'POSSIBLY_OURS' };
+  }
+
+  // Node-side base-fee admission check (geth ErrFeeCapTooLow; returned by the
+  // production provider as JSON-RPC -32000, VERIFIED live 2026-09-19). A
+  // deterministic statement about THIS payload at THIS moment: the node did
+  // not accept it, and the same signed bytes become acceptable again once the
+  // base fee falls back under the signed price. Not ambiguous, not dead --
+  // the caller keeps the SAME signed payload (same nonce, same hash) and
+  // re-broadcasts it; it still checks for a receipt under our hash first,
+  // because an EARLIER broadcast of these exact bytes may have landed.
+  if (lower.includes('max fee per gas less than block base fee')) {
+    return { kind: 'FEE_TOO_LOW' };
   }
 
   if (lower.includes('insufficient funds')) {

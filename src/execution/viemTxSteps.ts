@@ -3,7 +3,9 @@ import type { LocalAccount } from 'viem';
 import { getPublicClient } from '../blockchain/viemClient';
 import { getExecutorAccount, getExecutorAddress } from '../blockchain/walletClient';
 import { robinhoodChain } from '../blockchain/viemChain';
+import { config } from '../config';
 import { checkGasAffordability } from './gasAffordability';
+import { computeLegacyGasPrice } from './gasPrice';
 import type { StepResult, TxRequest } from './types';
 
 /**
@@ -60,9 +62,20 @@ export async function estimateGasForTx(tx: TxRequest): Promise<bigint> {
   return client.estimateGas({ account: getExecutorAddress(), to: tx.to, data: tx.data, value: tx.value });
 }
 
+/**
+ * The legacy gasPrice to sign: `max(eth_gasPrice, latest baseFeePerGas)` plus
+ * bounded headroom (execution/gasPrice.ts). Throws `GasPriceAboveCapError`
+ * (transient -- the executor retries next tick) when the configured cap
+ * cannot give enough headroom.
+ */
 export async function getCurrentGasPrice(): Promise<bigint> {
   const client = getPublicClient();
-  return client.getGasPrice();
+  const [networkGasPrice, block] = await Promise.all([client.getGasPrice(), client.getBlock({ blockTag: 'latest' })]);
+  const ex = config.rules.execution;
+  return computeLegacyGasPrice(
+    { networkGasPrice, baseFeePerGas: block.baseFeePerGas ?? null },
+    { headroomBps: ex.GAS_PRICE_HEADROOM_BPS, minHeadroomBps: ex.GAS_PRICE_MIN_HEADROOM_BPS, maxGasPriceWei: ex.MAX_GAS_PRICE_WEI },
+  ).gasPrice;
 }
 
 export async function checkGasAffordableOnChain(gasLimit: bigint, gasPrice: bigint): Promise<StepResult> {
