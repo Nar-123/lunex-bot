@@ -3,13 +3,14 @@ import { getAddress } from 'viem';
 import type { Address } from 'viem';
 import type { PrismaClient } from '@prisma/client';
 import { getPrismaClient } from '../storage/prismaClient';
-import type { CreateIfCapitalAllowsResult, CreatePositionInput, OpeningExpiryResult, PositionRecord, PositionRepository, PositionStatus } from './types';
+import type { CreateIfCapitalAllowsResult, CreatePositionInput, ObsoleteExitAttemptOutcome, OpeningExpiryResult, PositionRecord, PositionRepository, PositionStatus } from './types';
 import { DuplicateActiveTokenPositionError, ManualSettlementTxAlreadyUsedError, openMintAttemptKey } from './types';
 import type { DustSettlementEvidence, DustSettlementRecord, ManualSettlementEvidence, ManualSettlementRecord } from './types';
 import { decideCapitalAllocation } from '../capital/decideCapitalAllocation';
 import { checkCapitalStateConsistent, deriveCapitalSnapshot, exitLegKeyPrefix } from '../capital/freshCapitalSnapshot';
 import { findAttemptsByKeyPrefixes } from '../execution/transactionAttemptRepository';
 import type { CapitalRules } from '../capital/types';
+import { CLEANABLE_PURPOSE, classifyStaleExitAttempt, lifecycleClosedReason, MAX_LAST_ERROR_LENGTH } from '../exits/staleExitAttemptCleanup';
 import { computeCooldownEndsAt } from '../cooldown/cooldownLogic';
 
 interface PrismaRow {
@@ -597,6 +598,59 @@ export class PrismaPositionRepository implements PositionRepository {
       data: { resumeClaimedAt: null, resumeClaimToken: null },
     });
     return result.count === 1;
+  }
+
+  /**
+   * Maintenance fence for obsolete exit legs of CLOSED positions. Mirrors the
+   * H3 `expireStaleOpening` fence: one transaction, a version+status CAS on
+   * every write, and a hard failure (rolling the whole transaction back) if a
+   * CAS does not match exactly one row -- a concurrent writer moved the row,
+   * so this decision was made on stale data and none of it may stand.
+   *
+   * Reads nothing but the named positions and their own exit legs, and writes
+   * nothing but qualifying attempt rows. Positions, capital and every other
+   * attempt are untouched.
+   */
+  async fenceObsoleteExitAttempts(positionIds: readonly string[], now: Date): Promise<ObsoleteExitAttemptOutcome[]> {
+    if (positionIds.length === 0) return [];
+    return this.prisma.$transaction(async (tx) => {
+      const results: ObsoleteExitAttemptOutcome[] = [];
+      for (const positionId of positionIds) {
+        const position = await tx.position.findUnique({ where: { id: positionId }, select: { id: true, status: true, closeReason: true, closeIdempotencyKey: true } });
+        if (!position) { results.push({ positionId, outcome: 'POSITION_NOT_FOUND' }); continue; }
+        if (position.status !== 'CLOSED') { results.push({ positionId, outcome: 'POSITION_NOT_CLOSED' }); continue; }
+        if (!position.closeIdempotencyKey) { results.push({ positionId, outcome: 'NO_CLOSE_KEY' }); continue; }
+
+        // Scope: only this lifecycle's own legs, and only the swap purpose.
+        const legs = await tx.transactionAttempt.findMany({
+          where: { idempotencyKey: { startsWith: exitLegKeyPrefix(position.closeIdempotencyKey) }, purpose: CLEANABLE_PURPOSE },
+          orderBy: { idempotencyKey: 'asc' },
+        });
+        for (const leg of legs) {
+          const decision = classifyStaleExitAttempt(position, leg);
+          const common = { positionId, attemptId: leg.id, idempotencyKey: leg.idempotencyKey, purpose: leg.purpose };
+          if (decision.action === 'SKIP') { results.push({ ...common, outcome: 'SKIPPED', reason: decision.reason }); continue; }
+
+          const fenced = await tx.transactionAttempt.updateMany({
+            where: { id: leg.id, version: leg.version, status: leg.status, nonce: null, txHash: null, rawTx: null },
+            data: {
+              status: 'FAILED',
+              failureCode: 'LIFECYCLE_CLOSED',
+              lastError: lifecycleClosedReason(position, leg.attemptCount).slice(0, MAX_LAST_ERROR_LENGTH),
+              updatedAt: now,
+              version: { increment: 1 },
+            },
+          });
+          if (fenced.count !== 1) {
+            // A concurrent writer advanced this row between the read and the
+            // CAS. The whole batch is abandoned rather than partially applied.
+            throw new Error(`fenceObsoleteExitAttempts: CAS matched ${fenced.count} rows for attempt ${leg.id} (expected 1) -- concurrent modification, nothing was changed`);
+          }
+          results.push({ ...common, outcome: 'FENCED', statusBefore: leg.status, attemptCount: leg.attemptCount });
+        }
+      }
+      return results;
+    });
   }
 
   async expireStaleOpening(id: string, maxAgeMs: number, now: Date): Promise<OpeningExpiryResult> {

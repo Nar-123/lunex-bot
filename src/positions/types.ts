@@ -1,4 +1,5 @@
 import type { Address } from 'viem';
+import type { StaleExitSkipReason } from '../exits/staleExitAttemptCleanup';
 import type { CapitalRules } from '../capital/types';
 
 export type PositionStatus = 'OPENING' | 'ACTIVE' | 'CLOSING' | 'CLOSED' | 'FAILED';
@@ -99,6 +100,15 @@ export type OpeningExpiryResult =
   /** `approveStatus` is set when an approve that may have been broadcast (SIGNED/SENT/CONFIRMED) is what blocks the expiry -- an approve landing after FAILED would leave an unwanted allowance. */
   | { outcome: 'BLOCKED_UNRESOLVED_TX'; mintStatus: string; approveStatus?: string }
   | { outcome: 'MINT_VERIFIED' };
+
+/**
+ * Outcome of fencing ONE obsolete exit leg. `SKIPPED` is always a refusal to
+ * touch the row, never a silent success -- see `classifyStaleExitAttempt`.
+ */
+export type ObsoleteExitAttemptOutcome =
+  | { positionId: string; attemptId: string; idempotencyKey: string; purpose: string; outcome: 'FENCED'; statusBefore: string; attemptCount: number }
+  | { positionId: string; attemptId: string; idempotencyKey: string; purpose: string; outcome: 'SKIPPED'; reason: StaleExitSkipReason }
+  | { positionId: string; outcome: 'POSITION_NOT_FOUND' | 'POSITION_NOT_CLOSED' | 'NO_CLOSE_KEY' };
 
 export type CreateIfCapitalAllowsResult =
   | { ok: true; record: PositionRecord }
@@ -388,6 +398,16 @@ export interface PositionRepository {
    * second caller sees NOT_OPENING.
    */
   expireStaleOpening(id: string, maxAgeMs: number, now: Date): Promise<OpeningExpiryResult>;
+  /**
+   * Maintenance: fence the obsolete, never-signed `exit:swap` legs of
+   * already-CLOSED positions (see `exits/staleExitAttemptCleanup.ts`). All
+   * rows for all given positions are decided and written in ONE transaction:
+   * either every qualifying row is fenced or nothing is. Idempotent -- a row
+   * already FAILED is reported `ALREADY_TERMINAL` and not rewritten. Never
+   * touches a position, capital, or any attempt that holds a nonce, a txHash,
+   * a raw signed transaction, or a possibly-broadcast status.
+   */
+  fenceObsoleteExitAttempts(positionIds: readonly string[], now: Date): Promise<ObsoleteExitAttemptOutcome[]>;
 }
 
 /**

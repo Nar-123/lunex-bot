@@ -52,7 +52,17 @@ export type TxFailureCode =
    * broadcast, and `executeCriticalTransaction` returns this cached
    * definitive failure for the key forever after.
    */
-  | 'OPENING_TIMEOUT';
+  | 'OPENING_TIMEOUT'
+  /**
+   * Written ONLY by `PositionRepository.fenceObsoleteExitAttempts` onto an
+   * exit leg of an already-CLOSED position that provably never reached SIGNED
+   * (no nonce, no txHash, no rawTx). NOT a blockchain failure: no transaction
+   * was ever built to completion, let alone sent. It is a fence -- the
+   * CAS/version bump plus `executeCriticalTransaction`'s two FAILED checks
+   * mean the leg can never be resumed, signed or broadcast afterwards -- and
+   * it removes an obsolete row from `findNonTerminal()`'s stuck reporting.
+   */
+  | 'LIFECYCLE_CLOSED';
 
 export interface TxRequest {
   to: Address;

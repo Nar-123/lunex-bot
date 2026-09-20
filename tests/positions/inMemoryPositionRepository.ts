@@ -1,11 +1,12 @@
 import type { Address } from 'viem';
 import { getAddress } from 'viem';
-import type { CreateIfCapitalAllowsResult, CreatePositionInput, DustSettlementEvidence, DustSettlementRecord, ManualSettlementEvidence, ManualSettlementRecord, OpeningExpiryResult, PositionRecord, PositionRepository } from '../../src/positions/types';
+import type { CreateIfCapitalAllowsResult, CreatePositionInput, DustSettlementEvidence, DustSettlementRecord, ManualSettlementEvidence, ManualSettlementRecord, ObsoleteExitAttemptOutcome, OpeningExpiryResult, PositionRecord, PositionRepository } from '../../src/positions/types';
 import { DuplicateActiveTokenPositionError, ManualSettlementTxAlreadyUsedError, openMintAttemptKey } from '../../src/positions/types';
 import { decideCapitalAllocation } from '../../src/capital/decideCapitalAllocation';
 import type { CapitalRules } from '../../src/capital/types';
 import { checkCapitalStateConsistent, deriveCapitalSnapshot, exitLegKeyPrefix } from '../../src/capital/freshCapitalSnapshot';
 import type { TransactionAttemptRepository } from '../../src/execution/types';
+import { CLEANABLE_PURPOSE, classifyStaleExitAttempt, lifecycleClosedReason, MAX_LAST_ERROR_LENGTH } from '../../src/exits/staleExitAttemptCleanup';
 
 const NON_CLOSED = new Set(['OPENING', 'ACTIVE', 'CLOSING']);
 
@@ -342,6 +343,51 @@ export class InMemoryPositionRepository implements PositionRepository {
     if (row.status !== 'OPENING') return { outcome: 'NOT_OPENING' };
     row.status = 'FAILED';
     return { outcome: 'EXPIRED', mintStatusBefore: mint?.status ?? null };
+  }
+
+  /**
+   * Mirrors `PrismaPositionRepository.fenceObsoleteExitAttempts`: same
+   * classifier, same CAS-on-version write, same all-or-nothing batch, and the
+   * same serialization (the real one runs inside a single SQLite transaction).
+   */
+  async fenceObsoleteExitAttempts(positionIds: readonly string[], now: Date): Promise<ObsoleteExitAttemptOutcome[]> {
+    if (positionIds.length === 0) return [];
+    const run = this.fenceLock.then(() => this.fenceObsoleteExitAttemptsLocked(positionIds, now));
+    this.fenceLock = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private fenceLock: Promise<void> = Promise.resolve();
+
+  // `now` is unused here: TransactionAttemptRecord carries no updatedAt, which only the real (Prisma) row has.
+  private async fenceObsoleteExitAttemptsLocked(positionIds: readonly string[], _now: Date): Promise<ObsoleteExitAttemptOutcome[]> {
+    if (!this.txAttempts) throw new Error('InMemoryPositionRepository.fenceObsoleteExitAttempts needs the txAttempts repository (constructor argument)');
+    const results: ObsoleteExitAttemptOutcome[] = [];
+    // Staged, then committed at the end: the real implementation is one
+    // transaction, so a CAS failure anywhere must leave NOTHING written.
+    const staged: { id: string; version: number; lastError: string }[] = [];
+    for (const positionId of positionIds) {
+      const position = this.byId.get(positionId);
+      if (!position) { results.push({ positionId, outcome: 'POSITION_NOT_FOUND' }); continue; }
+      if (position.status !== 'CLOSED') { results.push({ positionId, outcome: 'POSITION_NOT_CLOSED' }); continue; }
+      if (!position.closeIdempotencyKey) { results.push({ positionId, outcome: 'NO_CLOSE_KEY' }); continue; }
+
+      const legs = (await this.txAttempts.findByKeyPrefixes([exitLegKeyPrefix(position.closeIdempotencyKey)]))
+        .filter((a) => a.purpose === CLEANABLE_PURPOSE)
+        .sort((a, b) => a.idempotencyKey.localeCompare(b.idempotencyKey));
+      for (const leg of legs) {
+        const decision = classifyStaleExitAttempt(position, leg);
+        const common = { positionId, attemptId: leg.id, idempotencyKey: leg.idempotencyKey, purpose: leg.purpose };
+        if (decision.action === 'SKIP') { results.push({ ...common, outcome: 'SKIPPED', reason: decision.reason }); continue; }
+        staged.push({ id: leg.id, version: leg.version, lastError: lifecycleClosedReason(position, leg.attemptCount).slice(0, MAX_LAST_ERROR_LENGTH) });
+        results.push({ ...common, outcome: 'FENCED', statusBefore: leg.status, attemptCount: leg.attemptCount });
+      }
+    }
+    for (const w of staged) {
+      // `update` enforces the version CAS and throws StaleTransactionAttemptWriteError on mismatch.
+      await this.txAttempts.update(w.id, { status: 'FAILED', failureCode: 'LIFECYCLE_CLOSED', lastError: w.lastError }, w.version);
+    }
+    return results;
   }
 
   private get(id: string): PositionRecord {
