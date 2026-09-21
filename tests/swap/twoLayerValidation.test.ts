@@ -2,11 +2,17 @@ import { describe, expect, it } from 'vitest';
 import { SwapQuoteValidationError, validateSwapQuote, type RawSwapTxCandidate, type SwapQuoteExpectation } from '../../src/swap/validateSwapQuote';
 import { SWAP_PROXY_EXECUTE_SELECTOR } from '../../src/swap/executionTargets';
 import { APPROVED_PROXY, APPROVED_ROUTER, LEGACY_PROXY, POLICY, proxyCalldata, TOKEN, UNVERIFIED_ROUTER } from './executionTargetFixtures';
+import { urExecuteCalldata } from './urCalldataFixture';
+import type { Address } from 'viem';
 
 const AMOUNT = 500n;
+const RECIPIENT = '0x9999999999999999999999999999999999999999' as Address;
+const NOW = Math.floor(Date.now() / 1000);
+/** EXIT-ROUTER RESOLUTION: CASE A now carries a real, decodable command batch. */
+const UR_DATA = urExecuteCalldata({ recipient: RECIPIENT, tokenIn: TOKEN as Address, amountIn: AMOUNT, amountOutMin: 1n });
 const base = (over: Partial<RawSwapTxCandidate> = {}): RawSwapTxCandidate => ({
   to: APPROVED_ROUTER,
-  data: '0xabcdef12',
+  data: UR_DATA,
   value: '0',
   chainId: 4663,
   echoedAmountInRaw: AMOUNT,
@@ -19,13 +25,15 @@ const expected = (over: Partial<SwapQuoteExpectation> = {}): SwapQuoteExpectatio
   minReceivedRequired: true,
   targets: POLICY,
   tokenIn: TOKEN,
+  recipient: RECIPIENT,
+  now: NOW,
   ...over,
 });
 const viaProxy = (over: Parameters<typeof proxyCalldata>[0] = {}): RawSwapTxCandidate => base({ to: APPROVED_PROXY, data: proxyCalldata(over) });
 
 describe('two-layer execution-target validation', () => {
   it('1. CASE A: a direct approved Universal Router is accepted and returns clean calldata', () => {
-    expect(validateSwapQuote(base(), expected())).toEqual({ to: APPROVED_ROUTER, data: '0xabcdef12', value: 0n });
+    expect(validateSwapQuote(base(), expected())).toEqual({ to: APPROVED_ROUTER, data: UR_DATA, value: 0n });
   });
 
   it('2. CASE B: an approved SwapProxy is accepted when the EMBEDDED router is approved', () => {
@@ -113,7 +121,9 @@ describe('two-layer execution-target validation', () => {
 
   it('regression: proxy validation is never treated as router validation (the proxy is not accepted as an embedded router, and a router is not accepted as a proxy target)', () => {
     expect(() => validateSwapQuote(viaProxy({ router: APPROVED_PROXY }), expected())).toThrow(SwapQuoteValidationError);
-    // a direct router target is not required to carry proxy calldata at all
-    expect(() => validateSwapQuote(base({ data: '0x3593564c' }), expected())).not.toThrow();
+    // a direct router target carries a Universal Router command batch, never proxy calldata...
+    expect(() => validateSwapQuote(base(), expected())).not.toThrow();
+    // ...and a bare selector with no decodable batch is now refused rather than waved through
+    expect(() => validateSwapQuote(base({ data: '0x3593564c' }), expected())).toThrow(SwapQuoteValidationError);
   });
 });

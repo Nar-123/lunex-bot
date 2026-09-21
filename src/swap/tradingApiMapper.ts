@@ -184,12 +184,13 @@ export function parseQuoteResponse(body: unknown, amountInRaw: bigint): Omit<Swa
     throw new TradingApiMappingError(`Trading API returned an unrecognized routing type: "${routing}"`);
   }
 
-  // Permit2 was requested disabled (see tradingApiClient.ts) specifically
-  // so this integration never needs EIP-712 signing -- if the API still
-  // wants a permit, the assumption didn't hold. Fail loudly, don't guess.
-  if (permitData !== null && permitData !== undefined) {
-    throw new TradingApiPermitRequiredError();
-  }
+  // `permitData` is ADVISORY (exit-router resolution, 2026-09-20). The API
+  // offers a signature route; this project instead relies on an on-chain
+  // Permit2 allowance, so a non-null value here is NOT a failure. What decides
+  // whether a swap is signable is the CALLDATA -- checked command by command in
+  // `swap/universalRouterCalldata.ts`, which fails closed on PERMIT2_PERMIT.
+  // Recorded on the quote so the decision is auditable rather than discarded.
+  const permitDataPresent = permitData !== null && permitData !== undefined;
 
   // Real validation opportunity (not tautological): confirms the API
   // actually quoted the amount we asked for, not a silently different one
@@ -223,6 +224,7 @@ export function parseQuoteResponse(body: unknown, amountInRaw: bigint): Omit<Swa
     expectedAmountOutRaw,
     minOutputAmountRaw: 0n, // filled in by the caller once MIN_RECEIVED_PROTECTION_ENABLED is applied
     priceImpactPct,
+    permitDataPresent,
     // The whole `quote` object, opaque, to be echoed back verbatim to
     // POST /v1/swap -- see SwapQuote.providerQuote's doc comment.
     providerQuote: quote,

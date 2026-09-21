@@ -9,6 +9,7 @@ import { InMemoryPositionRepository } from '../positions/inMemoryPositionReposit
 import { InMemoryExitStateRepository } from './inMemoryExitStateRepository';
 import { makeCreateInput } from '../positions/fixtures';
 import { config } from '../../src/config';
+import { grantAlreadyValid } from '../exits/tokenGrantTestStub';
 
 /**
  * Backoff follow-up: a deterministic block must survive a tick that merely
@@ -78,6 +79,7 @@ function deps(ctx: Awaited<ReturnType<typeof scenario>>, over: Partial<ExecuteEx
     positions: ctx.positions, exitStates: ctx.exitStates, txAttempts: ctx.txAttempts,
     livePositionState: { getLiveState: vi.fn() }, poolPrice: { getPriceState: vi.fn() },
     swapExecutor: executor(0.001), readTokenBalance: vi.fn(async () => U(500)), readAllowance: vi.fn(async () => U(1000)), walletAddress: WALLET,
+    tokenGrantPreflight: grantAlreadyValid,
     buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: U(400) })),
     buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: U(490), usdgProceedsRaw: U(490) })),
     buildApproveDeps: vi.fn(() => fakeTxDeps({ allowanceRaw: U(500) })),

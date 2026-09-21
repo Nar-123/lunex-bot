@@ -36,6 +36,7 @@ describe('parseQuoteResponse', () => {
       expectedAmountOutRaw: 490n,
       minOutputAmountRaw: 0n,
       priceImpactPct: 0.0042,
+      permitDataPresent: false,
       providerQuote: validBody.quote,
     });
   });
@@ -109,30 +110,29 @@ describe('parseQuoteResponse', () => {
     });
   });
 
-  describe('Permit2 opt-out verification (never falls back to guessing/signing if the API still wants a permit)', () => {
+  describe('permitData is ADVISORY (exit-router resolution, 2026-09-20)', () => {
     it('accepts a response with quote.permitData explicitly null', () => {
-      expect(() => parseQuoteResponse({ ...validBody, quote: { ...validBody.quote, permitData: null } }, 500n)).not.toThrow();
+      const q = parseQuoteResponse({ ...validBody, quote: { ...validBody.quote, permitData: null } }, 500n);
+      expect(q.permitDataPresent).toBe(false);
     });
 
     it('accepts a response that omits quote.permitData entirely', () => {
       const { permitData, ...withoutPermit } = validBody.quote;
       void permitData;
-      expect(() => parseQuoteResponse({ ...validBody, quote: withoutPermit }, 500n)).not.toThrow();
+      const q = parseQuoteResponse({ ...validBody, quote: withoutPermit }, 500n);
+      expect(q.permitDataPresent).toBe(false);
     });
 
-    it('throws TradingApiPermitRequiredError when the API still returns non-null quote.permitData despite the opt-out request', () => {
+    it('a non-null permitData no longer throws -- it is recorded, not obeyed', () => {
       const withPermit = { ...validBody, quote: { ...validBody.quote, permitData: { some: 'eip712-payload' } } };
-      expect(() => parseQuoteResponse(withPermit, 500n)).toThrow(TradingApiPermitRequiredError);
+      expect(() => parseQuoteResponse(withPermit, 500n)).not.toThrow();
+      expect(parseQuoteResponse(withPermit, 500n).permitDataPresent).toBe(true);
     });
 
-    it('does not silently attempt EIP-712 signing or otherwise proceed when permitData is present -- confirmed by the throw itself carrying no signed data', () => {
-      let caught: unknown;
-      try {
-        parseQuoteResponse({ ...validBody, quote: { ...validBody.quote, permitData: {} } }, 500n);
-      } catch (err) {
-        caught = err;
-      }
-      expect(caught).toBeInstanceOf(TradingApiPermitRequiredError);
+    it('the EIP-712 payload itself is never carried into the mapped quote as something to sign', () => {
+      const q = parseQuoteResponse({ ...validBody, quote: { ...validBody.quote, permitData: { domain: {}, types: {}, values: {} } } }, 500n);
+      expect(Object.keys(q)).not.toContain('permitData');
+      expect(q.permitDataPresent).toBe(true);
     });
   });
 });

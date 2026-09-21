@@ -16,6 +16,7 @@ import { config } from '../../src/config';
 import type { TxSafetyDeps } from '../../src/execution/types';
 import type { SwapExecutor } from '../../src/swap/types';
 import { makeCreateInput } from '../positions/fixtures';
+import { grantAlreadyValid } from '../exits/tokenGrantTestStub';
 
 // Cooldown crash-gap fix, against the REAL migrated SQLite schema. A
 // successful close and its exit cooldown are committed by ONE transaction
@@ -261,6 +262,7 @@ describe('Cooldown crash-gap fix (real SQLite): a successful close and its coold
       livePositionState: { getLiveState: vi.fn() },
       poolPrice: { getPriceState: vi.fn() },
       swapExecutor: { getQuote: vi.fn(), checkApproval: vi.fn(), buildSwapTx: vi.fn() } as unknown as SwapExecutor,
+      tokenGrantPreflight: grantAlreadyValid,
       buildRemoveLiquidityDeps: vi.fn(() => removeDeps),
       readTokenBalance: vi.fn(async () => 0n),
       walletAddress: WALLET,

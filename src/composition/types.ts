@@ -3,6 +3,7 @@ import type { Address } from 'viem';
 import type { PositionRecord, PositionRepository } from '../positions/types';
 import type { TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
 import type { ExitStateRepository } from '../exits/types';
+import type { ExecuteExitDeps } from '../exits/executeExit';
 import type { SettingsRepository } from '../settings/types';
 import type { CooldownChecker } from '../filters/types';
 import type { ActivePositionChecker } from '../filters/types';
@@ -96,6 +97,10 @@ export interface AppDeps {
   /** Same reasoning as the tx-builder overrides above -- unused in production (real reads apply), lets the integration smoke test avoid ever hitting a real RPC for allowance/balance checks. */
   readAllowance?: (tokenAddress: Address, owner: Address, spender: Address) => Promise<bigint>;
   readTokenBalanceForExit?: (tokenAddress: Address, wallet: Address) => Promise<bigint>;
+  /** EXIT-ROUTER RESOLUTION: the Permit2 token-grant pre-flight for exits. Defaults to the real chain read. */
+  tokenGrantPreflight?: ExecuteExitDeps['tokenGrantPreflight'];
+  /** EXIT-ROUTER RESOLUTION: the strict pre-send simulation gate. Defaults to a real `eth_call`. */
+  simulateSwap?: ExecuteExitDeps['simulateSwap'];
   /** v4 Permit2 entry pre-flight -- same override reasoning; production uses the real read-only on-chain check. */
   permit2Preflight?: (requiredAmount: bigint) => Promise<Permit2PreflightResult>;
 }

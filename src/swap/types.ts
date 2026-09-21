@@ -40,6 +40,14 @@ export interface SwapQuote {
    * `exits/swapTx.ts`).
    */
   priceImpactPct: number | null;
+  /**
+   * EXIT-ROUTER RESOLUTION: the Trading API returned `permitData` (an offer of
+   * the EIP-712 signature route). ADVISORY ONLY -- this project uses an
+   * on-chain Permit2 allowance instead, and the calldata is what is actually
+   * enforced (`swap/universalRouterCalldata.ts`). Recorded so a response that
+   * starts asking for a signature is visible in logs rather than invisible.
+   */
+  permitDataPresent?: boolean;
   /** TIER 3: the slippage tier (in basis points) this quote was requested with -- 100/200/300 per `EXITS.SLIPPAGE_TIERS_BPS`, escalating only on a DEFINITIVE prior failure. Recorded on the quote so the value that actually reached the router is visible downstream. */
   slippageBps: number;
   /**

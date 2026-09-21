@@ -12,6 +12,7 @@ import { makeCreateInput } from '../positions/fixtures';
 import type { SwapExecutor } from '../../src/swap/types';
 import type { TxRequest, TxSafetyDeps } from '../../src/execution/types';
 import type { Address } from 'viem';
+import { grantAlreadyValid } from '../exits/tokenGrantTestStub';
 
 const TX: TxRequest = { to: '0x1111111111111111111111111111111111111111', data: '0xabcdef', value: 0n };
 const WALLET = '0x9999999999999999999999999999999999999999' as Address;
@@ -53,6 +54,7 @@ async function makeDeps(overrides: { livePositionState?: LivePositionStateProvid
     livePositionState,
     poolPrice,
     swapExecutor: fakeSwapExecutor,
+    tokenGrantPreflight: grantAlreadyValid,
     settings: new InMemorySettingsRepository(),
     buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n })),
     buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n })),
@@ -217,6 +219,7 @@ describe('runExitCycle', () => {
       livePositionState,
       poolPrice: { getPriceState: vi.fn(async () => livePriceState(ENTRY_TICK)) },
       swapExecutor: fakeSwapExecutor,
+      tokenGrantPreflight: grantAlreadyValid,
       settings: new InMemorySettingsRepository(),
     });
 
@@ -253,6 +256,7 @@ describe('runExitCycle', () => {
         livePositionState,
         poolPrice: { getPriceState: vi.fn(async () => { throw new Error('RPC timeout'); }) },
         swapExecutor: fakeSwapExecutor,
+        tokenGrantPreflight: grantAlreadyValid,
         settings: new InMemorySettingsRepository(),
       });
 
@@ -292,6 +296,7 @@ describe('runExitCycle', () => {
         livePositionState,
         poolPrice,
         swapExecutor: fakeSwapExecutor,
+        tokenGrantPreflight: grantAlreadyValid,
         settings: new InMemorySettingsRepository(),
       });
 
@@ -325,6 +330,7 @@ describe('runExitCycle', () => {
         livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) }, // metrics read fine NOW -- outage resolved
         poolPrice: { getPriceState: vi.fn(async () => livePriceState(ENTRY_TICK)) },
         swapExecutor: fakeSwapExecutor,
+        tokenGrantPreflight: grantAlreadyValid,
         settings: new InMemorySettingsRepository(),
       });
 
@@ -375,6 +381,7 @@ describe('runExitCycle', () => {
         livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) },
         poolPrice: { getPriceState: vi.fn(async () => livePriceState(ENTRY_TICK)) },
         swapExecutor: fakeSwapExecutor,
+        tokenGrantPreflight: grantAlreadyValid,
         settings: new InMemorySettingsRepository(),
       };
 
@@ -421,6 +428,7 @@ describe('runExitCycle', () => {
         livePositionState: { getLiveState: vi.fn(async () => liveState(LIQUIDITY)) }, // metrics read fine NOW
         poolPrice: { getPriceState: vi.fn(async () => livePriceState(ENTRY_TICK)) },
         swapExecutor: fakeSwapExecutor,
+        tokenGrantPreflight: grantAlreadyValid,
         settings: new InMemorySettingsRepository(),
         readTokenBalance: vi.fn(async () => USDG(100)),
       });
@@ -468,6 +476,7 @@ describe('runExitCycle', () => {
         // -3000 -> pnlPct ~ -6.4%, in the un-armed Hard-Stop band (see P0-3) -- fires HARD_STOP_LOSS cleanly, same as before this constant needed adjusting.
         poolPrice: { getPriceState: vi.fn(async () => livePriceState(-3000)) }, // triggers HARD_STOP_LOSS immediately
         swapExecutor: fakeSwapExecutor,
+        tokenGrantPreflight: grantAlreadyValid,
         settings: new InMemorySettingsRepository(),
         buildRemoveLiquidityDeps,
       };

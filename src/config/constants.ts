@@ -609,6 +609,24 @@ export const EXITS = {
    * (QUOTE_UNAVAILABLE, PRICE_IMPACT_BLOCKED) are NOT affected -- their cause
    * can change on its own, so they keep retrying every tick.
    */
+  /// EXIT-ROUTER RESOLUTION (2026-09-20): the Permit2 grant an exit swap needs
+  /// so the APPROVED Universal Router can pull the position's TOKEN. Entirely
+  /// separate from the operator-only USDG -> PositionManager grant.
+  PERMIT2_TOKEN_GRANT: {
+    /// Short by design: this authority exists for one exit, not indefinitely.
+    /// A day comfortably covers a close lifecycle including retries and a
+    /// restart, and lapses on its own if the position is abandoned.
+    LIFETIME_SECONDS: 24 * 60 * 60,
+    /// Hard ceiling on any computed lifetime.
+    MAX_LIFETIME_SECONDS: 7 * 24 * 60 * 60,
+    /// A grant must outlast the swap it is created for; below this it is
+    /// treated as EXPIRED and re-approved rather than raced.
+    MIN_REMAINING_VALIDITY_SECONDS: 10 * 60,
+    /// Approve exactly what the swap pulls rather than uint160 max -- the same
+    /// "approve what's needed, nothing more" choice the ERC20 approve legs
+    /// already make. A fresh grant is cheap; a standing unlimited one is not.
+    APPROVE_EXACT_AMOUNT: true as boolean,
+  },
   DETERMINISTIC_BLOCK_BACKOFF: {
     /** [blocked-for-at-least-ms, retry-no-more-often-than-ms]; the last matching step wins. */
     LADDER_MS: [

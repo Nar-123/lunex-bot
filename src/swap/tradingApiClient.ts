@@ -34,6 +34,45 @@ const CLASSIC_ONLY_PROTOCOLS = ['V2', 'V3', 'V4'];
 const PERMIT2_DISABLED_HEADER = 'x-permit2-disabled';
 
 /**
+ * EXIT-ROUTER RESOLUTION (2026-09-20). This client no longer sends
+ * `x-permit2-disabled`.
+ *
+ * With that header, the Trading API targets a SwapProxy whose address it maps
+ * to the DEPRECATED proxy on chain 4663 (0x02E5..., reproducible across every
+ * documented header and body option -- see docs/exit-router-resolution.md).
+ * Lunex refuses that address, so every TOKEN exit leg was blocked.
+ *
+ * Without the header the API targets the APPROVED Universal Router directly --
+ * an address that is ALREADY on the allowlist, so nothing new is trusted. The
+ * router pulls the token through an on-chain Permit2 ALLOWANCE (created by
+ * `exits/permit2TokenGrant.ts`, an ordinary transaction), NOT through an
+ * EIP-712 signature: the observed calldata carries no PERMIT2_PERMIT command,
+ * and `universalRouterCalldata.ts` fails closed if one ever appears.
+ *
+ * `permitData` may now come back non-null. It is ADVISORY -- an offer of the
+ * signature route this project does not use. What governs is the calldata,
+ * which is decoded and checked command by command.
+ */
+const SEND_PERMIT2_DISABLED: boolean = false;
+
+/**
+ * PINS the Universal Router version -- and therefore the router ADDRESS -- the
+ * API targets. Documented header; the API accepts exactly [2.0, 2.1.1].
+ *
+ * Without it the API picks its own default, and that default is not stable:
+ * on 2026-09-20 it resolved to the approved 0x8876... (Universal Router 2.1.1);
+ * by 2026-09-21 it had moved to 0x204FAca1..., a DIFFERENT router build
+ * (different bytecode) that is not on the allowlist -- so every exit would have
+ * failed closed again. 2.1.1 is the version whose address IS allowlisted, so
+ * pinning it turns a moving default into a deterministic, audited target.
+ *
+ * The allowlist is still the authority: if Uniswap ever maps 2.1.1 to some
+ * other address, `validateSwapQuote` refuses it exactly as before.
+ */
+const UNIVERSAL_ROUTER_VERSION_HEADER = 'x-universal-router-version';
+const PINNED_UNIVERSAL_ROUTER_VERSION = '2.1.1';
+
+/**
  * Uniswap Trading API implementation of `SwapExecutor` -- exits/'s
  * TOKEN->USDG swap leg. Chosen over GMGN specifically because GMGN is
  * confirmed (via reference production code, per review) to only swap out
@@ -63,10 +102,11 @@ export class TradingApiSwapClient implements SwapExecutor {
   ) {}
 
   private headers(): Record<string, string> {
-    const headers: Record<string, string> = {
-      'content-type': 'application/json',
-      [PERMIT2_DISABLED_HEADER]: 'true',
-    };
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    // Kept as an explicit, named constant rather than a deleted line, so the
+    // decision is visible at the call site instead of being invisible history.
+    if (SEND_PERMIT2_DISABLED) headers[PERMIT2_DISABLED_HEADER] = 'true';
+    headers[UNIVERSAL_ROUTER_VERSION_HEADER] = PINNED_UNIVERSAL_ROUTER_VERSION;
     // API key travels via header, never a query param/URL -- matches this
     // project's existing secrets-via-header-not-argv discipline (see
     // discovery/gmgnCliClient.ts's childEnv()).
@@ -160,6 +200,12 @@ export class TradingApiSwapClient implements SwapExecutor {
       targets: config.uniswapTradingApi.executionTargets,
       tokenIn,
       identityGate: getExecutionTargetVerification(),
+      // CASE A (direct Universal Router) additionally checks that the output
+      // goes to THIS wallet and that the router deadline has not already
+      // passed. The wallet is the configured executor -- never a value taken
+      // from the API response.
+      recipient: this.walletAddress,
+      now: Math.floor(Date.now() / 1000),
     });
   }
 }

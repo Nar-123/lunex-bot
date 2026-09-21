@@ -1,10 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Address } from 'viem';
 import { TradingApiSwapClient } from '../../src/swap/tradingApiClient';
-import { TradingApiUnsupportedRoutingError, TradingApiPermitRequiredError } from '../../src/swap/tradingApiMapper';
+import { TradingApiUnsupportedRoutingError } from '../../src/swap/tradingApiMapper';
+import { urExecuteCalldata } from './urCalldataFixture';
 
 const TOKEN = '0x0000000000000000000000000000000000000002' as Address;
 const WALLET = '0x9999999999999999999999999999999999999999' as Address;
+/** A real Universal Router command batch selling 500 of TOKEN to WALLET -- what the Permit2-enabled API returns. */
+const UR_DATA = urExecuteCalldata({ recipient: WALLET, tokenIn: TOKEN, amountIn: 500n });
 
 function jsonResponse(body: unknown, ok = true): Response {
   return {
@@ -24,7 +27,7 @@ function classicQuoteBody({ routing = 'CLASSIC', quotePatch = {} }: { routing?: 
 }
 
 describe('TradingApiSwapClient.getQuote', () => {
-  it('sends `protocols` restricted to classic AMM routing, and the permit2-disable header, on the quote request', async () => {
+  it('sends `protocols` restricted to classic AMM routing, and does NOT send x-permit2-disabled (exit-router resolution)', async () => {
     const fetchFn = vi.fn(async () => jsonResponse(classicQuoteBody()));
     const client = new TradingApiSwapClient('https://api.test', '', WALLET, fetchFn);
 
@@ -37,7 +40,10 @@ describe('TradingApiSwapClient.getQuote', () => {
     expect(body.protocols).toEqual(['V2', 'V3', 'V4']);
     expect(body.protocols).not.toContain('DUTCH_V2');
     const headers = init.headers as Record<string, string>;
-    expect(headers['x-permit2-disabled']).toBe('true');
+    expect(headers['x-permit2-disabled']).toBeUndefined();
+    expect(Object.keys(headers).map((h) => h.toLowerCase())).not.toContain('x-permit2-disabled');
+    // the router version is PINNED -- the API default moved to an unallowlisted router overnight
+    expect(headers['x-universal-router-version']).toBe('2.1.1');
   });
 
   it('sends the API key as a header, never in the URL or body', async () => {
@@ -79,11 +85,12 @@ describe('TradingApiSwapClient.getQuote', () => {
     await expect(client.getQuote(TOKEN, 500n, 100)).rejects.toThrow(/unrecognized routing type/);
   });
 
-  it('rejects with TradingApiPermitRequiredError when the response still carries permitData despite the opt-out header', async () => {
+  it('a quote carrying permitData is accepted and flagged -- permitData is advisory, the calldata is what is enforced', async () => {
     const fetchFn = vi.fn(async () => jsonResponse(classicQuoteBody({ quotePatch: { permitData: { some: 'payload' } } })));
     const client = new TradingApiSwapClient('https://api.test', '', WALLET, fetchFn);
 
-    await expect(client.getQuote(TOKEN, 500n, 100)).rejects.toThrow(TradingApiPermitRequiredError);
+    const q = await client.getQuote(TOKEN, 500n, 100);
+    expect(q.permitDataPresent).toBe(true);
   });
 
   it('C5: priceImpact is parsed as a real NUMBER (the confirmed API type), not a string', async () => {
@@ -170,10 +177,29 @@ describe('TradingApiSwapClient.checkApproval', () => {
   });
 });
 
+describe('router version pinning (exit-router resolution, 2026-09-21)', () => {
+  it('every Trading API call pins x-universal-router-version=2.1.1 -- quote, check_approval and swap', async () => {
+    const fetchFn = vi.fn(async (url: string) =>
+      url.endsWith('/v1/quote') ? jsonResponse(classicQuoteBody())
+        : url.endsWith('/check_approval') ? jsonResponse({ approval: null })
+        : jsonResponse({ swap: { to: '0x1111111111111111111111111111111111111111', data: UR_DATA, value: '0', chainId: 4663 } }));
+    const client = new TradingApiSwapClient('https://api.test', '', WALLET, fetchFn as never);
+    const q = await client.getQuote(TOKEN, 500n, 100);
+    await client.checkApproval(TOKEN, 500n);
+    await client.buildSwapTx(TOKEN, q);
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+    for (const call of fetchFn.mock.calls) {
+      const headers = (call as unknown as [string, RequestInit])[1].headers as Record<string, string>;
+      expect(headers['x-universal-router-version']).toBe('2.1.1');
+      expect(headers['x-permit2-disabled']).toBeUndefined();
+    }
+  });
+});
+
 describe('TradingApiSwapClient.buildSwapTx', () => {
   it('C5: sends the whole prior quote object under `quote`, never re-derived scalar fields', async () => {
     const fetchFn = vi.fn(async () =>
-      jsonResponse({ swap: { to: '0x1111111111111111111111111111111111111111', data: '0xaabbccdd', value: '0', chainId: 4663 } }),
+      jsonResponse({ swap: { to: '0x1111111111111111111111111111111111111111', data: UR_DATA, value: '0', chainId: 4663 } }),
     );
     const client = new TradingApiSwapClient('https://api.test', '', WALLET, fetchFn);
     const providerQuote = { chainId: 4663, input: { amount: '500' }, output: { amount: '490' } };
@@ -189,12 +215,12 @@ describe('TradingApiSwapClient.buildSwapTx', () => {
 
   it('returns validated calldata built for the exact requested amount', async () => {
     const fetchFn = vi.fn(async () =>
-      jsonResponse({ swap: { to: '0x1111111111111111111111111111111111111111', data: '0xaabbccdd', value: '0', chainId: 4663 } }),
+      jsonResponse({ swap: { to: '0x1111111111111111111111111111111111111111', data: UR_DATA, value: '0', chainId: 4663 } }),
     );
     const client = new TradingApiSwapClient('https://api.test', '', WALLET, fetchFn);
     const quote = { amountInRaw: 500n, expectedAmountOutRaw: 490n, minOutputAmountRaw: 0n, priceImpactPct: 0.001, providerQuote: { fake: true }, slippageBps: 100 };
 
     const tx = await client.buildSwapTx(TOKEN, quote);
-    expect(tx).toEqual({ to: '0x1111111111111111111111111111111111111111', data: '0xaabbccdd', value: 0n });
+    expect(tx).toEqual({ to: '0x1111111111111111111111111111111111111111', data: UR_DATA, value: 0n });
   });
 });

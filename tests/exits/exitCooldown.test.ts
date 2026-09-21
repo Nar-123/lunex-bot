@@ -9,6 +9,7 @@ import { InMemoryPositionRepository } from '../positions/inMemoryPositionReposit
 import { InMemoryExitStateRepository } from './inMemoryExitStateRepository';
 import { InMemoryTransactionAttemptRepository } from '../execution/inMemoryTransactionAttemptRepository';
 import { makeCreateInput } from '../positions/fixtures';
+import { grantAlreadyValid } from '../exits/tokenGrantTestStub';
 
 // Cooldown crash-gap fix: the cooldown is recorded by markClosed itself (the
 // real repository does it in the same DB transaction -- see
@@ -65,6 +66,7 @@ async function setup(reason: 'HARD_STOP_LOSS' | 'SAFETY_EXIT' | 'OOR_TIMEOUT' = 
     livePositionState: { getLiveState: vi.fn() },
     poolPrice: { getPriceState: vi.fn() },
     swapExecutor: executor(quote()),
+    tokenGrantPreflight: grantAlreadyValid,
     readTokenBalance: vi.fn(async () => USDG(3)),
     readAllowance: vi.fn(async () => 0n),
     walletAddress: WALLET,

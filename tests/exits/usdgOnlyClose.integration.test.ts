@@ -14,6 +14,7 @@ import type { TxSafetyDeps } from '../../src/execution/types';
 import type { RemoveLiquidityVerifyData } from '../../src/exits/removeLiquidityTx';
 import type { SwapExecutor } from '../../src/swap/types';
 import { makeCreateInput } from '../positions/fixtures';
+import { grantAlreadyValid } from '../exits/tokenGrantTestStub';
 
 // H1 end-to-end against a REAL migrated SQLite DB and the REAL repositories:
 // proves the new `tokenProceedsRaw: 0n` survives the TransactionAttempt
@@ -91,6 +92,7 @@ describe('H1 (real SQLite DB): USDG-only close -- crash-resume, capital release,
         livePositionState: { getLiveState: vi.fn() },
         poolPrice: { getPriceState: vi.fn() },
         swapExecutor: neverSwap,
+        tokenGrantPreflight: grantAlreadyValid,
         buildRemoveLiquidityDeps: vi.fn(() => removeDeps),
         buildSwapDeps: vi.fn(() => { throw new Error('must never build a swap'); }),
         readTokenBalance: vi.fn(async () => 0n),

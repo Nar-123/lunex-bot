@@ -17,6 +17,7 @@ import type { TxRequest, TxSafetyDeps } from '../../src/execution/types';
 import type { SwapExecutor, SwapQuote } from '../../src/swap/types';
 import { DuplicateActiveTokenPositionError } from '../../src/positions/types';
 import { makeCreateInput } from '../positions/fixtures';
+import { grantAlreadyValid } from './tokenGrantTestStub';
 
 // Unroutable TOKEN leg against the REAL migrated SQLite schema: the block is
 // durable across a restart, the operator classification is rebuilt from
@@ -101,6 +102,7 @@ async function blockedClosingPosition() {
     livePositionState: { getLiveState: vi.fn() },
     poolPrice: { getPriceState: vi.fn() },
     swapExecutor,
+    tokenGrantPreflight: grantAlreadyValid,
     buildRemoveLiquidityDeps: vi.fn(() => removeDeps),
     buildSwapDeps: vi.fn(() => swapDeps),
     readTokenBalance: vi.fn(async () => RESIDUAL),

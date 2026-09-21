@@ -10,6 +10,7 @@ import { makeCreateInput } from '../positions/fixtures';
 import { decodeBlockReason, encodeBlockReason } from '../../src/exits/swapLegBackoff';
 import { config } from '../../src/config';
 import { LEGACY_PROXY } from '../swap/executionTargetFixtures';
+import { grantAlreadyValid } from '../exits/tokenGrantTestStub';
 
 const TX: TxRequest = { to: '0x1111111111111111111111111111111111111111', data: '0xabcdef', value: 0n };
 const WALLET = '0x9999999999999999999999999999999999999999' as Address;
@@ -78,6 +79,7 @@ function deps(over: Partial<ExecuteExitDeps>, ctx: Awaited<ReturnType<typeof stu
     livePositionState: { getLiveState: vi.fn() },
     poolPrice: { getPriceState: vi.fn() },
     swapExecutor: swapExecutor(null, false),
+    tokenGrantPreflight: grantAlreadyValid,
     readTokenBalance: vi.fn(async () => USDG(500)),
     readAllowance: vi.fn(async () => 0n),
     walletAddress: WALLET,

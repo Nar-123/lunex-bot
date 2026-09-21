@@ -12,6 +12,7 @@ import { decideCapitalAllocation } from '../../src/capital/decideCapitalAllocati
 import type { SwapExecutor, SwapQuote } from '../../src/swap/types';
 import type { Address } from 'viem';
 import { config } from '../../src/config';
+import { grantAlreadyValid } from '../exits/tokenGrantTestStub';
 
 const TX: TxRequest = { to: '0x1111111111111111111111111111111111111111', data: '0xabcdef', value: 0n };
 const WALLET = '0x9999999999999999999999999999999999999999' as Address;
@@ -97,6 +98,7 @@ function baseDeps(overrides: Partial<ExecuteExitDeps> = {}): Omit<ExecuteExitDep
     livePositionState: { getLiveState: vi.fn() },
     poolPrice: { getPriceState: vi.fn() },
     swapExecutor: makeSwapExecutor(),
+    tokenGrantPreflight: grantAlreadyValid,
     readTokenBalance: vi.fn(async () => USDG(500)),
     readAllowance: vi.fn(async () => 0n),
     walletAddress: WALLET,
@@ -636,6 +638,7 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
           buildSwapDeps: successfulSwapDeps(),
           buildApproveDeps,
           swapExecutor: makeSwapExecutor(makeQuote(), { needsApproval: false, spender: null }),
+          tokenGrantPreflight: grantAlreadyValid,
         }),
       });
 
@@ -660,6 +663,7 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
           buildSwapDeps: successfulSwapDeps(),
           buildApproveDeps,
           swapExecutor: makeSwapExecutor(makeQuote({ amountInRaw: USDG(500) }), { needsApproval: true, spender: SPENDER }),
+          tokenGrantPreflight: grantAlreadyValid,
           readAllowance: vi.fn(async () => USDG(1000)), // already plenty
           readTokenBalance: vi.fn(async () => USDG(500)),
         }),
@@ -686,6 +690,7 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
           buildSwapDeps: successfulSwapDeps(),
           buildApproveDeps,
           swapExecutor: makeSwapExecutor(makeQuote({ amountInRaw: USDG(500) }), { needsApproval: true, spender: SPENDER }),
+          tokenGrantPreflight: grantAlreadyValid,
           readAllowance: vi.fn(async () => 0n),
           readTokenBalance: vi.fn(async () => USDG(500)),
         }),
@@ -714,6 +719,7 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
           buildSwapDeps,
           buildApproveDeps,
           swapExecutor: makeSwapExecutor(makeQuote({ amountInRaw: USDG(500) }), { needsApproval: true, spender: SPENDER }),
+          tokenGrantPreflight: grantAlreadyValid,
           readAllowance: vi.fn(async () => 0n),
           readTokenBalance: vi.fn(async () => USDG(500)),
         }),
@@ -745,6 +751,7 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
           buildSwapDeps: successfulSwapDeps(),
           buildApproveDeps: ambiguousApprove,
           swapExecutor: makeSwapExecutor(makeQuote({ amountInRaw: USDG(500) }), { needsApproval: true, spender: SPENDER }),
+          tokenGrantPreflight: grantAlreadyValid,
           readAllowance: vi.fn(async () => 0n),
           readTokenBalance: vi.fn(async () => USDG(500)),
         }),
@@ -1573,6 +1580,7 @@ describe('H1 follow-up: TOKEN left over after remove-liquidity (e.g. residual TO
         buildRemoveLiquidityDeps: removePaying(USDG(500), DUST),
         readTokenBalance: vi.fn(async () => DUST),
         swapExecutor: rejectingSwapExecutor('Trading API /v1/quote failed: HTTP 400 {"errorCode":"VALIDATION_ERROR","detail":"amount too small"}'),
+        tokenGrantPreflight: grantAlreadyValid,
         buildSwapDeps: neverBuildSwap(),
         warnLog,
       }),
@@ -1594,6 +1602,7 @@ describe('H1 follow-up: TOKEN left over after remove-liquidity (e.g. residual TO
         buildRemoveLiquidityDeps: removePaying(USDG(500), DUST),
         readTokenBalance: vi.fn(async () => DUST),
         swapExecutor: rejectingSwapExecutor('Trading API /v1/quote failed: HTTP 404 {"errorCode":"ResourceNotFound","detail":"No quotes available"}'),
+        tokenGrantPreflight: grantAlreadyValid,
         buildSwapDeps: neverBuildSwap(),
         warnLog,
       }),
@@ -1611,6 +1620,7 @@ describe('H1 follow-up: TOKEN left over after remove-liquidity (e.g. residual TO
         buildRemoveLiquidityDeps: removePaying(USDG(500), DUST),
         readTokenBalance: vi.fn(async () => DUST),
         swapExecutor: makeSwapExecutor(makeQuote({ amountInRaw: DUST, priceImpactPct: null })),
+        tokenGrantPreflight: grantAlreadyValid,
         buildSwapDeps: neverBuildSwap(),
         warnLog,
       }),
@@ -1641,6 +1651,7 @@ describe('H1 follow-up: TOKEN left over after remove-liquidity (e.g. residual TO
         buildRemoveLiquidityDeps: removeDeps,
         readTokenBalance: vi.fn(async () => DUST),
         swapExecutor: makeSwapExecutor(makeQuote({ amountInRaw: DUST })),
+        tokenGrantPreflight: grantAlreadyValid,
         buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: swapPays, usdgProceedsRaw: swapPays })),
       }),
     });
@@ -1668,6 +1679,7 @@ describe('H1 follow-up: TOKEN left over after remove-liquidity (e.g. residual TO
         buildRemoveLiquidityDeps: removePaying(USDG(200), USDG(3)),
         readTokenBalance: vi.fn(async () => USDG(3)),
         swapExecutor: rejectingSwapExecutor('HTTP 503 upstream unavailable'),
+        tokenGrantPreflight: grantAlreadyValid,
         buildSwapDeps: neverBuildSwap(),
         warnLog: vi.fn(),
       }),
@@ -1831,6 +1843,7 @@ describe('H2: capital accounting across the REAL exit lifecycle (executeExit + P
         buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(300), tokenProceedsRaw: USDG(3) }, { getReceiptIfAvailable: vi.fn(async () => ({ status: 'success' as const, blockNumber: 9n })) })),
         readTokenBalance: vi.fn(async () => USDG(3)),
         swapExecutor: quoteFails(),
+        tokenGrantPreflight: grantAlreadyValid,
         warnLog: vi.fn(),
       }),
     });

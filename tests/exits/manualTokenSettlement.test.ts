@@ -20,6 +20,7 @@ import { InMemoryTransactionAttemptRepository } from '../execution/inMemoryTrans
 import { makeCreateInput } from '../positions/fixtures';
 import { buildTestApp, authHeader } from '../api/testApp';
 import { REMOVE_HASH, SETTLE_HASH, approvalLog, chainWithSettlement, fakeChain, nftTransferLog, swapLogs, transferLog, withdrawalLog } from './settlementFixtures';
+import { grantAlreadyValid } from '../exits/tokenGrantTestStub';
 
 // Manual TOKEN settlement via receipt: an operator-supplied transaction
 // settles a CLOSING position's receipt-proven residual TOKEN ONLY when its
@@ -73,6 +74,7 @@ async function stuckPosition(o: { token?: Address; removeData?: object } = {}) {
     livePositionState: { getLiveState: vi.fn() },
     poolPrice: { getPriceState: vi.fn() },
     swapExecutor: noQuote(),
+    tokenGrantPreflight: grantAlreadyValid,
     buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps((o.removeData ?? { liquidityZero: true as const, usdgProceedsRaw: U(200), tokenProceedsRaw: RESIDUAL }) as RemoveLiquidityVerifyData)),
     readTokenBalance: vi.fn(async () => RESIDUAL),
     walletAddress: WALLET,

@@ -1,4 +1,5 @@
 import { config } from '../config';
+import { simulateExitSwap } from '../exits/permit2GrantTx';
 import { runExitCycle } from '../exits/runExitCycle';
 import type { ExitCycleResult } from '../exits/runExitCycle';
 import { resumeOpenPosition } from '../positions/openPosition';
@@ -63,6 +64,12 @@ export async function runExitAndOpenResumeCycle(deps: AppDeps): Promise<ExitCycl
     readAllowance: deps.readAllowance,
     readTokenBalance: deps.readTokenBalanceForExit,
     walletAddress: deps.walletAddress,
+    // EXIT-ROUTER RESOLUTION: the strict pre-send simulation gate is wired ON
+    // here, in production composition. `executeExit` treats it as optional so
+    // the state machine stays testable without a chain; a test asserts this
+    // wiring exists so the gate cannot be silently lost.
+    tokenGrantPreflight: deps.tokenGrantPreflight,
+    simulateSwap: deps.simulateSwap ?? ((tx, from) => simulateExitSwap(tx, from)),
     warnLog: (event, data) => { deps.logger.warn(event, data); },
   });
 

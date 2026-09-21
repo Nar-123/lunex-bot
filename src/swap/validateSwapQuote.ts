@@ -2,6 +2,7 @@ import type { Address } from 'viem';
 import type { TxRequest } from '../execution/types';
 import { classifyExecutionTarget, decodeSwapProxyExecute, isApprovedUniversalRouter, type ExecutionTargetMatch, type ExecutionTargetPolicy } from './executionTargets';
 import type { ExecutionTargetVerificationState } from './executionTargetGate';
+import { assertUniversalRouterCallSafe, UniversalRouterCalldataError } from './universalRouterCalldata';
 
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const HEX_DATA_RE = /^0x[0-9a-fA-F]*$/;
@@ -87,6 +88,13 @@ export interface SwapQuoteExpectation {
   tokenIn: string;
   /** Startup identity-assertion state; `FAILED` blocks every swap (see `executionTargetGate.ts`). */
   identityGate?: ExecutionTargetVerificationState;
+  /**
+   * EXIT-ROUTER RESOLUTION: the wallet that must receive the swap output, and
+   * the clock used only to reject an already-expired router deadline. Required
+   * for CASE A (direct Universal Router), which is now the production path.
+   */
+  recipient?: string;
+  now?: number;
 }
 
 export function validateSwapQuote(candidate: RawSwapTxCandidate, expected: SwapQuoteExpectation): TxRequest {
@@ -119,7 +127,33 @@ export function validateSwapQuote(candidate: RawSwapTxCandidate, expected: SwapQ
     );
   }
 
-  // Layer 2 -- when the target is a SwapProxy, the router it will call must be approved too.
+  // Layer 2a -- CASE A: a direct call to an approved Universal Router. The
+  // calldata is a command batch, so the batch itself is the thing that has to
+  // be safe: no command requiring a signature this project cannot produce, no
+  // command it has never reasoned about, and swap parameters that match the
+  // quote this call was built for.
+  if (match.kind === 'UNIVERSAL_ROUTER') {
+    if (expected.recipient === undefined || expected.now === undefined) {
+      throw new SwapQuoteValidationError(
+        'direct Universal Router calldata cannot be validated without the expected recipient and current time -- refusing to sign an unchecked command batch (fail closed)',
+      );
+    }
+    try {
+      assertUniversalRouterCallSafe(candidate.data, {
+        tokenIn: expected.tokenIn,
+        amountInRaw: expected.amountInRaw,
+        minOutputAmountRaw: candidate.minOutputAmountRaw,
+        minReceivedRequired: expected.minReceivedRequired,
+        recipient: expected.recipient,
+        now: expected.now,
+      });
+    } catch (err) {
+      if (err instanceof UniversalRouterCalldataError) throw new SwapQuoteValidationError(err.message);
+      throw err;
+    }
+  }
+
+  // Layer 2b -- when the target is a SwapProxy, the router it will call must be approved too.
   if (match.kind === 'SWAP_PROXY') {
     let decoded;
     try {

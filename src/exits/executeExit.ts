@@ -2,8 +2,8 @@ import type { Address } from 'viem';
 import { config } from '../config';
 import { readErc20Allowance, readErc20Balance, readErc20TransfersTo } from '../blockchain/erc20';
 import { getExecutorAddress } from '../blockchain/walletClient';
-import { executeCriticalTransaction } from '../execution/executeCriticalTransaction';
-import type { ExecutionResult, TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
+import { executeCriticalTransaction, safeErrorMessage } from '../execution/executeCriticalTransaction';
+import type { ExecutionResult, TransactionAttemptRepository, TxRequest, TxSafetyDeps } from '../execution/types';
 import type { PositionRecord, PositionRepository } from '../positions/types';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring/types';
 import type { SwapExecutor, SwapQuote } from '../swap/types';
@@ -12,6 +12,8 @@ import { buildRemoveLiquidityDeps as realBuildRemoveLiquidityDeps, type RemoveLi
 import { buildSwapDeps as realBuildSwapDeps, defaultLogImpact, shouldBlockForPriceImpact, type SwapVerifyData } from './swapTx';
 import { buildApproveDeps as realBuildApproveDeps, needsApproval, type ApproveVerifyData } from './approveTx';
 import { classifyApprovalSpender } from '../swap/executionTargets';
+import { runTokenGrantPreflight, buildTokenGrantDeps, type TokenGrantVerifyData } from './permit2GrantTx';
+import { tokenGrantIdempotencyKey, type TokenGrantAssessment } from './permit2TokenGrant';
 import { decodeBlockReason, evaluateSuppression, fingerprintDeterministicFailure, isDeterministicBlockReason, recordDeterministicBlock } from './swapLegBackoff';
 
 /**
@@ -144,6 +146,18 @@ export interface ExecuteExitDeps {
     options: { swapAttemptCount: number },
   ) => TxSafetyDeps<SwapVerifyData>;
   buildApproveDeps?: (tokenAddress: Address, spender: Address, amountInRaw: bigint) => TxSafetyDeps<ApproveVerifyData>;
+  /**
+   * EXIT-ROUTER RESOLUTION: the Permit2 grant leg that lets the APPROVED
+   * Universal Router pull this position's TOKEN. Injectable so the state
+   * machine stays testable without a chain.
+   */
+  tokenGrantPreflight?: (token: Address, requiredAmount: bigint) => Promise<TokenGrantAssessment>;
+  buildTokenGrantDeps?: (
+    approval: NonNullable<TokenGrantAssessment['approval']>,
+    requiredAmount: bigint,
+  ) => TxSafetyDeps<TokenGrantVerifyData>;
+  /** Strict pre-send simulation. Returning `ok: false` blocks the swap before anything is signed. */
+  simulateSwap?: (tx: TxRequest, from: Address) => Promise<{ ok: true } | { ok: false; reason: string }>;
   /** Injectable for tests -- defaults to the real on-chain ERC20 reads. */
   readTokenBalance?: (tokenAddress: Address, wallet: Address) => Promise<bigint>;
   readAllowance?: (tokenAddress: Address, owner: Address, spender: Address) => Promise<bigint>;
@@ -577,7 +591,78 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
     }
   }
 
+  // ---- Permit2 token grant (exit-router resolution, 2026-09-20)
+  //
+  // The Permit2-enabled Trading API flow targets the APPROVED Universal Router
+  // directly, and that router pulls the TOKEN through an on-chain Permit2
+  // allowance. Create it here, BEFORE the swap leg, as an ordinary critical
+  // transaction -- never as a side effect of the swap, and never for USDG or
+  // the PositionManager (that authority belongs to the operator-only path).
+  //
+  // Ordering is strict: preflight -> approve if needed -> VERIFIED -> swap.
+  // An approval that does not reach VERIFIED never lets a swap be built.
+  {
+    const preflight = deps.tokenGrantPreflight ?? ((t: Address, amt: bigint) => runTokenGrantPreflight(t, amt));
+    let grant: TokenGrantAssessment;
+    try {
+      grant = await preflight(position.tokenAddress, amountInRaw);
+    } catch (err) {
+      // A read failure is never "no grant" -- defer, do not guess.
+      return { outcome: 'PENDING', reason: `Permit2 token-grant pre-flight could not be read: ${safeErrorMessage(err)}` };
+    }
+
+    if (grant.status !== 'VALID' && !grant.needsApproval) {
+      // WRONG_OWNER / WRONG_TOKEN / WRONG_SPENDER / UNAVAILABLE -- a
+      // configuration fact, not a market condition. Block deterministically
+      // rather than re-asking every tick.
+      await noteDeterministicBlock('APPROVAL_SPENDER_NOT_APPROVED', `[PERMIT2_GRANT_${grant.status}] ${grant.reason}`, {});
+      return { outcome: 'PENDING', reason: `exit swap blocked: [PERMIT2_GRANT_${grant.status}] ${grant.reason}` };
+    }
+
+    if (grant.needsApproval && grant.approval !== null) {
+      const approval = grant.approval;
+      const grantKey = tokenGrantIdempotencyKey(
+        position.closeIdempotencyKey,
+        config.chain.chainId,
+        approval.token,
+        approval.spender,
+        // the grant being REPLACED -- stable until this approval lands (see tokenGrantIdempotencyKey)
+        grant.current.expiration,
+      );
+      const grantDeps = (deps.buildTokenGrantDeps ?? ((a: typeof approval, amt: bigint) => buildTokenGrantDeps(a, amt)))(approval, amountInRaw);
+      const grantResult = await executeCriticalTransaction(grantKey, 'exit:permit2Grant', grantDeps, deps.txAttempts);
+      if (!grantResult.ok) {
+        // The swap is NOT built. A definitive failure bumps the attempt so the
+        // ladder advances; an ambiguous one stays resumable and is recovered by
+        // receipt on a later tick -- never re-signed here.
+        if (!grantResult.resumable) {
+          await deps.exitStates.incrementSwapAttemptFrom(position.id, exitState.swapAttemptCount);
+          return { outcome: 'SWAP_FAILED_RETRY_PENDING', reason: `Permit2 token grant failed: ${grantResult.reason}` };
+        }
+        return { outcome: 'PENDING', reason: `Permit2 token grant pending: ${grantResult.reason}` };
+      }
+    }
+  }
+
   const swapDeps = buildSwapDeps(position.id, position.tokenAddress, quote, deps.swapExecutor, deps.exitStates, { swapAttemptCount: exitState.swapAttemptCount });
+
+  // ---- strict simulation gate: the exact calldata is eth_call'd before any
+  // signing decision. A revert blocks the swap instead of paying gas to learn.
+  if (deps.simulateSwap) {
+    let candidate: TxRequest;
+    try {
+      candidate = await swapDeps.buildTransaction();
+    } catch (err) {
+      const reason = safeErrorMessage(err);
+      if (isSwapTargetValidationFailure(reason)) await noteDeterministicBlock('TARGET_NOT_APPROVED', reason, {});
+      return { outcome: 'PENDING', reason: `exit swap could not be built: ${reason}` };
+    }
+    const sim = await deps.simulateSwap(candidate, wallet);
+    if (!sim.ok) {
+      return { outcome: 'PENDING', reason: `exit swap simulation failed, not signing: ${sim.reason}` };
+    }
+  }
+
   const swapResult = await executeCriticalTransaction(swapKey, 'exit:swap', swapDeps, deps.txAttempts);
   if (!swapResult.ok && isSwapTargetValidationFailure(swapResult.reason)) {
     // The provider's calldata failed the two-layer execution-target check. The

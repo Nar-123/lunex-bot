@@ -13,6 +13,7 @@ import { PositionCapitalSnapshotProvider } from '../../src/positions/capitalSnap
 import { InMemoryCanaryGuard } from '../../src/capital/canary';
 import { createInMemoryLogger } from '../../src/composition/logger';
 import { validPermit2Preflight } from '../positions/permit2Fixtures';
+import { grantAlreadyValid } from '../exits/tokenGrantTestStub';
 
 export const WALLET = '0x9999999999999999999999999999999999999999' as Address;
 export const USDG = (n: number): bigint => BigInt(n) * 10n ** 18n;
@@ -138,6 +139,10 @@ export function createFakeAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
       recentSamples: vi.fn(async () => []),
       pruneOlderThan: vi.fn(async () => undefined),
     },
+    tokenGrantPreflight: grantAlreadyValid,
+    // the real gate is an eth_call; composition tests have no chain, so the gate passes here
+    // and is exercised for real in tests/exits/exitPermit2Flow.test.ts
+    simulateSwap: () => Promise.resolve({ ok: true as const }),
     swapExecutor: {
       getQuote: vi.fn(async () => ({ amountInRaw: USDG(1), expectedAmountOutRaw: USDG(1), minOutputAmountRaw: 0n, priceImpactPct: 0.001, slippageBps: 100, providerQuote: { fake: true } })),
       checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })),

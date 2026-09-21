@@ -1,20 +1,29 @@
 import { describe, expect, it } from 'vitest';
+import type { Address } from 'viem';
 import { validateSwapQuote, SwapQuoteValidationError } from '../../src/swap/validateSwapQuote';
 import type { RawSwapTxCandidate } from '../../src/swap/validateSwapQuote';
+import { urExecuteCalldata } from './urCalldataFixture';
 
 const ALLOWED_ROUTER = '0x1111111111111111111111111111111111111111';
+const TOKEN_IN = '0x7777777777777777777777777777777777777777';
+const RECIPIENT = '0x9999999999999999999999999999999999999999' as Address;
+const NOW = Math.floor(Date.now() / 1000);
 
+/**
+ * EXIT-ROUTER RESOLUTION: a direct Universal Router target now carries a real
+ * command batch that is decoded and checked, so the fixture is real calldata
+ * rather than a placeholder -- the test exercises the production decoder.
+ */
 const VALID: RawSwapTxCandidate = {
   to: ALLOWED_ROUTER,
-  data: '0xabcdef12',
+  data: urExecuteCalldata({ recipient: RECIPIENT, tokenIn: TOKEN_IN as Address, amountIn: 500n }),
   value: '0',
   chainId: 4663,
   echoedAmountInRaw: 500n,
   minOutputAmountRaw: 0n,
 };
-const TOKEN_IN = '0x7777777777777777777777777777777777777777';
 const POLICY = { chainId: 4663, universalRouters: [ALLOWED_ROUTER], swapProxies: [] as string[] };
-const EXPECTED = { amountInRaw: 500n, chainId: 4663, minReceivedRequired: false, targets: POLICY, tokenIn: TOKEN_IN };
+const EXPECTED = { amountInRaw: 500n, chainId: 4663, minReceivedRequired: false, targets: POLICY, tokenIn: TOKEN_IN, recipient: RECIPIENT, now: NOW };
 
 describe('validateSwapQuote -- structural validation before trusting external swap calldata', () => {
   it('accepts a well-formed candidate targeting the configured allowed router, and returns a clean TxRequest', () => {
@@ -35,15 +44,25 @@ describe('validateSwapQuote -- structural validation before trusting external sw
   });
 
   it('rejects malformed "data" (not hex)', () => {
-    expect(() => validateSwapQuote({ ...VALID, data: '0xzz' }, EXPECTED)).toThrow(/not well-formed calldata/);
+    expect(() => validateSwapQuote({ ...VALID, data: '0xzz' }, EXPECTED)).toThrow(SwapQuoteValidationError);
   });
 
   it('rejects "data" shorter than a 4-byte function selector', () => {
     expect(() => validateSwapQuote({ ...VALID, data: '0xab' }, EXPECTED)).toThrow(SwapQuoteValidationError);
   });
 
-  it('accepts "data" at exactly the minimum length (4-byte selector, no args)', () => {
-    expect(() => validateSwapQuote({ ...VALID, data: '0xaabbccdd' }, EXPECTED)).not.toThrow();
+  it('EXIT-ROUTER RESOLUTION: a bare 4-byte selector at a Universal Router is now REJECTED -- a direct router call must be a real, decodable command batch', () => {
+    expect(() => validateSwapQuote({ ...VALID, data: '0xabcdef12' }, EXPECTED)).toThrow(/universal router calldata selector/);
+  });
+
+  it('the minimum-length rule still guards a SwapProxy target, where calldata is not a router command batch', () => {
+    const proxyPolicy = { chainId: 4663, universalRouters: [ALLOWED_ROUTER], swapProxies: ['0x2222222222222222222222222222222222222222'] };
+    expect(() =>
+      validateSwapQuote(
+        { ...VALID, to: '0x2222222222222222222222222222222222222222', data: '0x1234' },
+        { ...EXPECTED, targets: proxyPolicy },
+      ),
+    ).toThrow(SwapQuoteValidationError);
   });
 
   it('rejects an amount-in mismatch -- the API/pipeline built calldata for a different amount than requested', () => {

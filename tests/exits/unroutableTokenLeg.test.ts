@@ -16,6 +16,7 @@ import { InMemoryExitStateRepository } from './inMemoryExitStateRepository';
 import { InMemoryTransactionAttemptRepository } from '../execution/inMemoryTransactionAttemptRepository';
 import { makeCreateInput } from '../positions/fixtures';
 import { buildTestApp, authHeader } from '../api/testApp';
+import { grantAlreadyValid } from './tokenGrantTestStub';
 
 // Unroutable TOKEN leg: a CLOSING position whose remove-liquidity receipt
 // proved TOKEN > 0, but whose TOKEN->USDG swap cannot currently be quoted or
@@ -71,6 +72,7 @@ async function setup() {
     livePositionState: { getLiveState: vi.fn() },
     poolPrice: { getPriceState: vi.fn() },
     swapExecutor,
+    tokenGrantPreflight: grantAlreadyValid,
     buildRemoveLiquidityDeps: vi.fn(() => removeDeps),
     buildSwapDeps: vi.fn(() => swapDeps),
     readTokenBalance: vi.fn(async () => RESIDUAL),
