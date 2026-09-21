@@ -110,7 +110,7 @@ describe('7-11. swap parameters must match the position and the quote', () => {
 
   it('9. an amount mismatch inside the calldata is rejected, even when the API echo matches', () => {
     const data = urExecuteCalldata({ recipient: WALLET, tokenIn: TOKEN, amountIn: AMOUNT - 1n, amountOutMin: 8156n });
-    expect(() => validateSwapQuote(candidate({ data }), expectation())).toThrow(/swaps .* of the token, but .* was requested/);
+    expect(() => validateSwapQuote(candidate({ data }), expectation())).toThrow(/swap legs sell .* in total .* but exactly .* was requested/);
   });
 
   it('10. payerIsUser=false is rejected -- it does not describe a swap paid from the wallet', () => {

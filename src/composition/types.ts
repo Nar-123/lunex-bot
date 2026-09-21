@@ -99,8 +99,7 @@ export interface AppDeps {
   readTokenBalanceForExit?: (tokenAddress: Address, wallet: Address) => Promise<bigint>;
   /** EXIT-ROUTER RESOLUTION: the Permit2 token-grant pre-flight for exits. Defaults to the real chain read. */
   tokenGrantPreflight?: ExecuteExitDeps['tokenGrantPreflight'];
-  /** EXIT-ROUTER RESOLUTION: the strict pre-send simulation gate. Defaults to a real `eth_call`. */
-  simulateSwap?: ExecuteExitDeps['simulateSwap'];
+
   /** v4 Permit2 entry pre-flight -- same override reasoning; production uses the real read-only on-chain check. */
   permit2Preflight?: (requiredAmount: bigint) => Promise<Permit2PreflightResult>;
 }

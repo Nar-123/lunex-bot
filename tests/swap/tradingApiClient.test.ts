@@ -37,7 +37,9 @@ describe('TradingApiSwapClient.getQuote', () => {
     const [url, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe('https://api.test/v1/quote');
     const body = JSON.parse(init.body as string);
-    expect(body.protocols).toEqual(['V2', 'V3', 'V4']);
+    // D7: V2/V3 only -- V4 routes arrive as an undecoded V4_SWAP and are refused
+    expect(body.protocols).toEqual(['V2', 'V3']);
+    expect(body.protocols).not.toContain('V4');
     expect(body.protocols).not.toContain('DUTCH_V2');
     const headers = init.headers as Record<string, string>;
     expect(headers['x-permit2-disabled']).toBeUndefined();

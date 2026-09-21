@@ -85,20 +85,22 @@ function harness(ctx: Ctx, o: { grant?: () => TokenGrantAssessment; grantDeps?: 
   const swapSign = vi.fn(async () => { order.push('swap:sign'); return { raw: '0x02' as `0x${string}`, hash: `0x${'22'.repeat(32)}` as `0x${string}` }; });
   const buildTokenGrantDeps = vi.fn((_a: NonNullable<TokenGrantAssessment['approval']>) =>
     fakeTxDeps({ amount: U(500).toString(), expiration: NOW + 86_400, nonce: 0 }, { signTransaction: grantSign, ...(o.grantDeps as object) }));
-  const buildSwapDeps = vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: U(490), usdgProceedsRaw: U(490) }, { signTransaction: swapSign, ...(o.swapDeps as object) }));
-  const simulateSwap = vi.fn(async () => { order.push('swap:simulate'); return o.sim ?? ({ ok: true } as const); });
+  // The swap's simulation is the EXECUTOR's own step: it runs on the txRequest
+  // the executor built once and persisted, and gates the signature (D7).
+  const executorSimulate = vi.fn(async (_tx: TxRequest) => { order.push('swap:simulate'); return o.sim ?? ({ ok: true } as const); });
+  const buildSwapDeps = vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: U(490), usdgProceedsRaw: U(490) }, { signTransaction: swapSign, simulate: executorSimulate, ...(o.swapDeps as object) }));
   const tokenGrantPreflight = vi.fn(async () => { order.push('grant:preflight'); return (o.grant ?? MISSING)(); });
   const deps: ExecuteExitDeps = {
     positions: ctx.positions, exitStates: ctx.exitStates, txAttempts: ctx.txAttempts,
     livePositionState: { getLiveState: vi.fn() }, poolPrice: { getPriceState: vi.fn() },
     swapExecutor: executor(), readTokenBalance: vi.fn(async () => U(500)), readAllowance: vi.fn(async () => U(1000)), walletAddress: WALLET,
-    tokenGrantPreflight, buildTokenGrantDeps: buildTokenGrantDeps as never, simulateSwap,
+    tokenGrantPreflight, buildTokenGrantDeps: buildTokenGrantDeps as never,
     buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: U(400) })),
     buildSwapDeps: buildSwapDeps as never,
     buildApproveDeps: vi.fn(() => fakeTxDeps({ allowanceRaw: U(500) })),
     warnLog: vi.fn(),
   };
-  return { deps, order, grantSign, swapSign, buildTokenGrantDeps, buildSwapDeps, simulateSwap, tokenGrantPreflight };
+  return { deps, order, grantSign, swapSign, buildTokenGrantDeps, buildSwapDeps, executorSimulate, tokenGrantPreflight };
 }
 const grantRows = async (ctx: Ctx) => (await ctx.txAttempts.findByKeyPrefixes(['permit2:exit:'])).length;
 
@@ -143,7 +145,7 @@ describe('19-20. approval failure never lets a swap be built', () => {
     expect(out.outcome).toBe('SWAP_FAILED_RETRY_PENDING');
     expect(h.buildSwapDeps).not.toHaveBeenCalled();
     expect(h.swapSign).not.toHaveBeenCalled();
-    expect(h.simulateSwap).not.toHaveBeenCalled();
+    expect(h.executorSimulate).not.toHaveBeenCalled();
     const p = await ctx.positions.findById(ctx.position.id);
     expect(p?.status).toBe('CLOSING'); // never closed on an approval failure
   });
@@ -230,14 +232,15 @@ describe('21-22. duplicates and resumption', () => {
   });
 });
 
-describe('23-24. the simulation gate', () => {
-  it('23. a failing simulation blocks the swap BEFORE any signature', async () => {
+describe('23-24. simulation: the executor simulates the PERSISTED txRequest and only then signs (D7)', () => {
+  it('23. a reverted simulation blocks the swap BEFORE any signature', async () => {
     const ctx = await scenario();
     const h = harness(ctx, { grant: SUFFICIENT, sim: { ok: false, reason: 'execution reverted: TRANSFER_FROM_FAILED' } });
     const out = await executeExit(ctx.position, h.deps);
-    expect(out.outcome).toBe('PENDING');
-    expect((out as { reason: string }).reason).toMatch(/simulation failed, not signing/);
+    expect(out.outcome).not.toBe('CLOSED');
     expect(h.swapSign).not.toHaveBeenCalled();
+    const row = await ctx.txAttempts.find(`${ctx.position.closeIdempotencyKey}:swap:0`);
+    expect(row).toMatchObject({ status: 'FAILED', failureCode: 'SIMULATION_REJECTED', nonce: null, rawTx: null, txHash: null });
     expect((await ctx.positions.findById(ctx.position.id))?.status).toBe('CLOSING');
   });
 
@@ -248,11 +251,33 @@ describe('23-24. the simulation gate', () => {
     expect(h.swapSign).toHaveBeenCalledTimes(1);
   });
 
-  it('the gate is wired ON in production composition', async () => {
+  it('the simulated bytes ARE the signed bytes: built once, simulated and signed from the same persisted object', async () => {
+    const ctx = await scenario();
+    let builds = 0;
+    const simulated: TxRequest[] = [];
+    const signed: TxRequest[] = [];
+    const h = harness(ctx, {
+      grant: SUFFICIENT,
+      swapDeps: {
+        buildTransaction: vi.fn(async () => ({ ...TX, data: `0x3593564c${(++builds).toString(16).padStart(8, '0')}` as `0x${string}` })),
+        simulate: vi.fn(async (tx: TxRequest) => { simulated.push(tx); return { ok: true } as const; }),
+        signTransaction: vi.fn(async (tx: TxRequest) => { signed.push(tx); return { raw: '0x02' as `0x${string}`, hash: `0x${'22'.repeat(32)}` as `0x${string}` }; }),
+      },
+    });
+    expect((await executeExit(ctx.position, h.deps)).outcome).toBe('CLOSED');
+    expect(builds).toBe(1); // ONE provider build per swap -- no second /v1/swap call
+    expect(simulated).toHaveLength(1);
+    expect(signed).toHaveLength(1);
+    expect(signed[0]!.data).toBe(simulated[0]!.data);
+  });
+
+  it('no separate pre-send simulation exists that could simulate different calldata', async () => {
     const { readFileSync } = await import('node:fs');
     const path = await import('node:path');
-    const text = readFileSync(path.resolve(__dirname, '../../src/composition/exitCycle.ts'), 'utf8');
-    expect(text).toMatch(/simulateSwap:\s*deps\.simulateSwap\s*\?\?\s*\(\(tx, from\) => simulateExitSwap\(tx, from\)\)/);
+    for (const f of ['src/exits/executeExit.ts', 'src/composition/exitCycle.ts', 'src/exits/permit2GrantTx.ts']) {
+      const code = readFileSync(path.resolve(__dirname, '../..', f), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      expect(code, f).not.toMatch(/simulateSwap|simulateExitSwap/);
+    }
   });
 });
 

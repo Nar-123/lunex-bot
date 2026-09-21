@@ -98,7 +98,6 @@ function deps(token: Address, o: { grant: () => TokenGrantAssessment; grantSign?
     walletAddress: WALLET,
     tokenGrantPreflight: vi.fn(async () => o.grant()),
     buildTokenGrantDeps: (() => fakeTxDeps({ amount: RESIDUAL.toString(), expiration: NOW + 86_400, nonce: 0 }, { signTransaction: grantSign as never })) as never,
-    simulateSwap: vi.fn(async () => ({ ok: true }) as const),
     buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 200n * U, tokenProceedsRaw: RESIDUAL })) as never,
     buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: 290n * U, usdgProceedsRaw: 290n * U }, o.swapOver as never)) as never,
     buildApproveDeps: vi.fn(() => fakeTxDeps({ allowanceRaw: RESIDUAL })),

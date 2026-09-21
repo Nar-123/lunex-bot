@@ -60,19 +60,44 @@ with different arguments.
 
 ## Guarantees
 
-- **Calldata is decoded and checked** (`swap/universalRouterCalldata.ts`): the
-  selector, a tight command allowlist, no `PERMIT2_PERMIT`/`PERMIT2_PERMIT_BATCH`,
-  a future deadline, and — for V2/V3 — amount, token, recipient, `payerIsUser`,
-  and a non-zero `amountOutMin`.
+- **Calldata is decoded and every command checked** (`swap/universalRouterCalldata.ts`).
+  Only `V2_SWAP_EXACT_IN` and `V3_SWAP_EXACT_IN` are accepted. For **every** leg:
+  input token = the position TOKEN (a malformed path is refused, never skipped),
+  amount > 0, recipient = the executor wallet, `payerIsUser = true`, and
+  `amountOutMin > 0`. The legs' amounts must sum to **exactly** the requested
+  amount. One future deadline per batch; strict command/input count.
+- **Refused outright:** `V4_SWAP`, `PERMIT2_PERMIT`, `PERMIT2_PERMIT_BATCH`,
+  `SWEEP`, `PAY_PORTION`, exact-output swaps, and any command not listed above.
 - **The grant is separate from the entry grant** (`exits/permit2TokenGrant.ts`):
   the spender must be an allowlisted Universal Router; USDG and the
   PositionManager are refused outright. Amount is exact, lifetime 24h (max 7d).
-- **Strict ordering**: pre-flight → grant (only if needed) → VERIFIED →
-  simulate → swap. A grant that does not reach VERIFIED never lets a swap be
-  built, and a failed simulation stops the swap before anything is signed.
-- **Idempotency** keys on the grant being *replaced* (`…:from<currentExpiration>`),
+- **Strict ordering**: pre-flight -> grant (only if needed) -> VERIFIED -> swap.
+  A grant that does not reach VERIFIED never lets a swap be built.
+- **Simulation is the executor's**: `executeCriticalTransaction` builds once,
+  persists that exact `txRequest`, simulates the persisted object and signs only
+  if it passed -- the simulated bytes are the signed bytes.
+- **Idempotency** keys on the grant being *replaced* (`...:from<currentExpiration>`),
   so restarts and concurrent exits reuse one attempt, while a grant that expired
   again later gets a new one.
+
+## D7 corrections (pre-D6 audit of 7aa6f35)
+
+Two blockers, both fixed and regression-tested:
+
+1. **V4 was accepted unvalidated.** `V4_SWAP` returned early without decoding
+   its nested V4Router actions -- a garbage payload passed. With V4 allowed, the
+   live API routed **both** PONS and MEME through `V4_SWAP`. Now V4 is refused,
+   and the client requests `protocols: ["V2","V3"]`; both tokens still route.
+   V4 needs a complete, tested decoder before it can be allowed. A partial
+   decoder is not an acceptable intermediate step.
+2. **Only the first swap leg was checked** (`findIndex`). A valid first leg plus
+   an attacker-paid second leg with `amountOutMin = 0` passed; a legitimate
+   split was wrongly refused. Now every leg is checked and the amounts summed.
+
+Also removed: a separate pre-send `eth_call` added in 7aa6f35. It called
+`buildTransaction` a second time -- a second `/v1/swap` request -- so it
+simulated **different** calldata from what was signed. The executor's
+persisted-tx simulation already covers the signed bytes.
 
 ## Not changed
 

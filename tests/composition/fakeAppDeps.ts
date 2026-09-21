@@ -140,9 +140,6 @@ export function createFakeAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
       pruneOlderThan: vi.fn(async () => undefined),
     },
     tokenGrantPreflight: grantAlreadyValid,
-    // the real gate is an eth_call; composition tests have no chain, so the gate passes here
-    // and is exercised for real in tests/exits/exitPermit2Flow.test.ts
-    simulateSwap: () => Promise.resolve({ ok: true as const }),
     swapExecutor: {
       getQuote: vi.fn(async () => ({ amountInRaw: USDG(1), expectedAmountOutRaw: USDG(1), minOutputAmountRaw: 0n, priceImpactPct: 0.001, slippageBps: 100, providerQuote: { fake: true } })),
       checkApproval: vi.fn(async () => ({ needsApproval: false, spender: null })),

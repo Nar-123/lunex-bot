@@ -18,7 +18,18 @@ import type { ApprovalCheck, SwapExecutor, SwapQuote } from './types';
  * `tradingApiMapper.ts`'s `parseQuoteResponse` -- a request-side
  * restriction is never assumed to be honored, only verified.
  */
-const CLASSIC_ONLY_PROTOCOLS = ['V2', 'V3', 'V4'];
+/**
+ * D7: V2 and V3 ONLY. V4 is deliberately excluded.
+ *
+ * A V4 route arrives as a `V4_SWAP` command whose payload is a nested V4Router
+ * action program; this release does not decode it, so it cannot verify where a
+ * V4 swap sends its output. The calldata validator refuses `V4_SWAP` outright
+ * (`universalRouterCalldata.ts`); requesting V2/V3 here is what keeps exits
+ * working, because it stops the API offering V4 in the first place. Verified
+ * 2026-09-21: with V4 allowed, both PONS and MEME were routed through V4_SWAP;
+ * with V2/V3 only, both still produced a route.
+ */
+const CLASSIC_ONLY_PROTOCOLS = ['V2', 'V3'];
 
 /**
  * PHASE 5: CONFIRMED against the live OpenAPI spec (the documented

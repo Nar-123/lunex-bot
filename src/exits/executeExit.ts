@@ -3,7 +3,7 @@ import { config } from '../config';
 import { readErc20Allowance, readErc20Balance, readErc20TransfersTo } from '../blockchain/erc20';
 import { getExecutorAddress } from '../blockchain/walletClient';
 import { executeCriticalTransaction, safeErrorMessage } from '../execution/executeCriticalTransaction';
-import type { ExecutionResult, TransactionAttemptRepository, TxRequest, TxSafetyDeps } from '../execution/types';
+import type { ExecutionResult, TransactionAttemptRepository, TxSafetyDeps } from '../execution/types';
 import type { PositionRecord, PositionRepository } from '../positions/types';
 import type { LivePositionStateProvider, PoolPriceProvider } from '../monitoring/types';
 import type { SwapExecutor, SwapQuote } from '../swap/types';
@@ -156,8 +156,7 @@ export interface ExecuteExitDeps {
     approval: NonNullable<TokenGrantAssessment['approval']>,
     requiredAmount: bigint,
   ) => TxSafetyDeps<TokenGrantVerifyData>;
-  /** Strict pre-send simulation. Returning `ok: false` blocks the swap before anything is signed. */
-  simulateSwap?: (tx: TxRequest, from: Address) => Promise<{ ok: true } | { ok: false; reason: string }>;
+
   /** Injectable for tests -- defaults to the real on-chain ERC20 reads. */
   readTokenBalance?: (tokenAddress: Address, wallet: Address) => Promise<bigint>;
   readAllowance?: (tokenAddress: Address, owner: Address, spender: Address) => Promise<bigint>;
@@ -646,23 +645,13 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
 
   const swapDeps = buildSwapDeps(position.id, position.tokenAddress, quote, deps.swapExecutor, deps.exitStates, { swapAttemptCount: exitState.swapAttemptCount });
 
-  // ---- strict simulation gate: the exact calldata is eth_call'd before any
-  // signing decision. A revert blocks the swap instead of paying gas to learn.
-  if (deps.simulateSwap) {
-    let candidate: TxRequest;
-    try {
-      candidate = await swapDeps.buildTransaction();
-    } catch (err) {
-      const reason = safeErrorMessage(err);
-      if (isSwapTargetValidationFailure(reason)) await noteDeterministicBlock('TARGET_NOT_APPROVED', reason, {});
-      return { outcome: 'PENDING', reason: `exit swap could not be built: ${reason}` };
-    }
-    const sim = await deps.simulateSwap(candidate, wallet);
-    if (!sim.ok) {
-      return { outcome: 'PENDING', reason: `exit swap simulation failed, not signing: ${sim.reason}` };
-    }
-  }
-
+  // SIMULATION (D7): the authoritative gate is inside executeCriticalTransaction.
+  // It builds ONCE, persists that exact txRequest in the version-checked BUILT
+  // write, simulates THAT persisted object, and signs only if the simulation
+  // passed -- so the bytes simulated are the bytes signed. A separate pre-send
+  // eth_call here (added in 7aa6f35, removed in D7) called buildTransaction a
+  // second time, i.e. a second /v1/swap request, and so simulated DIFFERENT
+  // calldata from what was signed. It is intentionally not reintroduced.
   const swapResult = await executeCriticalTransaction(swapKey, 'exit:swap', swapDeps, deps.txAttempts);
   if (!swapResult.ok && isSwapTargetValidationFailure(swapResult.reason)) {
     // The provider's calldata failed the two-layer execution-target check. The
