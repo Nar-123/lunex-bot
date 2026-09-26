@@ -222,7 +222,10 @@ describe('Unroutable TOKEN leg -- stays CLOSING, recorded durably, operator-visi
   it('(O) legacy remove attempt without a recorded TOKEN amount: residual reported as UNKNOWN (null), never guessed as 0', async () => {
     const ctx = await setup();
     ctx.removeDeps.verifyOnChain = vi.fn(async () => ({ ok: true as const, data: { liquidityZero: true as const, usdgProceedsRaw: USDG(200) } as never }));
-    await executeExit(ctx.position, ctx.deps(noQuote())); // legacy path: live balance 3 TOKEN -> swap path -> no quote
+    // D8: with no recorded TOKEN amount the attempt's OWN receipt is re-read --
+    // the wallet balance is never the amount, so the re-read must be available.
+    const readTransfersTo = vi.fn(async (_h: `0x${string}`, token: string) => (token === ctx.position.tokenAddress ? RESIDUAL : USDG(200)));
+    await executeExit(ctx.position, { ...ctx.deps(noQuote()), readTransfersTo }); // -> swap path -> no quote
     const r = await ctx.assess();
     expect(r.phase).toBe('QUOTE_UNAVAILABLE');
     expect(r.tokenResidualRaw).toBeNull();

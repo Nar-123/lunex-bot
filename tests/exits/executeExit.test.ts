@@ -39,8 +39,20 @@ function fakeTxDeps<T>(data: T, overrides: Partial<TxSafetyDeps<T>> = {}): TxSaf
   };
 }
 
-/** A remove-liquidity leg that always succeeds. */
+/**
+ * A remove-liquidity leg that always succeeds. D8: its receipt records the
+ * TOKEN it paid out (`tokenProceedsRaw`) -- the amount the exit then sells.
+ * `baseDeps`' wallet balance matches it, and is only a sanity check.
+ */
 function successfulRemoveDeps() {
+  return vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n, tokenProceedsRaw: USDG(500) }));
+}
+
+/**
+ * A remove-liquidity leg whose verifyData predates `tokenProceedsRaw` -- the
+ * legacy shape D8's receipt re-read path exists for.
+ */
+function legacyRemoveDeps() {
   return vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n }));
 }
 
@@ -166,7 +178,7 @@ describe('executeExit -- C3 regression: swap already VERIFIED must never re-deri
 
     // Remove-liquidity paid out 480 USDG (principal+fees side in USDG),
     // the swap paid out 490 USDG -> 970 total measured proceeds.
-    const buildRemoveLiquidityDeps = vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(480) }));
+    const buildRemoveLiquidityDeps = vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(480), tokenProceedsRaw: USDG(500) }));
     const buildSwapDeps = vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: USDG(490), usdgProceedsRaw: USDG(490) }));
 
     const outcome = await executeExit(position, {
@@ -200,7 +212,7 @@ describe('executeExit -- C3 regression: swap already VERIFIED must never re-deri
     // Principal-only value at the -6% trigger would have been ~470, but the
     // SAME remove-liquidity settlement also paid out accrued fees the live
     // pnlPct never counted -- so the two legs together return 495, not 470.
-    const buildRemoveLiquidityDeps = vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(495) }));
+    const buildRemoveLiquidityDeps = vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(495), tokenProceedsRaw: USDG(500) }));
     const buildSwapDeps = vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: USDG(0), usdgProceedsRaw: USDG(0) }));
 
     const outcome = await executeExit(position, {
@@ -278,7 +290,7 @@ describe('executeExit -- P1: a proceeds-read failure after a confirmed on-chain 
     expect(firstSwapFactory).not.toHaveBeenCalled();
     if (!afterFirst) throw new Error('unreachable');
 
-    const resumeRemove = fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(480) });
+    const resumeRemove = fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(480), tokenProceedsRaw: USDG(500) });
     const second = await executeExit(afterFirst, {
       positions,
       exitStates,
@@ -304,7 +316,7 @@ describe('executeExit -- P1: a proceeds-read failure after a confirmed on-chain 
     const txAttempts = new InMemoryTransactionAttemptRepository();
     const position = await makeClosingPosition(positions, USDG(500));
     await exitStates.update(position.id, { pendingCloseReason: 'TRAILING_TP' });
-    const removeFactory = vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(480) }));
+    const removeFactory = vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(480), tokenProceedsRaw: USDG(500) }));
 
     const firstSwap = fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n }, { verifyOnChain: resumableProceedsFailure() });
     const first = await executeExit(position, {
@@ -1074,38 +1086,49 @@ describe('executeExit -- the failed-exit state machine (point 3)', () => {
       const txAttempts = new InMemoryTransactionAttemptRepository();
       const position = await makeClosingPosition(positions, USDG(500));
 
-      await expect(
-        executeExit(position, {
-          positions,
-          exitStates,
-          txAttempts,
-          ...baseDeps({
-            buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(200), tokenProceedsRaw: USDG(3) })),
-            readTokenBalance: vi.fn(async () => 0n),
-          }),
+      const warnLog = vi.fn();
+      const swapExecutor = makeSwapExecutor();
+      const outcome = await executeExit(position, {
+        positions,
+        exitStates,
+        txAttempts,
+        ...baseDeps({
+          buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(200), tokenProceedsRaw: USDG(3) })),
+          readTokenBalance: vi.fn(async () => 0n),
+          swapExecutor,
+          warnLog,
         }),
-      ).rejects.toThrow(/paid 3000000000000000000 TOKEN, but TOKEN balance reads 0 -- invariant violated/);
+      });
+      // D8 FIX 1: the receipt-proven TOKEN is gone from the wallet. Nothing is
+      // quoted, approved or sold -- selling "whatever is there" would be a
+      // different transaction than the one this exit accounts for.
+      expect(outcome.outcome).toBe('PENDING');
+      if (outcome.outcome === 'PENDING') expect(outcome.reason).toMatch(/receipt paid 3000000000000000000 TOKEN but the wallet holds only 0/);
+      expect(swapExecutor.getQuote).not.toHaveBeenCalled();
+      expect(warnLog).toHaveBeenCalledWith('exit_token_balance_below_receipt_proceeds', expect.objectContaining({ positionId: position.id }));
       expect((await positions.findById(position.id))?.status).toBe('CLOSING');
     });
 
-    it('legacy attempt (no tokenProceedsRaw recorded) + TOKEN balance 0: re-reads the removal receipt, and if it shows TOKEN WAS paid, still throws the invariant', async () => {
+    it('legacy attempt (no tokenProceedsRaw recorded) + TOKEN balance 0: re-reads the removal receipt, and if it shows TOKEN WAS paid, fails closed -- D8: PENDING, never sells a different amount', async () => {
       const positions = new InMemoryPositionRepository();
       const exitStates = new InMemoryExitStateRepository();
       const txAttempts = new InMemoryTransactionAttemptRepository();
       const position = await makeClosingPosition(positions, USDG(500));
 
-      await expect(
-        executeExit(position, {
-          positions,
-          exitStates,
-          txAttempts,
-          ...baseDeps({
-            buildRemoveLiquidityDeps: successfulRemoveDeps(), // legacy verifyData shape: no tokenProceedsRaw
-            readTokenBalance: vi.fn(async () => 0n),
-            readTransfersTo: vi.fn(async (_h: `0x${string}`, token: Address) => (token === position.tokenAddress ? USDG(3) : USDG(200))),
-          }),
+      const swapExecutor = makeSwapExecutor();
+      const outcome = await executeExit(position, {
+        positions,
+        exitStates,
+        txAttempts,
+        ...baseDeps({
+          buildRemoveLiquidityDeps: legacyRemoveDeps(), // legacy verifyData shape: no tokenProceedsRaw
+          readTokenBalance: vi.fn(async () => 0n),
+          readTransfersTo: vi.fn(async (_h: `0x${string}`, token: Address) => (token === position.tokenAddress ? USDG(3) : USDG(200))),
+          swapExecutor,
         }),
-      ).rejects.toThrow(/invariant violated/);
+      });
+      expect(outcome.outcome).toBe('PENDING');
+      expect(swapExecutor.getQuote).not.toHaveBeenCalled();
     });
   });
 
@@ -1447,23 +1470,33 @@ describe('H1: a one-sided USDG position that never filled closes cleanly after a
         positions,
         exitStates,
         txAttempts,
-        ...baseDeps({ buildRemoveLiquidityDeps: successfulRemoveDeps(), ...noSwapDeps(), readTransfersTo: vi.fn(async () => { throw new Error('RPC down'); }) }),
+        ...baseDeps({ buildRemoveLiquidityDeps: legacyRemoveDeps(), ...noSwapDeps(), readTransfersTo: vi.fn(async () => { throw new Error('RPC down'); }) }),
       });
       expect(outcome.outcome).toBe('PENDING');
       expect((await positions.findById(position.id))?.status).toBe('CLOSING');
     });
 
-    it('legacy attempt WITH TOKEN in the wallet -> the unchanged live-balance swap path (receipt never consulted)', async () => {
+    it('legacy attempt WITH TOKEN in the wallet -> D8: the RECEIPT is re-read and ITS amount is sold, never the wallet balance', async () => {
       const { positions, exitStates, txAttempts, position } = await setup(USDG(500));
-      const readTransfersTo = vi.fn();
+      // The wallet holds far MORE than this position's own burn paid out (e.g.
+      // TOKEN from another position). Only the receipt-proven 2 may be sold.
+      const readTransfersTo = vi.fn(async (_h: `0x${string}`, token: Address) => (token === position.tokenAddress ? USDG(2) : USDG(200)));
+      const swapExecutor = makeSwapExecutor(makeQuote({ amountInRaw: USDG(2) }));
       const outcome = await executeExit(position, {
         positions,
         exitStates,
         txAttempts,
-        ...baseDeps({ buildRemoveLiquidityDeps: successfulRemoveDeps(), buildSwapDeps: successfulSwapDeps(), readTokenBalance: vi.fn(async () => USDG(2)), readTransfersTo }),
+        ...baseDeps({
+          buildRemoveLiquidityDeps: legacyRemoveDeps(),
+          buildSwapDeps: successfulSwapDeps(),
+          readTokenBalance: vi.fn(async () => USDG(50)),
+          readTransfersTo,
+          swapExecutor,
+        }),
       });
       expect(outcome).toEqual({ outcome: 'CLOSED' });
-      expect(readTransfersTo).not.toHaveBeenCalled();
+      expect(readTransfersTo).toHaveBeenCalled();
+      expect(swapExecutor.getQuote).toHaveBeenCalledWith(position.tokenAddress, USDG(2), 100);
     });
   });
 
@@ -1589,7 +1622,7 @@ describe('H1 follow-up: TOKEN left over after remove-liquidity (e.g. residual TO
     if (outcome.outcome === 'PENDING') expect(outcome.reason).toMatch(/quote unavailable for 37 TOKEN.*TOKEN retained/);
     expect(warnLog).toHaveBeenCalledWith(
       'exit_token_leg_unactionable',
-      expect.objectContaining({ positionId: ctx.position.id, cause: 'QUOTE_UNAVAILABLE', receiptTokenProceedsRaw: '37', walletTokenAmountRaw: '37', tokenDecimals: 18 }),
+      expect.objectContaining({ positionId: ctx.position.id, cause: 'QUOTE_UNAVAILABLE', receiptTokenProceedsRaw: '37', walletTokenBalanceRaw: '37', tokenDecimals: 18 }),
     );
   });
 

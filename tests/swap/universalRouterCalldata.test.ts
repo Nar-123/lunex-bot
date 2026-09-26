@@ -4,7 +4,7 @@ import { validateSwapQuote, SwapQuoteValidationError, type RawSwapTxCandidate, t
 import { assertUniversalRouterCallSafe, decodeUniversalRouterExecute, UniversalRouterCalldataError } from '../../src/swap/universalRouterCalldata';
 import { config } from '../../src/config';
 import { EXECUTION_TARGETS } from '../../src/config/constants';
-import { urExecuteCalldata, urWithPermitCommand } from './urCalldataFixture';
+import { FIXTURE_USDG, urExecuteCalldata, urWithPermitCommand } from './urCalldataFixture';
 
 /**
  * Exit-router resolution: the Permit2-enabled Trading API flow targets the
@@ -37,6 +37,7 @@ const expectation = (o: Partial<SwapQuoteExpectation> = {}): SwapQuoteExpectatio
   minReceivedRequired: true,
   targets: TARGETS,
   tokenIn: TOKEN,
+  tokenOut: FIXTURE_USDG,
   recipient: WALLET,
   now: NOW,
   ...o,
@@ -149,7 +150,7 @@ describe('7-11. swap parameters must match the position and the quote', () => {
     it('command/input count mismatch', () => {
       const abi = parseAbi(['function execute(bytes commands,bytes[] inputs,uint256 deadline)']);
       const data = encodeFunctionData({ abi, functionName: 'execute', args: ['0x0000', [encodeAbiParameters([{ type: 'uint256' }], [1n])], BigInt(NOW + 600)] });
-      expect(() => assertUniversalRouterCallSafe(data, { tokenIn: TOKEN, amountInRaw: AMOUNT, minOutputAmountRaw: 1n, minReceivedRequired: true, recipient: WALLET, now: NOW })).toThrow(/count mismatch/);
+      expect(() => assertUniversalRouterCallSafe(data, { tokenIn: TOKEN, tokenOut: FIXTURE_USDG, amountInRaw: AMOUNT, minOutputAmountRaw: 1n, minReceivedRequired: true, recipient: WALLET, now: NOW })).toThrow(/count mismatch/);
     });
 
     it('empty command list', () => {

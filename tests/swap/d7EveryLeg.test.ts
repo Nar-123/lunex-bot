@@ -37,7 +37,7 @@ const v2 = (l: Leg): `0x${string}` => encodeAbiParameters(
 const batch = (commands: `0x${string}`, inputs: `0x${string}`[]): `0x${string}` =>
   encodeFunctionData({ abi: ABI, functionName: 'execute', args: [commands, inputs, BigInt(NOW + 600)] });
 
-const EXPECT = { amountInRaw: AMT, chainId: 4663, minReceivedRequired: true, targets: TARGETS, tokenIn: TOKEN, recipient: WALLET, now: NOW };
+const EXPECT = { amountInRaw: AMT, chainId: 4663, minReceivedRequired: true, targets: TARGETS, tokenIn: TOKEN, tokenOut: USDG, recipient: WALLET, now: NOW };
 const run = (data: `0x${string}`) => validateSwapQuote({ to: UR, data, value: '0', chainId: 4663, echoedAmountInRaw: AMT, minOutputAmountRaw: 1n }, EXPECT);
 const accepted = (data: `0x${string}`) => expect(() => run(data)).not.toThrow();
 const rejected = (data: `0x${string}`, re: RegExp) => expect(() => run(data)).toThrow(re);

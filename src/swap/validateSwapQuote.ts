@@ -86,6 +86,13 @@ export interface SwapQuoteExpectation {
   targets: ExecutionTargetPolicy;
   /** The TOKEN being sold -- cross-checked against SwapProxy calldata so a proxy payload cannot swap a different asset. */
   tokenIn: string;
+  /**
+   * D8: the OFFICIAL configured quote asset (USDG) every swap leg must pay
+   * out. Required for CASE A (direct Universal Router); its absence there is
+   * fail-closed, exactly like a missing `recipient`, because a batch whose
+   * destination asset was never checked is not a validated batch.
+   */
+  tokenOut?: string;
   /** Startup identity-assertion state; `FAILED` blocks every swap (see `executionTargetGate.ts`). */
   identityGate?: ExecutionTargetVerificationState;
   /**
@@ -133,14 +140,15 @@ export function validateSwapQuote(candidate: RawSwapTxCandidate, expected: SwapQ
   // command it has never reasoned about, and swap parameters that match the
   // quote this call was built for.
   if (match.kind === 'UNIVERSAL_ROUTER') {
-    if (expected.recipient === undefined || expected.now === undefined) {
+    if (expected.recipient === undefined || expected.now === undefined || expected.tokenOut === undefined) {
       throw new SwapQuoteValidationError(
-        'direct Universal Router calldata cannot be validated without the expected recipient and current time -- refusing to sign an unchecked command batch (fail closed)',
+        'direct Universal Router calldata cannot be validated without the expected recipient, output token and current time -- refusing to sign an unchecked command batch (fail closed)',
       );
     }
     try {
       assertUniversalRouterCallSafe(candidate.data, {
         tokenIn: expected.tokenIn,
+        tokenOut: expected.tokenOut,
         amountInRaw: expected.amountInRaw,
         minOutputAmountRaw: candidate.minOutputAmountRaw,
         minReceivedRequired: expected.minReceivedRequired,

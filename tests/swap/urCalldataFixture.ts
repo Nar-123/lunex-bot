@@ -1,4 +1,5 @@
 import { encodeAbiParameters, encodeFunctionData, parseAbi, type Address } from 'viem';
+import { config } from '../../src/config';
 
 /**
  * Builds REAL Universal Router `execute(commands, inputs, deadline)` calldata
@@ -15,9 +16,19 @@ const V3_ARGS = [
   { type: 'bool', name: 'payerIsUser' },
 ] as const;
 
+/**
+ * The OFFICIAL configured quote asset -- read from config exactly as production
+ * does, so a fixture path can never end somewhere the validator would accept
+ * only because the test hardcoded a different USDG than the code reads.
+ * D8: every fixture path ends here, because every real exit leg must.
+ */
+export const FIXTURE_USDG = config.quoteAsset.ADDRESS as Address;
+
 export interface UrFixtureOptions {
   recipient: Address;
   tokenIn: Address;
+  /** D8: defaults to the official USDG -- overridden only to prove a wrong destination is refused. */
+  tokenOut?: Address;
   amountIn: bigint;
   amountOutMin?: bigint;
   payerIsUser?: boolean;
@@ -38,7 +49,7 @@ export function urExecuteCalldata(o: UrFixtureOptions): `0x${string}` {
     o.recipient,
     o.amountIn,
     o.amountOutMin ?? 1n,
-    v3Path(o.tokenIn, '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168'),
+    v3Path(o.tokenIn, o.tokenOut ?? FIXTURE_USDG),
     o.payerIsUser ?? true,
   ]);
   const commands = o.commands ?? '0x00';

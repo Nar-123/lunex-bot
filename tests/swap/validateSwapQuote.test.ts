@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Address } from 'viem';
 import { validateSwapQuote, SwapQuoteValidationError } from '../../src/swap/validateSwapQuote';
 import type { RawSwapTxCandidate } from '../../src/swap/validateSwapQuote';
-import { urExecuteCalldata } from './urCalldataFixture';
+import { FIXTURE_USDG, urExecuteCalldata } from './urCalldataFixture';
 
 const ALLOWED_ROUTER = '0x1111111111111111111111111111111111111111';
 const TOKEN_IN = '0x7777777777777777777777777777777777777777';
@@ -23,7 +23,7 @@ const VALID: RawSwapTxCandidate = {
   minOutputAmountRaw: 0n,
 };
 const POLICY = { chainId: 4663, universalRouters: [ALLOWED_ROUTER], swapProxies: [] as string[] };
-const EXPECTED = { amountInRaw: 500n, chainId: 4663, minReceivedRequired: false, targets: POLICY, tokenIn: TOKEN_IN, recipient: RECIPIENT, now: NOW };
+const EXPECTED = { amountInRaw: 500n, chainId: 4663, minReceivedRequired: false, targets: POLICY, tokenIn: TOKEN_IN, tokenOut: FIXTURE_USDG, recipient: RECIPIENT, now: NOW };
 
 describe('validateSwapQuote -- structural validation before trusting external swap calldata', () => {
   it('accepts a well-formed candidate targeting the configured allowed router, and returns a clean TxRequest', () => {
@@ -70,15 +70,19 @@ describe('validateSwapQuote -- structural validation before trusting external sw
   });
 
   it('rejects a zero minOutputAmountRaw when minimum-received protection is required', () => {
-    expect(() => validateSwapQuote(VALID, { ...EXPECTED, minReceivedRequired: true })).toThrow(/minOutputAmountRaw/);
+    expect(() => validateSwapQuote(VALID, { ...EXPECTED, minReceivedRequired: true })).toThrow(/minimum-received protection is enabled/);
   });
 
   it('accepts a zero minOutputAmountRaw when protection is NOT required (the OFF/default spec state)', () => {
     expect(() => validateSwapQuote(VALID, { ...EXPECTED, minReceivedRequired: false })).not.toThrow();
   });
 
-  it('accepts a nonzero minOutputAmountRaw when protection is required', () => {
-    expect(() => validateSwapQuote({ ...VALID, minOutputAmountRaw: 100n }, { ...EXPECTED, minReceivedRequired: true })).not.toThrow();
+  it('accepts a nonzero minOutputAmountRaw when protection is required -- and the calldata must actually guarantee it (D8)', () => {
+    const boundData = urExecuteCalldata({ recipient: RECIPIENT, tokenIn: TOKEN_IN as Address, amountIn: 500n, amountOutMin: 100n });
+    expect(() => validateSwapQuote({ ...VALID, data: boundData, minOutputAmountRaw: 100n }, { ...EXPECTED, minReceivedRequired: true })).not.toThrow();
+    // D8 FIX 4: the SAME policy minimum against calldata that only guarantees
+    // 1 wei is refused -- a positive amountOutMin is no longer sufficient.
+    expect(() => validateSwapQuote({ ...VALID, minOutputAmountRaw: 100n }, { ...EXPECTED, minReceivedRequired: true })).toThrow(/guarantee only 1 .*below the 100/);
   });
 
   it('rejects an unparseable "value"', () => {

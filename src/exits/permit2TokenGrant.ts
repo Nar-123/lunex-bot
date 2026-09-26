@@ -168,9 +168,79 @@ export function assessTokenGrant(i: TokenGrantInput): TokenGrantAssessment {
  * The current expiration is stable across ticks until the approval lands and
  * changes it, so: concurrent exits and restarts reuse ONE attempt, and a later,
  * genuinely new need (a grant that expired again) gets a new one.
+ *
+ * ## D8 FIX 2: why a retry generation was added
+ *
+ * Those properties held for every case EXCEPT a definitive failure. A grant
+ * approval that fails definitively (reverted, simulation rejected, ...) leaves
+ * the on-chain expiration exactly as it was, so the key was unchanged, and
+ * `executeCriticalTransaction` returns a FAILED attempt's cached failure
+ * forever by design. Every later tick therefore re-derived the same dead key
+ * and re-read the same FAILED row: the grant could never be retried, and with
+ * it the exit's swap leg could never run again -- a permanently blocked exit
+ * from one transient-looking revert.
+ *
+ * The generation is a suffix, and it is NOT stored on a new column: it is
+ * DERIVED from the grant attempts that already exist for this exact prefix
+ * (`resolveTokenGrantRetryGeneration`), which is durable state the
+ * `TransactionAttempt` table already holds. So it advances only when a
+ * definitive FAILED row exists at the current generation, and stays put for a
+ * crash, an RPC timeout, SIGNED/SENT/CONFIRMED-not-yet-verified, a restart, or
+ * a second concurrent worker -- all of which leave a non-FAILED row.
  */
-export function tokenGrantIdempotencyKey(closeIdempotencyKey: string, chainId: number, token: string, spender: string, replacingExpiration: number): string {
-  return `permit2:exit:${closeIdempotencyKey}:${chainId}:${token.toLowerCase()}:${spender.toLowerCase()}:from${replacingExpiration}`;
+export function tokenGrantIdempotencyKey(
+  closeIdempotencyKey: string,
+  chainId: number,
+  token: string,
+  spender: string,
+  replacingExpiration: number,
+  retryGeneration = 0,
+): string {
+  return `${tokenGrantKeyPrefix(closeIdempotencyKey, chainId, token, spender, replacingExpiration)}${retryGeneration}`;
+}
+
+/**
+ * Everything in the key except the retry generation -- the identity of "this
+ * lifecycle's grant replacing THIS on-chain expiration". Used to find the
+ * attempts already made for it. Ends with `:r` so it cannot match a different
+ * expiration that merely starts with the same digits.
+ */
+export function tokenGrantKeyPrefix(closeIdempotencyKey: string, chainId: number, token: string, spender: string, replacingExpiration: number): string {
+  return `permit2:exit:${closeIdempotencyKey}:${chainId}:${token.toLowerCase()}:${spender.toLowerCase()}:from${replacingExpiration}:r`;
+}
+
+/**
+ * How many definitive failures in a row are retried before an exit stops
+ * asking and waits for an operator. Each generation is one real on-chain
+ * approval attempt, and the swap leg's own slippage ladder advances alongside
+ * it, so this only has to be generous, not tuned.
+ */
+export const TOKEN_GRANT_RETRY_GENERATION_LIMIT = 32;
+
+/**
+ * The generation THIS tick must use: the lowest one not already occupied by a
+ * definitively FAILED attempt. `null` = the limit is reached, which the caller
+ * turns into a deferral for an operator rather than an endless retry.
+ *
+ * Deterministic and read-only, so two concurrent workers reading the same rows
+ * always derive the SAME key, and a worker that crashes and restarts re-derives
+ * the key it was already using.
+ */
+export function resolveTokenGrantRetryGeneration(
+  attempts: readonly { idempotencyKey: string; status: string }[],
+  prefix: string,
+  limit: number = TOKEN_GRANT_RETRY_GENERATION_LIMIT,
+): number | null {
+  const failed = new Set<number>();
+  for (const a of attempts) {
+    if (a.status !== 'FAILED' || !a.idempotencyKey.startsWith(prefix)) continue;
+    const suffix = a.idempotencyKey.slice(prefix.length);
+    if (!/^\d+$/.test(suffix)) continue; // not a generation of this prefix -- ignored, never guessed at
+    failed.add(Number(suffix));
+  }
+  let generation = 0;
+  while (failed.has(generation)) generation += 1;
+  return generation >= limit ? null : generation;
 }
 
 /** The single approved Universal Router an exit may authorise. Fails closed when the allowlist is empty or ambiguous. */

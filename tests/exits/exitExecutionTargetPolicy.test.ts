@@ -83,7 +83,7 @@ function deps(over: Partial<ExecuteExitDeps>, ctx: Awaited<ReturnType<typeof stu
     readTokenBalance: vi.fn(async () => USDG(500)),
     readAllowance: vi.fn(async () => 0n),
     walletAddress: WALLET,
-    buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(400) })),
+    buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: USDG(400), tokenProceedsRaw: USDG(500) })),
     buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: USDG(490), usdgProceedsRaw: USDG(490) })),
     buildApproveDeps: vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(500) })),
     warnLog: vi.fn(),
@@ -99,7 +99,8 @@ describe('approval spender policy (15-18)', () => {
 
     const outcome = await executeExit(ctx.position, d);
 
-    expect(buildApproveDeps).toHaveBeenCalledWith(TOKEN, APPROVED_PROXY, USDG(500));
+    // D8: the receipt paid 5 TOKEN (the wallet holds 500) -- the approval is for the RECEIPT amount.
+    expect(buildApproveDeps).toHaveBeenCalledWith(TOKEN, APPROVED_PROXY, USDG(5));
     expect(outcome.outcome).not.toBe('PENDING');
     expect((await ctx.exitStates.getOrCreate(ctx.position.id)).swapLegBlockedReason).toBeNull();
   });
@@ -108,7 +109,7 @@ describe('approval spender policy (15-18)', () => {
     const ctx = await stuckAfterRemoval();
     const buildApproveDeps = vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(500) }));
     await executeExit(ctx.position, deps({ swapExecutor: swapExecutor(APPROVED_ROUTER), buildApproveDeps }, ctx));
-    expect(buildApproveDeps).toHaveBeenCalledWith(TOKEN, APPROVED_ROUTER, USDG(500));
+    expect(buildApproveDeps).toHaveBeenCalledWith(TOKEN, APPROVED_ROUTER, USDG(5)); // D8: receipt amount, not the wallet's 500
   });
 
   it('16. the DEPRECATED legacy proxy spender is refused -- no approval is built, a durable block is recorded', async () => {

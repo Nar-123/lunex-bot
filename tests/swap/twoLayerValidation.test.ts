@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { SwapQuoteValidationError, validateSwapQuote, type RawSwapTxCandidate, type SwapQuoteExpectation } from '../../src/swap/validateSwapQuote';
 import { SWAP_PROXY_EXECUTE_SELECTOR } from '../../src/swap/executionTargets';
 import { APPROVED_PROXY, APPROVED_ROUTER, LEGACY_PROXY, POLICY, proxyCalldata, TOKEN, UNVERIFIED_ROUTER } from './executionTargetFixtures';
-import { urExecuteCalldata } from './urCalldataFixture';
+import { FIXTURE_USDG, urExecuteCalldata } from './urCalldataFixture';
 import type { Address } from 'viem';
 
 const AMOUNT = 500n;
@@ -25,6 +25,7 @@ const expected = (over: Partial<SwapQuoteExpectation> = {}): SwapQuoteExpectatio
   minReceivedRequired: true,
   targets: POLICY,
   tokenIn: TOKEN,
+  tokenOut: FIXTURE_USDG,
   recipient: RECIPIENT,
   now: NOW,
   ...over,

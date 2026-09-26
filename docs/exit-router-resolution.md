@@ -99,6 +99,39 @@ Also removed: a separate pre-send `eth_call` added in 7aa6f35. It called
 simulated **different** calldata from what was signed. The executor's
 persisted-tx simulation already covers the signed bytes.
 
+## D8 corrections (exit-safety review of 0525c41)
+
+Four fixes, all regression-tested and mutation-tested:
+
+1. **An exit sold the WALLET-WIDE TOKEN balance.** `amountInRaw` fell back to
+   `readTokenBalance(...)`, so TOKEN belonging to another position (or arriving
+   from anywhere else) could be sold under this close -- and granted to the
+   router through Permit2. The amount is now always the remove-liquidity
+   receipt's own `tokenProceedsRaw`; a legacy attempt that recorded none has its
+   receipt re-read. The wallet balance is only a floor check: below the receipt
+   amount the exit defers (PENDING, stays CLOSING) rather than selling a
+   different amount. The grant and the quote use that same receipt amount.
+2. **A definitively failed Permit2 grant could never be retried.** The key was
+   derived from the on-chain expiration it replaced, which a failed approval
+   leaves unchanged, so every later tick re-read the same cached FAILED row and
+   the exit's swap leg was blocked for good. The key now carries a retry
+   generation (`:r<n>`) derived from the grant attempts already persisted for
+   that prefix, so it advances ONLY past a definitive failure -- never for a
+   crash, an ambiguous broadcast, SIGNED/SENT/CONFIRMED, a restart or a
+   concurrent worker, all of which still resolve to the same key. No schema
+   change: the generation is read from existing `TransactionAttempt` rows. Past
+   32 generations the exit defers for an operator.
+3. **Every leg must END at the configured USDG.** Only the input token was
+   checked, so a leg selling the right TOKEN into the wrong asset passed. Both
+   path endpoints are now decoded (V2 needs >= 2 hops; V3's last 20 bytes), and
+   the destination is compared against `config.quoteAsset.ADDRESS`.
+4. **`amountOutMin` is bound to our own computed minimum.** `> 0` alone let a
+   1-wei minimum satisfy any policy. The legs' minimums must now SUM to at least
+   the minimum this project derives from the quote and its slippage tier (not
+   the API's echoed minimum). Per-leg proportional floors are deliberately not
+   asserted -- a split's legs price differently and only the aggregate is
+   quoted, while the aggregate already bounds every leg.
+
 ## Not changed
 
 The allowlist; the operator-only USDG → PositionManager grant; entry; D3/D4

@@ -13,7 +13,13 @@ import { buildSwapDeps as realBuildSwapDeps, defaultLogImpact, shouldBlockForPri
 import { buildApproveDeps as realBuildApproveDeps, needsApproval, type ApproveVerifyData } from './approveTx';
 import { classifyApprovalSpender } from '../swap/executionTargets';
 import { runTokenGrantPreflight, buildTokenGrantDeps, type TokenGrantVerifyData } from './permit2GrantTx';
-import { tokenGrantIdempotencyKey, type TokenGrantAssessment } from './permit2TokenGrant';
+import {
+  resolveTokenGrantRetryGeneration,
+  tokenGrantIdempotencyKey,
+  tokenGrantKeyPrefix,
+  TOKEN_GRANT_RETRY_GENERATION_LIMIT,
+  type TokenGrantAssessment,
+} from './permit2TokenGrant';
 import { decodeBlockReason, evaluateSuppression, fingerprintDeterministicFailure, isDeterministicBlockReason, recordDeterministicBlock } from './swapLegBackoff';
 
 /**
@@ -109,6 +115,28 @@ export function classifyUsdgOnlyRemoval(
     };
   }
   return { ok: true };
+}
+
+/**
+ * D8 FIX 1: the receipt-proven TOKEN amount from a VERIFIED remove-liquidity
+ * attempt's persisted `verifyData` -- the ONLY quantity an exit may sell.
+ *
+ * `verifyData` is persisted JSON. Bigints round-trip through a tagged string
+ * (`transactionAttemptRepository.ts`), and a legacy row may hold a plain
+ * decimal string, so both are accepted; a value of any OTHER shape returns
+ * `null`, which makes the caller re-derive the amount from the attempt's own
+ * receipt instead of trusting something it cannot read. The wallet balance is
+ * never a fallback. (Same tolerance as `dustSettlement.ts`'s reader, which
+ * reports the same number to operators.)
+ */
+export function receiptTokenProceedsRaw(verifyData: unknown): bigint | null {
+  if (typeof verifyData !== 'object' || verifyData === null) return null;
+  const raw = (verifyData as Record<string, unknown>).tokenProceedsRaw;
+  if (typeof raw === 'bigint') return raw >= 0n ? raw : null;
+  if (typeof raw !== 'string') return null;
+  const cleaned = raw.startsWith('bigint:') ? raw.slice('bigint:'.length) : raw;
+  if (!/^\d+$/.test(cleaned)) return null;
+  return BigInt(cleaned);
 }
 
 export type ExitExecutionOutcome =
@@ -373,25 +401,26 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
   //                               live-balance behavior, EXCEPT that a 0
   //                               balance is now checked against the
   //                               attempt's own receipt instead of thrown.
+  // D8 FIX 1: the amount to sell is ALWAYS receipt-scoped. A legacy attempt
+  // (verified by a build that recorded no `tokenProceedsRaw`) has its own
+  // confirmed receipt re-read to derive one -- unconditionally, not only when
+  // the wallet happens to read 0. The wallet balance is never the amount; see
+  // the sanity check below.
   const removal = removeResult.data;
-  let removalTokenProceedsRaw: bigint | undefined = removal.tokenProceedsRaw;
+  let removalTokenProceedsRaw: bigint | undefined = receiptTokenProceedsRaw(removal) ?? undefined;
   let removalUsdgProceedsRaw: bigint | undefined = (removal as Partial<RemoveLiquidityVerifyData>).usdgProceedsRaw;
-  let amountInRaw: bigint | null = null;
   if (removalTokenProceedsRaw === undefined) {
-    amountInRaw = await readTokenBalance(position.tokenAddress, wallet);
-    if (amountInRaw <= 0n) {
-      const txHash = removeResult.attempt.txHash;
-      if (!txHash) {
-        return { outcome: 'PENDING', reason: `remove-liquidity is VERIFIED with no recorded TOKEN proceeds and no txHash to re-read them from -- manual review required` };
-      }
-      const readTransfersTo = deps.readTransfersTo ?? readErc20TransfersTo;
-      try {
-        removalTokenProceedsRaw = await readTransfersTo(txHash, position.tokenAddress, wallet);
-        removalUsdgProceedsRaw ??= await readTransfersTo(txHash, config.quoteAsset.ADDRESS as Address, wallet);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return { outcome: 'PENDING', reason: `could not re-read the remove-liquidity receipt to prove its TOKEN proceeds: ${message}` };
-      }
+    const txHash = removeResult.attempt.txHash;
+    if (!txHash) {
+      return { outcome: 'PENDING', reason: `remove-liquidity is VERIFIED with no recorded TOKEN proceeds and no txHash to re-read them from -- manual review required` };
+    }
+    const readTransfersTo = deps.readTransfersTo ?? readErc20TransfersTo;
+    try {
+      removalTokenProceedsRaw = await readTransfersTo(txHash, position.tokenAddress, wallet);
+      removalUsdgProceedsRaw ??= await readTransfersTo(txHash, config.quoteAsset.ADDRESS as Address, wallet);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { outcome: 'PENDING', reason: `could not re-read the remove-liquidity receipt to prove its TOKEN proceeds: ${message}` };
     }
   }
 
@@ -408,9 +437,31 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
     return finalizeClose(position, exitState, deps, removeKey, null, usdgProceedsRaw);
   }
 
-  amountInRaw ??= await readTokenBalance(position.tokenAddress, wallet);
-  if (amountInRaw <= 0n) {
-    throw new Error(`position ${position.id}: remove-liquidity is VERIFIED and paid ${removalTokenProceedsRaw ?? 'unknown'} TOKEN, but TOKEN balance reads 0 -- invariant violated`);
+  // D8 FIX 1: THIS is the amount sold, approved through Permit2 and quoted --
+  // the TOKEN this position's own remove-liquidity receipt paid out, and
+  // nothing else. The wallet may hold TOKEN from other positions, other
+  // strategies or a manual transfer; selling the wallet-wide balance (what the
+  // previous `amountInRaw ??= readTokenBalance(...)` did) would liquidate
+  // unrelated holdings under this position's close, and grant the router
+  // Permit2 authority over them too.
+  const amountInRaw: bigint = removalTokenProceedsRaw;
+  const walletTokenBalanceRaw = await readTokenBalance(position.tokenAddress, wallet);
+  if (walletTokenBalanceRaw < amountInRaw) {
+    // The receipt-proven TOKEN is no longer (all) there: something moved it.
+    // Selling whatever IS there instead would be a different transaction than
+    // the one this exit is accounting for, so nothing is sold, approved or
+    // quoted. The position stays CLOSING (capital still counted as deployed)
+    // and reconciliation surfaces it.
+    const detail =
+      `remove-liquidity receipt paid ${amountInRaw} TOKEN but the wallet holds only ${walletTokenBalanceRaw} -- ` +
+      'refusing to sell a different amount than this position realized; manual review required';
+    const warn = deps.warnLog ?? ((event: string, data?: Record<string, unknown>) => { console.warn(event, data); });
+    warn('exit_token_balance_below_receipt_proceeds', {
+      positionId: position.id,
+      receiptTokenProceedsRaw: amountInRaw.toString(),
+      walletTokenBalanceRaw: walletTokenBalanceRaw.toString(),
+    });
+    return { outcome: 'PENDING', reason: detail };
   }
   // TIER 3 — slippage ladder. The tier is `swapAttemptCount`, which Module
   // 8 increments ONLY on a DEFINITIVE failure, so:
@@ -445,8 +496,8 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
   const warnLog = deps.warnLog ?? ((event: string, data?: Record<string, unknown>) => { console.warn(event, data); });
   const tokenLegContext = {
     positionId: position.id,
-    receiptTokenProceedsRaw: removalTokenProceedsRaw === undefined ? null : removalTokenProceedsRaw.toString(),
-    walletTokenAmountRaw: amountInRaw.toString(),
+    receiptTokenProceedsRaw: amountInRaw.toString(),
+    walletTokenBalanceRaw: walletTokenBalanceRaw.toString(),
     tokenDecimals: position.tokenDecimals,
   };
   // Unroutable TOKEN leg: the block is recorded DURABLY on ExitState (for
@@ -620,13 +671,44 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
 
     if (grant.needsApproval && grant.approval !== null) {
       const approval = grant.approval;
-      const grantKey = tokenGrantIdempotencyKey(
+      // D8 FIX 2: the key carries a RETRY GENERATION derived from the grant
+      // attempts already persisted for this same (lifecycle, token, router,
+      // replaced expiration). It advances only past a definitively FAILED
+      // attempt, so a failed approval is retried under a fresh key instead of
+      // re-reading its cached failure forever, while a crash, an ambiguous
+      // broadcast, a SIGNED/SENT payload, a restart or a concurrent worker all
+      // still resolve to the SAME key and never sign twice.
+      const grantPrefix = tokenGrantKeyPrefix(
         position.closeIdempotencyKey,
         config.chain.chainId,
         approval.token,
         approval.spender,
         // the grant being REPLACED -- stable until this approval lands (see tokenGrantIdempotencyKey)
         grant.current.expiration,
+      );
+      let priorGrantAttempts: { idempotencyKey: string; status: string }[];
+      try {
+        priorGrantAttempts = await deps.txAttempts.findByKeyPrefixes([grantPrefix]);
+      } catch (err) {
+        // Not knowing which generation is current is never a reason to guess
+        // one: a wrong generation could re-sign an approval already in flight.
+        return { outcome: 'PENDING', reason: `could not read this exit's prior Permit2 grant attempts: ${safeErrorMessage(err)}` };
+      }
+      const retryGeneration = resolveTokenGrantRetryGeneration(priorGrantAttempts, grantPrefix);
+      if (retryGeneration === null) {
+        const detail =
+          `Permit2 token grant for ${approval.token} has failed definitively ${TOKEN_GRANT_RETRY_GENERATION_LIMIT} times for this close ` +
+          '-- no further approval is attempted; OPERATOR ACTION REQUIRED';
+        await noteDeterministicBlock('APPROVAL_SPENDER_NOT_APPROVED', `[PERMIT2_GRANT_RETRY_LIMIT] ${detail}`, { spender: approval.spender });
+        return { outcome: 'PENDING', reason: `exit swap blocked: ${detail}` };
+      }
+      const grantKey = tokenGrantIdempotencyKey(
+        position.closeIdempotencyKey,
+        config.chain.chainId,
+        approval.token,
+        approval.spender,
+        grant.current.expiration,
+        retryGeneration,
       );
       const grantDeps = (deps.buildTokenGrantDeps ?? ((a: typeof approval, amt: bigint) => buildTokenGrantDeps(a, amt)))(approval, amountInRaw);
       const grantResult = await executeCriticalTransaction(grantKey, 'exit:permit2Grant', grantDeps, deps.txAttempts);

@@ -132,6 +132,14 @@ export interface DecodedSwapCommand {
   payerIsUser: boolean;
   /** V2: the token path array. V3: the encoded path bytes. V4: not decoded here. */
   tokenIn: Address | null;
+  /**
+   * D8: the LAST token of the same path -- what this leg actually pays out.
+   * `null` whenever the path is too short or malformed to name one, which the
+   * caller rejects rather than skipping the check. Before D8 only the input
+   * token was read, so a leg selling the right TOKEN into the wrong asset
+   * passed: the path's destination was never looked at.
+   */
+  tokenOut: Address | null;
 }
 
 const V3_SWAP_EXACT_IN_ARGS = [
@@ -152,13 +160,15 @@ const V2_SWAP_EXACT_IN_ARGS = [
 
 /**
  * V3 path is `token (20) | fee (3) | token (20) | ...`, so its length is
- * 20 + 23n bytes for n >= 1 hops. The first 20 bytes are the input token.
+ * 20 + 23n bytes for n >= 1 hops. The FIRST 20 bytes are the input token and
+ * the LAST 20 bytes are the output token (D8 -- a multi-hop path's
+ * intermediate tokens are the router's business, but where it ENDS is ours).
  * Anything else is malformed and yields `null`, which the caller REJECTS.
  */
-function firstTokenOfV3Path(path: `0x${string}`): Address | null {
+function endpointsOfV3Path(path: `0x${string}`): { tokenIn: Address; tokenOut: Address } | null {
   const bytes = (path.length - 2) / 2;
   if (!Number.isInteger(bytes) || bytes < 43 || (bytes - 20) % 23 !== 0) return null;
-  return `0x${path.slice(2, 42)}`;
+  return { tokenIn: `0x${path.slice(2, 42)}`, tokenOut: `0x${path.slice(path.length - 40)}` };
 }
 
 /**
@@ -172,18 +182,41 @@ function firstTokenOfV3Path(path: `0x${string}`): Address | null {
 export function decodeSwapCommand(command: number, input: `0x${string}`): DecodedSwapCommand | null {
   if (command === COMMAND.V3_SWAP_EXACT_IN) {
     const [recipient, amountIn, amountOutMin, path, payerIsUser] = decodeAbiParameters(V3_SWAP_EXACT_IN_ARGS, input);
-    return { command, recipient, amountIn, amountOutMin, payerIsUser, tokenIn: firstTokenOfV3Path(path) };
+    const ends = endpointsOfV3Path(path);
+    return { command, recipient, amountIn, amountOutMin, payerIsUser, tokenIn: ends?.tokenIn ?? null, tokenOut: ends?.tokenOut ?? null };
   }
   if (command === COMMAND.V2_SWAP_EXACT_IN) {
     const [recipient, amountIn, amountOutMin, path, payerIsUser] = decodeAbiParameters(V2_SWAP_EXACT_IN_ARGS, input);
-    return { command, recipient, amountIn, amountOutMin, payerIsUser, tokenIn: path.length > 0 ? (path[0] as Address) : null };
+    // D8: a V2 path needs at least [tokenIn, tokenOut]; a 1-element path names
+    // no destination, so both endpoints stay null and the leg is refused.
+    const usable = path.length >= 2;
+    return {
+      command,
+      recipient,
+      amountIn,
+      amountOutMin,
+      payerIsUser,
+      tokenIn: usable ? (path[0] as Address) : null,
+      tokenOut: usable ? (path[path.length - 1] as Address) : null,
+    };
   }
   return null; // not a V2/V3 exact-input leg -- the caller rejects it
 }
 
 export interface UniversalRouterExpectation {
   tokenIn: string;
+  /**
+   * D8: the OFFICIAL configured quote asset (USDG). Every leg's path must end
+   * here. Supplied by the caller from config -- never taken from a quote, a
+   * swap response or the calldata itself.
+   */
+  tokenOut: string;
   amountInRaw: bigint;
+  /**
+   * The minimum output THIS project computed from the quote and the slippage
+   * tier it asked for (`tradingApiClient.computeMinOutputAmount`), not the
+   * API's own echoed minimum. D8 binds the calldata to it.
+   */
   minOutputAmountRaw: bigint;
   minReceivedRequired: boolean;
   /** The wallet that must receive the output. */
@@ -213,6 +246,7 @@ export function assertUniversalRouterCallSafe(data: string, expected: UniversalR
 
   // 2. every command, in order -- nothing is skipped or tolerated
   let total = 0n;
+  let totalMinOut = 0n;
   let legs = 0;
   decoded.commands.forEach((c, i) => {
     if (SIGNATURE_COMMANDS.has(c)) {
@@ -249,6 +283,20 @@ export function assertUniversalRouterCallSafe(data: string, expected: UniversalR
     if (leg.tokenIn.toLowerCase() !== expected.tokenIn.toLowerCase()) {
       throw new UniversalRouterCalldataError(`universal router swap leg ${i} sells token ${leg.tokenIn}, but this swap was quoted for ${expected.tokenIn}`);
     }
+    // D8 FIX 3: where the leg ENDS is checked as strictly as where it starts.
+    // A leg that sells the right TOKEN into the wrong asset delivers nothing
+    // this exit can account for, and the post-swap USDG balance check would
+    // only notice afterwards -- too late, the transaction is already signed.
+    if (leg.tokenOut === null) {
+      throw new UniversalRouterCalldataError(
+        `universal router swap leg ${i} has a path that names no output token, so the leg is refused rather than the output check skipped`,
+      );
+    }
+    if (leg.tokenOut.toLowerCase() !== expected.tokenOut.toLowerCase()) {
+      throw new UniversalRouterCalldataError(
+        `universal router swap leg ${i} pays out ${leg.tokenOut}, but every exit leg must end at the configured quote asset ${expected.tokenOut}`,
+      );
+    }
     if (leg.amountIn <= 0n) throw new UniversalRouterCalldataError(`universal router swap leg ${i} has a non-positive input amount ${leg.amountIn}`);
     if (leg.recipient.toLowerCase() !== expected.recipient.toLowerCase()) {
       throw new UniversalRouterCalldataError(`universal router swap leg ${i} sends output to ${leg.recipient}, but this exit expects ${expected.recipient}`);
@@ -263,6 +311,7 @@ export function assertUniversalRouterCallSafe(data: string, expected: UniversalR
       throw new UniversalRouterCalldataError(`universal router swap leg ${i} carries a zero amountOutMin -- an unbounded leg is refused on every exit`);
     }
     total += leg.amountIn;
+    totalMinOut += leg.amountOutMin;
     legs += 1;
   });
 
@@ -274,6 +323,36 @@ export function assertUniversalRouterCallSafe(data: string, expected: UniversalR
       `universal router swap legs sell ${total} of the token in total across ${legs} leg(s), but exactly ${expected.amountInRaw} was requested ` +
         `(${short ? 'short' : 'over'} by ${short ? expected.amountInRaw - total : total - expected.amountInRaw})`,
     );
+  }
+
+  // 5. D8 FIX 4: bind the calldata's minimums to OUR OWN computed minimum.
+  //
+  // `amountOutMin > 0` per leg (checked above) only rules out a completely
+  // unbounded leg: 1 wei is > 0 and would let the whole exit fill at any
+  // price. What the wallet actually receives is at least the SUM of the legs'
+  // router-enforced minimums, all of which pay this wallet in the configured
+  // quote asset (both facts are enforced per leg above), so that sum is the
+  // real floor on this transaction and is what must meet the policy minimum
+  // `minOutputAmountRaw` -- derived locally from the quote's expected output
+  // and the slippage tier we asked for, never from the API's echoed minimum.
+  //
+  // Per-leg PROPORTIONAL floors are deliberately not asserted: a split route's
+  // legs price differently, only their aggregate is quoted, and inventing a
+  // per-leg share would reject legitimate splits while adding nothing -- the
+  // aggregate bound already covers every leg, since each leg's minimum is a
+  // positive summand of it.
+  if (expected.minReceivedRequired) {
+    if (expected.minOutputAmountRaw <= 0n) {
+      throw new UniversalRouterCalldataError(
+        'minimum-received protection is enabled but no policy minimum was computed for this swap -- refusing to validate router minimums against nothing (fail closed)',
+      );
+    }
+    if (totalMinOut < expected.minOutputAmountRaw) {
+      throw new UniversalRouterCalldataError(
+        `universal router swap legs guarantee only ${totalMinOut} of ${expected.tokenOut} in total across ${legs} leg(s), ` +
+          `below the ${expected.minOutputAmountRaw} this exit's slippage policy requires (short by ${expected.minOutputAmountRaw - totalMinOut})`,
+      );
+    }
   }
   return decoded;
 }

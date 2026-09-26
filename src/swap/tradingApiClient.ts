@@ -210,6 +210,10 @@ export class TradingApiSwapClient implements SwapExecutor {
       minReceivedRequired: config.rules.exits.MIN_RECEIVED_PROTECTION_ENABLED,
       targets: config.uniswapTradingApi.executionTargets,
       tokenIn,
+      // D8: every leg's path must END at the OFFICIAL configured quote asset --
+      // the same constant the quote request's `tokenOut` was built from, taken
+      // from config here rather than echoed back from the API's response.
+      tokenOut: QUOTE_ASSET.ADDRESS,
       identityGate: getExecutionTargetVerification(),
       // CASE A (direct Universal Router) additionally checks that the output
       // goes to THIS wallet and that the router deadline has not already

@@ -47,7 +47,7 @@ describe('runExitAndOpenResumeCycle', () => {
     // so it actually stays CLOSING through this cycle call, rather than
     // completing immediately via the default fake deps.
     const deps = createFakeAppDeps({
-      buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n }, { broadcastRaw: vi.fn(async () => { throw new Error('ECONNRESET'); }) })),
+      buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n, tokenProceedsRaw: USDG(500) }, { broadcastRaw: vi.fn(async () => { throw new Error('ECONNRESET'); }) })),
     });
     // A non-terminal, old-enough-to-be-flagged attempt.
     const attempt = await deps.txAttempts.create('deploy:stuck:1', 'test');
@@ -89,7 +89,7 @@ describe('runExitAndOpenResumeCycle', () => {
       // CLOSING through the first cycle call, isolating this test to the
       // stuck-detection reporting logic rather than the full exit flow.
       const deps = createFakeAppDeps({
-        buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n }, { broadcastRaw: vi.fn(async () => { throw new Error('ECONNRESET'); }) })),
+        buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n, tokenProceedsRaw: USDG(500) }, { broadcastRaw: vi.fn(async () => { throw new Error('ECONNRESET'); }) })),
       });
       const created = await deps.positions.create(makeCreateInput({ tokenAddress: '0x0000000000000000000000000000000000000031' }));
       await deps.positions.markActive(created.id, '1', new Date());

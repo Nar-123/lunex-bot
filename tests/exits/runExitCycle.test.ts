@@ -56,7 +56,7 @@ async function makeDeps(overrides: { livePositionState?: LivePositionStateProvid
     swapExecutor: fakeSwapExecutor,
     tokenGrantPreflight: grantAlreadyValid,
     settings: new InMemorySettingsRepository(),
-    buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n })),
+    buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n, tokenProceedsRaw: USDG(100) })),
     buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n })),
     readTokenBalance: vi.fn(async () => USDG(100)),
     readAllowance: vi.fn(async () => 0n),
@@ -419,7 +419,7 @@ describe('runExitCycle', () => {
 
       const removeKey = `exit:${created.id}:1:removeLiquidity`;
       const removeAttempt = await txAttempts.create(removeKey, 'exit:removeLiquidity');
-      await txAttempts.update(removeAttempt.id, { status: 'VERIFIED', verifyData: { liquidityZero: true, usdgProceedsRaw: 0n } });
+      await txAttempts.update(removeAttempt.id, { status: 'VERIFIED', verifyData: { liquidityZero: true, usdgProceedsRaw: 0n, tokenProceedsRaw: USDG(100) } });
 
       const results = await runExitCycle({
         positions,
@@ -464,7 +464,7 @@ describe('runExitCycle', () => {
           broadcastRaw: vi.fn(async () => { throw new Error('ECONNRESET'); }), // ambiguous -- never advances past SIGNED
           waitForReceipt: vi.fn(async () => ({ status: 'success' as const, blockNumber: 1n })),
           getReceiptIfAvailable: vi.fn(async () => null),
-          verifyOnChain: vi.fn(async () => ({ ok: true as const, data: { liquidityZero: true as const, usdgProceedsRaw: 0n } })),
+          verifyOnChain: vi.fn(async () => ({ ok: true as const, data: { liquidityZero: true as const, usdgProceedsRaw: 0n, tokenProceedsRaw: USDG(100) } })),
         };
       };
 

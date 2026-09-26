@@ -206,8 +206,8 @@ describe('Permit2-enabled exit flow (real SQLite, real migrations)', () => {
     const rows = await rowsFor(position.closeIdempotencyKey!);
     expect(rows).toHaveLength(2);
     expect(new Set(rows.map((r) => r.idempotencyKey)).size).toBe(2);
-    expect(rows.some((r) => r.idempotencyKey.endsWith(':from0'))).toBe(true);
-    expect(rows.some((r) => r.idempotencyKey.endsWith(`:from${E1}`))).toBe(true);
+    expect(rows.some((r) => r.idempotencyKey.endsWith(':from0:r0'))).toBe(true);
+    expect(rows.some((r) => r.idempotencyKey.endsWith(`:from${E1}:r0`))).toBe(true);
   });
 
   it('a failed approval leaves the position CLOSING, with no swap attempt row', async () => {
