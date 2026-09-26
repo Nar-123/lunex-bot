@@ -242,10 +242,12 @@ function harness(ctx: Ctx, o: HarnessOptions) {
 }
 
 describe('HIGH-1: the ON-CHAIN allowance decides, the provider is advisory only', () => {
-  it('A. allowance 0 and the API says needsApproval=false -> the approval STILL happens (the live MEME regression)', async () => {
-    // Reproduces the case found on 2026-09-26: a clean wallet, MEME, on-chain
-    // TOKEN->Permit2 allowance 0, and the Trading API answering `false`. Before
-    // HIGH-1 the leg was skipped and the swap died at simulation.
+  it('A. allowance 0 and the API says needsApproval=false -> the approval STILL happens', async () => {
+    // The invariant that matters regardless of any particular token's behaviour:
+    // a remote `false` can never suppress an approval the chain requires. (On
+    // chain 4663 the two live tokens differ -- MEME grants Permit2 an infinite
+    // allowance in its own contract, PONS starts at 0 -- which is exactly why
+    // the decision must be read locally rather than asked for.)
     const ctx = await scenario();
     const h = harness(ctx, { spender: null, needsApproval: false, tokenAllowanceRaw: 0n });
 

@@ -603,12 +603,14 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
   //
   // The spender is chosen locally (the configured Permit2 -- the only spender
   // the Permit2-enabled router flow consumes) and the requirement is decided by
-  // reading the real allowance. The provider's `needsApproval` is advisory only:
-  // it was observed answering `false` for a wallet whose on-chain allowance was
-  // genuinely 0 (live, MEME, 2026-09-26), which used to skip this leg and leave
-  // the swap to fail at simulation -- safe, but an exit that could never
-  // complete on a clean wallet. A provider can no longer suppress an approval
-  // the chain says is required, nor choose the token, spender or amount.
+  // reading the real allowance, because only the chain knows it. Tokens differ:
+  // MEME hardcodes an infinite Permit2 allowance for every owner (verified
+  // 2026-09-26: `allowance(anyAddress, Permit2)` is uint256 max), so no approval
+  // is ever needed for it, while PONS starts at 0 and needs one per exit. The
+  // provider's `needsApproval` happens to describe both correctly today, but it
+  // is a remote opinion about local state: it is kept as advisory telemetry
+  // only, and can no longer suppress an approval the chain says is required,
+  // nor choose the token, spender or amount.
   {
     const spenderCheck = classifyExitApprovalSpender({
       spender: config.uniswap.v4.permit2,

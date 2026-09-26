@@ -41,7 +41,10 @@ Exit:
 4. `TOKEN.approve(Permit2, exact receipt amount)` — **created by Lunex itself**
    since the HIGH-1 fix: the on-chain allowance is the source of truth, so the
    leg runs whenever `allowance(TOKEN, wallet, Permit2) < receipt amount`, no
-   matter what the Trading API's advisory `needsApproval` says.
+   matter what the Trading API's advisory `needsApproval` says. Tokens differ on
+   this chain: MEME hardcodes an infinite Permit2 allowance for every owner, so
+   it never needs one; PONS starts at 0 and needs one per exit. Both are handled
+   without any manual pre-approval.
 5. Permit2 grant `TOKEN -> UniversalRouter` (exact amount, 24 h) — created by
    Lunex's grant leg.
 
