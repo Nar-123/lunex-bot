@@ -11,7 +11,7 @@ import type { ExitStateRepository, SwapLegBlockReason } from './types';
 import { buildRemoveLiquidityDeps as realBuildRemoveLiquidityDeps, type RemoveLiquidityVerifyData } from './removeLiquidityTx';
 import { buildSwapDeps as realBuildSwapDeps, defaultLogImpact, shouldBlockForPriceImpact, type SwapVerifyData } from './swapTx';
 import { buildApproveDeps as realBuildApproveDeps, needsApproval, type ApproveVerifyData } from './approveTx';
-import { classifyApprovalSpender } from '../swap/executionTargets';
+import { classifyExitApprovalSpender } from './exitApprovalSpender';
 import { runTokenGrantPreflight, buildTokenGrantDeps, type TokenGrantVerifyData } from './permit2GrantTx';
 import {
   resolveTokenGrantRetryGeneration,
@@ -602,31 +602,32 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
   const approvalCheck = await deps.swapExecutor.checkApproval(position.tokenAddress, amountInRaw);
   if (approvalCheck.needsApproval && approvalCheck.spender) {
     const spender = approvalCheck.spender;
-    // The spender the provider names is held to the SAME standard as a swap
-    // target: it must be an approved Universal Router or an approved SwapProxy
-    // for this chain. Granting an allowance to an unapproved contract is the
-    // one irreversible-ish step available before signing a swap, so it is
-    // refused here rather than validated later. (The embedded-router guarantee
-    // is enforced by validateSwapQuote before anything is signed; an allowance
-    // alone moves no funds.)
-    let spenderMatch: ReturnType<typeof classifyApprovalSpender>;
-    try {
-      spenderMatch = classifyApprovalSpender(spender, config.uniswapTradingApi.executionTargets);
-    } catch {
-      // malformed address / unusable policy -> treated as not approved
-      spenderMatch = null;
-    }
-    if (spenderMatch === null) {
-      const detail =
-        `provider asked to approve spender ${spender}, which is not an approved execution target for chain ` +
-        `${config.uniswapTradingApi.executionTargets.chainId} -- no approval sent`;
+    // The provider's answer decides WHETHER an allowance is needed; this policy
+    // decides WHO may receive it, and the answer is always the same: the
+    // configured Permit2, because that is the only spender the Permit2-enabled
+    // router flow consumes. Granting an allowance is the one irreversible-ish
+    // step available before signing a swap, so it is refused here rather than
+    // validated later. See `exitApprovalSpender.ts` for why this is no longer
+    // the swap-target allowlist -- which refused Permit2 and so could not exit
+    // from a wallet that had not been pre-approved elsewhere.
+    const spenderCheck = classifyExitApprovalSpender({
+      spender,
+      configuredPermit2: config.uniswap.v4.permit2,
+      amountRaw: amountInRaw,
+    });
+    if (!spenderCheck.ok) {
+      const detail = `${spenderCheck.reason} [${spenderCheck.refusal}]`;
       await noteDeterministicBlock('APPROVAL_SPENDER_NOT_APPROVED', detail, { spender });
       return { outcome: 'PENDING', reason: `exit swap blocked: ${detail}` };
     }
-    const currentAllowance = await readAllowance(position.tokenAddress, wallet, spender);
+    // From here on ONLY the policy-validated address is used -- never the raw
+    // provider value again, so a later edit cannot reintroduce an unchecked
+    // spender by reaching back into the API response.
+    const approvedSpender = spenderCheck.spender as Address;
+    const currentAllowance = await readAllowance(position.tokenAddress, wallet, approvedSpender);
     if (needsApproval(currentAllowance, amountInRaw)) {
       const approveKey = `${position.closeIdempotencyKey}:approve:${exitState.swapAttemptCount}`;
-      const approveDeps = buildApproveDeps(position.tokenAddress, spender, amountInRaw);
+      const approveDeps = buildApproveDeps(position.tokenAddress, approvedSpender, amountInRaw);
       const approveResult = await executeCriticalTransaction(approveKey, 'exit:approve', approveDeps, deps.txAttempts);
 
       if (!approveResult.ok) {

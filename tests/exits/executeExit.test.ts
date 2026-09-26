@@ -19,7 +19,13 @@ const WALLET = '0x9999999999999999999999999999999999999999' as Address;
 const TOKEN = '0x0000000000000000000000000000000000000002' as Address;
 // An APPROVED execution target (the chain's configured SwapProxy): the exit flow
 // now refuses to approve any spender that is not an approved router/proxy.
-const SPENDER = config.uniswapTradingApi.executionTargets.swapProxies[0] as Address;
+/**
+ * The ONLY spender an exit may approve: the configured Permit2 (the Universal
+ * Router pulls the TOKEN through it). The approve-leg tests below are about the
+ * leg's mechanics, so they name the spender the policy accepts -- the policy
+ * itself is pinned in `exitApprovalSpender.test.ts`.
+ */
+const SPENDER = config.uniswap.v4.permit2 as Address;
 const USDG = (n: number): bigint => BigInt(n) * 10n ** 18n;
 
 function fakeTxDeps<T>(data: T, overrides: Partial<TxSafetyDeps<T>> = {}): TxSafetyDeps<T> {
