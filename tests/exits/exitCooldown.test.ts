@@ -68,7 +68,7 @@ async function setup(reason: 'HARD_STOP_LOSS' | 'SAFETY_EXIT' | 'OOR_TIMEOUT' = 
     swapExecutor: executor(quote()),
     tokenGrantPreflight: grantAlreadyValid,
     readTokenBalance: vi.fn(async () => USDG(3)),
-    readAllowance: vi.fn(async () => 0n),
+    readAllowance: vi.fn(async () => 10n ** 30n), // HIGH-1: TOKEN->Permit2 allowance already sufficient, so the approve leg is skipped (it is not this test's subject)
     walletAddress: WALLET,
     warnLog: vi.fn(),
     ...o,

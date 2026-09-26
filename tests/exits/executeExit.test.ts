@@ -118,7 +118,7 @@ function baseDeps(overrides: Partial<ExecuteExitDeps> = {}): Omit<ExecuteExitDep
     swapExecutor: makeSwapExecutor(),
     tokenGrantPreflight: grantAlreadyValid,
     readTokenBalance: vi.fn(async () => USDG(500)),
-    readAllowance: vi.fn(async () => 0n),
+    readAllowance: vi.fn(async () => 10n ** 30n), // HIGH-1: TOKEN->Permit2 allowance already sufficient, so the approve leg is skipped (it is not this test's subject)
     walletAddress: WALLET,
     ...overrides,
   };

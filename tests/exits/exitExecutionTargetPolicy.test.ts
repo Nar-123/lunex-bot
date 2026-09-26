@@ -94,65 +94,46 @@ function deps(over: Partial<ExecuteExitDeps>, ctx: Awaited<ReturnType<typeof stu
 }
 
 describe('approval spender policy (15-18)', () => {
-  it('15. the configured PERMIT2 spender is accepted and the approve leg runs for the exact receipt amount', async () => {
-    const ctx = await stuckAfterRemoval();
-    const buildApproveDeps = vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(500) }));
-    const d = deps({ swapExecutor: swapExecutor(PERMIT2), buildApproveDeps }, ctx);
+  it('15. the approve leg runs for the exact receipt amount, to the configured Permit2, whatever the provider names', async () => {
+    for (const providerSpender of [PERMIT2, APPROVED_PROXY, APPROVED_ROUTER, LEGACY_PROXY as Address, '0x1234567890123456789012345678901234567890' as Address]) {
+      const ctx = await stuckAfterRemoval();
+      const buildApproveDeps = vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(500) }));
+      const d = deps({ swapExecutor: swapExecutor(providerSpender), buildApproveDeps, readAllowance: vi.fn(async () => 0n) }, ctx);
 
-    const outcome = await executeExit(ctx.position, d);
+      const outcome = await executeExit(ctx.position, d);
 
-    // D8: the receipt paid 5 TOKEN (the wallet holds 500) -- the approval is for the RECEIPT amount.
-    expect(buildApproveDeps).toHaveBeenCalledWith(TOKEN, PERMIT2, USDG(5));
-    expect(outcome.outcome).not.toBe('PENDING');
-    expect((await ctx.exitStates.getOrCreate(ctx.position.id)).swapLegBlockedReason).toBeNull();
+      // D8: the receipt paid 5 TOKEN (the wallet holds 500) -- the approval is
+      // for the RECEIPT amount. HIGH-1: and always to the configured Permit2.
+      expect(buildApproveDeps).toHaveBeenCalledWith(TOKEN, PERMIT2, USDG(5));
+      expect(outcome.outcome).not.toBe('PENDING');
+      expect((await ctx.exitStates.getOrCreate(ctx.position.id)).swapLegBlockedReason).toBeNull();
+    }
   });
 
-  it('15b. an approved SwapProxy is REFUSED as an ALLOWANCE spender -- being a legal call target is not authority to pull funds', async () => {
+  it('18. the approved Universal Router never receives a TOKEN ERC20 allowance, while remaining a legal SWAP target', async () => {
     const ctx = await stuckAfterRemoval();
     const buildApproveDeps = vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(500) }));
-    const outcome = await executeExit(ctx.position, deps({ swapExecutor: swapExecutor(APPROVED_PROXY), buildApproveDeps }, ctx));
+    await executeExit(ctx.position, deps({ swapExecutor: swapExecutor(APPROVED_ROUTER), buildApproveDeps, readAllowance: vi.fn(async () => 0n) }, ctx));
 
-    expect(outcome.outcome).toBe('PENDING');
-    expect(outcome.outcome === 'PENDING' ? outcome.reason : '').toMatch(/SPENDER_NOT_PERMIT2/);
-    expect(buildApproveDeps).not.toHaveBeenCalled();
-  });
-
-  it('18. the approved Universal Router is REFUSED as a TOKEN ERC20 approval spender (it pulls through Permit2, never directly)', async () => {
-    const ctx = await stuckAfterRemoval();
-    const buildApproveDeps = vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(500) }));
-    const outcome = await executeExit(ctx.position, deps({ swapExecutor: swapExecutor(APPROVED_ROUTER), buildApproveDeps }, ctx));
-
-    expect(outcome.outcome).toBe('PENDING');
-    expect(outcome.outcome === 'PENDING' ? outcome.reason : '').toMatch(/SPENDER_NOT_PERMIT2/);
-    expect(buildApproveDeps).not.toHaveBeenCalled();
-    // the router remains a legal SWAP TARGET -- only the allowance is refused
+    const spenders = buildApproveDeps.mock.calls.map((c) => String((c as unknown[])[1]).toLowerCase());
+    expect(spenders).not.toContain(APPROVED_ROUTER.toLowerCase());
+    expect(spenders).toEqual([PERMIT2.toLowerCase()]);
+    // the router remains a legal SWAP TARGET -- only the allowance is withheld
     expect(config.uniswapTradingApi.executionTargets.universalRouters.map((r) => r.toLowerCase())).toContain(APPROVED_ROUTER.toLowerCase());
   });
 
-  it('16. the DEPRECATED legacy proxy spender is refused -- no approval is built, a durable block is recorded', async () => {
-    const ctx = await stuckAfterRemoval();
-    const buildApproveDeps = vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(500) }));
-    const buildSwapDeps = vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n }));
-    const d = deps({ swapExecutor: swapExecutor(LEGACY_PROXY as Address), buildApproveDeps, buildSwapDeps }, ctx);
+  it('16/17. neither the deprecated legacy proxy nor an arbitrary API spender can ever receive the allowance', async () => {
+    for (const rogue of [LEGACY_PROXY as Address, '0x1234567890123456789012345678901234567890' as Address]) {
+      const ctx = await stuckAfterRemoval();
+      const buildApproveDeps = vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(500) }));
+      await executeExit(ctx.position, deps({ swapExecutor: swapExecutor(rogue), buildApproveDeps, readAllowance: vi.fn(async () => 0n) }, ctx));
 
-    const outcome = await executeExit(ctx.position, d);
-
-    expect(outcome).toMatchObject({ outcome: 'PENDING' });
-    expect(outcome.outcome === 'PENDING' ? outcome.reason : '').toMatch(/SPENDER_NOT_PERMIT2/);
-    expect(buildApproveDeps).not.toHaveBeenCalled();
-    expect(buildSwapDeps).not.toHaveBeenCalled();
-    expect(await ctx.txAttempts.find(`${ctx.position.closeIdempotencyKey}:approve:0`)).toBeNull();
-    const state = await ctx.exitStates.getOrCreate(ctx.position.id);
-    expect(decodeBlockReason(state.swapLegBlockedReason).reason).toBe('APPROVAL_SPENDER_NOT_APPROVED');
-    expect(state.swapLegBlockedSince).not.toBeNull();
-  });
-
-  it('17. an arbitrary API-provided spender is refused the same way', async () => {
-    const ctx = await stuckAfterRemoval();
-    const buildApproveDeps = vi.fn(() => fakeTxDeps({ allowanceRaw: USDG(500) }));
-    const outcome = await executeExit(ctx.position, deps({ swapExecutor: swapExecutor('0x1234567890123456789012345678901234567890' as Address), buildApproveDeps }, ctx));
-    expect(outcome.outcome).toBe('PENDING');
-    expect(buildApproveDeps).not.toHaveBeenCalled();
+      const spenders = buildApproveDeps.mock.calls.map((c) => String((c as unknown[])[1]).toLowerCase());
+      expect(spenders).not.toContain(rogue.toLowerCase());
+      expect(spenders).toEqual([PERMIT2.toLowerCase()]);
+      // and the ERC20 approval that WAS built is for the exact receipt amount
+      expect(buildApproveDeps).toHaveBeenCalledWith(TOKEN, PERMIT2, USDG(5));
+    }
   });
 
   it('25. a refused spender never mutates the position (still CLOSING, same key, same entry amount)', async () => {

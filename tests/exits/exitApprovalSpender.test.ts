@@ -161,12 +161,12 @@ const grantValid = (): TokenGrantAssessment =>
     expectedToken: TOKEN,
     spender: UR,
     targets: { chainId: 4663, universalRouters: [UR], swapProxies: [] },
-    grant: { amount: RECEIPT_TOKEN, expiration: NOW + 86_400, nonce: 0 },
-    requiredAmount: RECEIPT_TOKEN,
+    grant: { amount: 2n ** 159n, expiration: NOW + 86_400, nonce: 0 },
+    requiredAmount: 1n,
     chainTimestamp: NOW,
   });
 
-async function scenario() {
+async function scenario(receiptTokenRaw: bigint = RECEIPT_TOKEN) {
   const positions = new InMemoryPositionRepository();
   const exitStates = new InMemoryExitStateRepository();
   const txAttempts = new InMemoryTransactionAttemptRepository();
@@ -180,20 +180,39 @@ async function scenario() {
     swapMinOutputAmountRaw: null, swapVerifiedUsdgIncreaseRaw: null, swapLegBlockedReason: null, swapLegBlockedSince: null, swapLegLastCheckedAt: null,
   } as never);
   const remove = await txAttempts.create(`${position.closeIdempotencyKey}:removeLiquidity`, 'exit:removeLiquidity');
-  await txAttempts.update(remove.id, { status: 'VERIFIED', txHash: `0x${'ee'.repeat(32)}`, verifyData: { liquidityZero: true, usdgProceedsRaw: U(400), tokenProceedsRaw: RECEIPT_TOKEN } });
+  await txAttempts.update(remove.id, { status: 'VERIFIED', txHash: `0x${'ee'.repeat(32)}`, verifyData: { liquidityZero: true, usdgProceedsRaw: U(400), tokenProceedsRaw: receiptTokenRaw } });
   return { positions, exitStates, txAttempts, position };
 }
 type Ctx = Awaited<ReturnType<typeof scenario>>;
 
 /** `tokenAllowanceRaw` is the wallet's CURRENT TOKEN->spender ERC20 allowance. */
-function harness(ctx: Ctx, o: { spender: Address | null; needsApproval: boolean; tokenAllowanceRaw?: bigint }) {
+interface HarnessOptions {
+  spender: Address | null;
+  needsApproval: boolean;
+  tokenAllowanceRaw?: bigint;
+  /** The receipt-proven TOKEN amount this exit sells (D8 FIX 1). */
+  receiptTokenRaw?: bigint;
+  /** Wallet TOKEN balance -- only ever a floor check. */
+  walletTokenRaw?: bigint;
+  /** The on-chain allowance read fails. */
+  allowanceThrows?: boolean;
+  /** The provider's advisory check_approval call fails. */
+  checkApprovalThrows?: boolean;
+}
+
+function harness(ctx: Ctx, o: HarnessOptions) {
+  const receipt = o.receiptTokenRaw ?? RECEIPT_TOKEN;
   const approveCalls: { token: Address; spender: Address; amount: bigint }[] = [];
-  const quote = (): SwapQuote => ({
-    amountInRaw: RECEIPT_TOKEN, expectedAmountOutRaw: U(2), minOutputAmountRaw: U(1), priceImpactPct: 0.001, slippageBps: 100, providerQuote: {}, permitDataPresent: true,
+  const quotedAmounts: bigint[] = [];
+  const quote = (amountInRaw: bigint): SwapQuote => ({
+    amountInRaw, expectedAmountOutRaw: U(2), minOutputAmountRaw: U(1), priceImpactPct: 0.001, slippageBps: 100, providerQuote: {}, permitDataPresent: true,
   });
   const swapExecutor: SwapExecutor = {
-    getQuote: vi.fn(async () => quote()),
-    checkApproval: vi.fn(async () => ({ needsApproval: o.needsApproval, spender: o.spender })),
+    getQuote: vi.fn(async (_t: Address, amountInRaw: bigint) => { quotedAmounts.push(amountInRaw); return quote(amountInRaw); }),
+    checkApproval: vi.fn(async () => {
+      if (o.checkApprovalThrows) throw new Error('check_approval unavailable');
+      return { needsApproval: o.needsApproval, spender: o.spender };
+    }),
     buildSwapTx: vi.fn(),
   };
   const buildApproveDeps = vi.fn((token: Address, spender: Address, amount: bigint) => {
@@ -201,75 +220,159 @@ function harness(ctx: Ctx, o: { spender: Address | null; needsApproval: boolean;
     return fakeTxDeps({ allowanceRaw: amount });
   });
   const warnLog = vi.fn();
+  const swapSign = vi.fn(async () => ({ raw: '0x02' as `0x${string}`, hash: `0x${'22'.repeat(32)}` as `0x${string}` }));
+  const tokenGrantPreflight = vi.fn(async () => grantValid());
   const deps: ExecuteExitDeps = {
     positions: ctx.positions, exitStates: ctx.exitStates, txAttempts: ctx.txAttempts,
     livePositionState: { getLiveState: vi.fn() }, poolPrice: { getPriceState: vi.fn() },
     swapExecutor,
-    readTokenBalance: vi.fn(async () => RECEIPT_TOKEN),
-    readAllowance: vi.fn(async () => o.tokenAllowanceRaw ?? 0n),
+    readTokenBalance: vi.fn(async () => o.walletTokenRaw ?? receipt),
+    readAllowance: vi.fn(async () => {
+      if (o.allowanceThrows) throw new Error('RPC down: allowance unreadable');
+      return o.tokenAllowanceRaw ?? 0n;
+    }),
     walletAddress: WALLET,
-    tokenGrantPreflight: vi.fn(async () => grantValid()),
-    buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: U(400), tokenProceedsRaw: RECEIPT_TOKEN } as never)),
-    buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: U(2), usdgProceedsRaw: U(2) })) as never,
+    tokenGrantPreflight,
+    buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: U(400), tokenProceedsRaw: receipt } as never)),
+    buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: U(2), usdgProceedsRaw: U(2) }, { signTransaction: swapSign })) as never,
     buildApproveDeps: buildApproveDeps as never,
     warnLog,
   };
-  return { deps, approveCalls, buildApproveDeps, swapExecutor, warnLog };
+  return { deps, approveCalls, quotedAmounts, buildApproveDeps, swapExecutor, warnLog, swapSign, tokenGrantPreflight };
 }
 
-describe('the exit flow applies the policy', () => {
-  it('I. FRESH wallet (TOKEN allowance 0, API names Permit2) -> the approve leg runs for Permit2 and the exit completes', async () => {
+describe('HIGH-1: the ON-CHAIN allowance decides, the provider is advisory only', () => {
+  it('A. allowance 0 and the API says needsApproval=false -> the approval STILL happens (the live MEME regression)', async () => {
+    // Reproduces the case found on 2026-09-26: a clean wallet, MEME, on-chain
+    // TOKEN->Permit2 allowance 0, and the Trading API answering `false`. Before
+    // HIGH-1 the leg was skipped and the swap died at simulation.
     const ctx = await scenario();
-    const h = harness(ctx, { spender: PERMIT2, needsApproval: true, tokenAllowanceRaw: 0n });
+    const h = harness(ctx, { spender: null, needsApproval: false, tokenAllowanceRaw: 0n });
 
     const out = await executeExit(ctx.position, h.deps);
 
     expect(out).toEqual({ outcome: 'CLOSED' });
-    // E. exactly one approval, for the configured Permit2, for the exact
-    // receipt-proven amount -- never unlimited.
     expect(h.approveCalls).toEqual([{ token: TOKEN, spender: PERMIT2, amount: RECEIPT_TOKEN }]);
-    expect(h.approveCalls[0]!.amount).not.toBe(2n ** 256n - 1n);
-    const approveRow = await ctx.txAttempts.find(`${ctx.position.closeIdempotencyKey}:approve:0`);
-    expect(approveRow?.status).toBe('VERIFIED');
+    const row = await ctx.txAttempts.find(`${ctx.position.closeIdempotencyKey}:approve:0`);
+    expect(row?.status).toBe('VERIFIED');
+    // the disagreement is recorded for telemetry, never acted on
+    expect(h.warnLog).toHaveBeenCalledWith('exit_approval_provider_disagrees', expect.objectContaining({ providerNeedsApproval: false, onChainAllowanceRaw: '0' }));
   });
 
-  it('B/D. an unknown spender, and the Universal Router, both block the exit with no approval built', async () => {
-    for (const spender of ['0x1234567890123456789012345678901234567890' as Address, UR, LEGACY_PROXY, APPROVED_PROXY]) {
-      const ctx = await scenario();
-      const h = harness(ctx, { spender, needsApproval: true, tokenAllowanceRaw: 0n });
-
-      const out = await executeExit(ctx.position, h.deps);
-
-      expect(out.outcome).toBe('PENDING');
-      if (out.outcome === 'PENDING') expect(out.reason).toMatch(/exit swap blocked: .*SPENDER_NOT_PERMIT2/);
-      expect(h.buildApproveDeps).not.toHaveBeenCalled();
-      expect(await ctx.txAttempts.find(`${ctx.position.closeIdempotencyKey}:approve:0`)).toBeNull();
-      // nothing was signed for the swap either
-      expect(await ctx.txAttempts.find(`${ctx.position.closeIdempotencyKey}:swap:0`)).toBeNull();
-      expect((await ctx.positions.findById(ctx.position.id))?.status).toBe('CLOSING');
-    }
-  });
-
-  it('the refusal is recorded as a DETERMINISTIC block, so the provider is not re-asked every tick', async () => {
+  it('B. allowance BELOW the receipt amount and the API says false -> the approval still happens', async () => {
     const ctx = await scenario();
-    const h = harness(ctx, { spender: UR, needsApproval: true, tokenAllowanceRaw: 0n });
-    await executeExit(ctx.position, h.deps);
-    const state = await ctx.exitStates.getOrCreate(ctx.position.id);
-    expect(state.swapLegBlockedReason).toMatch(/APPROVAL_SPENDER_NOT_APPROVED/);
-    expect(h.warnLog).toHaveBeenCalledWith('exit_token_leg_unactionable', expect.objectContaining({ cause: 'APPROVAL_SPENDER_NOT_APPROVED' }));
+    const h = harness(ctx, { spender: null, needsApproval: false, tokenAllowanceRaw: RECEIPT_TOKEN - 1n });
+    expect((await executeExit(ctx.position, h.deps)).outcome).toBe('CLOSED');
+    expect(h.approveCalls).toEqual([{ token: TOKEN, spender: PERMIT2, amount: RECEIPT_TOKEN }]);
   });
 
-  it('J. unchanged behaviour: when the API reports no approval needed, no approve leg runs and the exit still completes', async () => {
+  it('C. allowance SUFFICIENT and the API says true -> NO approval is sent', async () => {
     const ctx = await scenario();
-    const h = harness(ctx, { spender: null, needsApproval: false });
+    const h = harness(ctx, { spender: PERMIT2, needsApproval: true, tokenAllowanceRaw: RECEIPT_TOKEN });
+    expect((await executeExit(ctx.position, h.deps)).outcome).toBe('CLOSED');
+    expect(h.buildApproveDeps).not.toHaveBeenCalled();
+    expect(await ctx.txAttempts.find(`${ctx.position.closeIdempotencyKey}:approve:0`)).toBeNull();
+  });
+
+  it('D. allowance SUFFICIENT and the API says false -> NO approval is sent', async () => {
+    const ctx = await scenario();
+    const h = harness(ctx, { spender: null, needsApproval: false, tokenAllowanceRaw: RECEIPT_TOKEN * 2n });
     expect((await executeExit(ctx.position, h.deps)).outcome).toBe('CLOSED');
     expect(h.buildApproveDeps).not.toHaveBeenCalled();
   });
 
-  it('J2. unchanged behaviour: a sufficient existing TOKEN -> Permit2 allowance skips the approve leg (no redundant approval)', async () => {
+  it('E. a MALICIOUS provider spender cannot redirect the allowance -- the configured Permit2 is used', async () => {
+    for (const rogue of [UR, APPROVED_PROXY, LEGACY_PROXY, '0x1234567890123456789012345678901234567890' as Address]) {
+      const ctx = await scenario();
+      const h = harness(ctx, { spender: rogue, needsApproval: true, tokenAllowanceRaw: 0n });
+      expect((await executeExit(ctx.position, h.deps)).outcome).toBe('CLOSED');
+      expect(h.approveCalls).toEqual([{ token: TOKEN, spender: PERMIT2, amount: RECEIPT_TOKEN }]);
+      expect(h.approveCalls.map((c) => c.spender.toLowerCase())).not.toContain(rogue.toLowerCase());
+      expect(h.warnLog).toHaveBeenCalledWith('exit_approval_provider_disagrees', expect.objectContaining({ providerSpender: rogue }));
+    }
+  });
+
+  it('F. the comparison uses the EXACT receipt amount, at the boundary in both directions', async () => {
+    // allowance == receipt -> skip; allowance == receipt-1 -> approve
+    const exact = await scenario(RECEIPT_TOKEN);
+    const hExact = harness(exact, { spender: null, needsApproval: false, tokenAllowanceRaw: RECEIPT_TOKEN });
+    expect((await executeExit(exact.position, hExact.deps)).outcome).toBe('CLOSED');
+    expect(hExact.buildApproveDeps).not.toHaveBeenCalled();
+
+    // a DIFFERENT receipt amount moves the boundary with it
+    const bigger = await scenario(RECEIPT_TOKEN * 10n);
+    const hBigger = harness(bigger, { spender: null, needsApproval: false, tokenAllowanceRaw: RECEIPT_TOKEN, receiptTokenRaw: RECEIPT_TOKEN * 10n });
+    expect((await executeExit(bigger.position, hBigger.deps)).outcome).toBe('CLOSED');
+    expect(hBigger.approveCalls).toEqual([{ token: TOKEN, spender: PERMIT2, amount: RECEIPT_TOKEN * 10n }]);
+    expect(hBigger.deps.readAllowance).toHaveBeenCalledWith(TOKEN, WALLET, PERMIT2);
+  });
+
+  it('G. a wallet balance far LARGER than the receipt amount does not widen the approval', async () => {
     const ctx = await scenario();
-    const h = harness(ctx, { spender: PERMIT2, needsApproval: true, tokenAllowanceRaw: RECEIPT_TOKEN });
+    const h = harness(ctx, { spender: null, needsApproval: false, tokenAllowanceRaw: 0n, walletTokenRaw: RECEIPT_TOKEN * 1000n });
     expect((await executeExit(ctx.position, h.deps)).outcome).toBe('CLOSED');
+    expect(h.approveCalls).toEqual([{ token: TOKEN, spender: PERMIT2, amount: RECEIPT_TOKEN }]);
+    expect(h.quotedAmounts).toEqual([RECEIPT_TOKEN]);
+  });
+
+  it('G2. the allowance is compared against the RECEIPT amount, not the wallet balance', async () => {
+    // allowance sits BETWEEN the receipt amount and the (much larger) wallet
+    // balance: comparing against the balance would approve needlessly, and would
+    // re-approve on every tick for as long as the wallet held unrelated TOKEN.
+    const ctx = await scenario();
+    const h = harness(ctx, {
+      spender: null,
+      needsApproval: false,
+      tokenAllowanceRaw: RECEIPT_TOKEN + 1n,
+      walletTokenRaw: RECEIPT_TOKEN * 1000n,
+    });
+
+    expect((await executeExit(ctx.position, h.deps)).outcome).toBe('CLOSED');
+
+    expect(h.buildApproveDeps).not.toHaveBeenCalled();
+    expect(await ctx.txAttempts.find(`${ctx.position.closeIdempotencyKey}:approve:0`)).toBeNull();
+  });
+
+  it('H. an allowance READ FAILURE fails closed: no approval, no grant, no swap', async () => {
+    const ctx = await scenario();
+    const h = harness(ctx, { spender: null, needsApproval: false, tokenAllowanceRaw: 0n, allowanceThrows: true });
+
+    const out = await executeExit(ctx.position, h.deps);
+
+    expect(out.outcome).toBe('PENDING');
+    if (out.outcome === 'PENDING') expect(out.reason).toMatch(/could not read the TOKEN allowance to Permit2/);
+    expect(h.buildApproveDeps).not.toHaveBeenCalled();
+    expect(h.tokenGrantPreflight).not.toHaveBeenCalled();
+    expect(h.swapSign).not.toHaveBeenCalled();
+    expect((await ctx.positions.findById(ctx.position.id))?.status).toBe('CLOSING');
+  });
+
+  it('I. a provider that THROWS on check_approval cannot stop the approval the chain requires', async () => {
+    const ctx = await scenario();
+    const h = harness(ctx, { spender: null, needsApproval: false, tokenAllowanceRaw: 0n, checkApprovalThrows: true });
+    expect((await executeExit(ctx.position, h.deps)).outcome).toBe('CLOSED');
+    expect(h.approveCalls).toEqual([{ token: TOKEN, spender: PERMIT2, amount: RECEIPT_TOKEN }]);
+    expect(h.warnLog).toHaveBeenCalledWith('exit_approval_provider_unavailable', expect.objectContaining({ positionId: ctx.position.id }));
+  });
+
+  it('J. two concurrent exits produce exactly ONE approval transaction', async () => {
+    const ctx = await scenario();
+    const a = harness(ctx, { spender: null, needsApproval: false, tokenAllowanceRaw: 0n });
+    const b = harness(ctx, { spender: null, needsApproval: false, tokenAllowanceRaw: 0n });
+
+    const [ra, rb] = await Promise.all([executeExit(ctx.position, a.deps), executeExit(ctx.position, b.deps)]);
+
+    expect(a.approveCalls.length + b.approveCalls.length).toBe(1);
+    const rows = await ctx.txAttempts.findByKeyPrefixes([`${ctx.position.closeIdempotencyKey}:approve:`]);
+    expect(rows).toHaveLength(1);
+    expect([ra.outcome, rb.outcome].filter((o) => o === 'PENDING')).toHaveLength(1);
+  });
+
+  it('no approval is attempted when the exit has nothing to sell (USDG-only close)', async () => {
+    const ctx = await scenario(0n);
+    const h = harness(ctx, { spender: null, needsApproval: false, tokenAllowanceRaw: 0n, receiptTokenRaw: 0n });
+    const out = await executeExit(ctx.position, h.deps);
+    expect(out.outcome).not.toBe('SWAP_FAILED_RETRY_PENDING');
     expect(h.buildApproveDeps).not.toHaveBeenCalled();
   });
 
@@ -281,10 +384,11 @@ describe('the exit flow applies the policy', () => {
     expect(h.deps.readAllowance).toHaveBeenCalledWith(TOKEN, WALLET, PERMIT2);
   });
 
-  it('J3. an insufficient existing allowance still tops up to the exact receipt amount', async () => {
+  it('an insufficient allowance tops up to exactly the receipt amount, never more', async () => {
     const ctx = await scenario();
     const h = harness(ctx, { spender: PERMIT2, needsApproval: true, tokenAllowanceRaw: RECEIPT_TOKEN - 1n });
     expect((await executeExit(ctx.position, h.deps)).outcome).toBe('CLOSED');
     expect(h.approveCalls).toEqual([{ token: TOKEN, spender: PERMIT2, amount: RECEIPT_TOKEN }]);
+    expect(h.approveCalls[0]!.amount).not.toBe(2n ** 256n - 1n);
   });
 });

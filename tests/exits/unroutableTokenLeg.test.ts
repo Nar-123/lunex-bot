@@ -76,7 +76,7 @@ async function setup() {
     buildRemoveLiquidityDeps: vi.fn(() => removeDeps),
     buildSwapDeps: vi.fn(() => swapDeps),
     readTokenBalance: vi.fn(async () => RESIDUAL),
-    readAllowance: vi.fn(async () => 0n),
+    readAllowance: vi.fn(async () => 10n ** 30n), // HIGH-1: TOKEN->Permit2 allowance already sufficient, so the approve leg is skipped (it is not this test's subject)
     walletAddress: WALLET,
     warnLog: vi.fn(),
     ...o,

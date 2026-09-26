@@ -173,19 +173,27 @@ describe('deterministic block survives a passing impact gate', () => {
     expect(after.swapLegBlockedSince!.getTime()).toBeGreaterThan(since.getTime()); // fresh condition, evaluated now
   });
 
-  it('an approval-spender block behaves the same way (deterministic, preserved)', async () => {
+  it('HIGH-1: a rogue provider spender creates NO block and cannot redirect the approval -- the configured Permit2 is used', async () => {
+    // Before HIGH-1 this produced an APPROVAL_SPENDER_NOT_APPROVED block, because
+    // the provider's spender was consulted at all. It no longer is: the chain
+    // decides whether an approval is needed and config decides who receives it.
+    // (Deterministic-block preservation itself is covered by the
+    // TARGET_NOT_APPROVED tests above.)
     const rogue = () => ({ ...executor(0.001), checkApproval: vi.fn(async () => ({ needsApproval: true, spender: '0x02E5be68D46DAc0B524905bfF209cf47EE6dB2a9' as Address })) });
     const ctx = await scenario(null);
-    await executeExit(ctx.position, deps(ctx, { swapExecutor: rogue() as never, readAllowance: vi.fn(async () => 0n) }));
+    const approveCalls: { token: string; spender: string; amount: bigint }[] = [];
+    const buildApproveDeps = vi.fn((token: Address, spender: Address, amount: bigint) => {
+      approveCalls.push({ token, spender, amount });
+      return fakeTxDeps({ allowanceRaw: amount });
+    });
+
+    await executeExit(ctx.position, deps(ctx, { swapExecutor: rogue() as never, readAllowance: vi.fn(async () => 0n), buildApproveDeps: buildApproveDeps as never }));
+
     const first = await ctx.exitStates.getOrCreate(ctx.position.id);
-    expect(decodeBlockReason(first.swapLegBlockedReason).reason).toBe('APPROVAL_SPENDER_NOT_APPROVED');
-    const since = await backdate(ctx, 60);
-
-    await executeExit(ctx.position, deps(ctx, { swapExecutor: rogue() as never, readAllowance: vi.fn(async () => 0n) }));
-
-    const after = await ctx.exitStates.getOrCreate(ctx.position.id);
-    expect(decodeBlockReason(after.swapLegBlockedReason).reason).toBe('APPROVAL_SPENDER_NOT_APPROVED');
-    expect(after.swapLegBlockedSince).toEqual(since);
+    expect(decodeBlockReason(first.swapLegBlockedReason).reason).not.toBe('APPROVAL_SPENDER_NOT_APPROVED');
+    expect(approveCalls).toHaveLength(1);
+    expect(approveCalls[0]!.spender.toLowerCase()).toBe(config.uniswap.v4.permit2.toLowerCase());
+    expect(approveCalls[0]!.spender.toLowerCase()).not.toBe('0x02e5be68d46dac0b524905bff209cf47ee6db2a9');
   });
 
   it('safety unchanged: nothing is signed or sent on any of these ticks', async () => {

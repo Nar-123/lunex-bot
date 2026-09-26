@@ -599,33 +599,63 @@ async function executeExitClaimed(position: PositionRecord, deps: ExecuteExitDep
   // allowance is still independently re-checked below before deciding to
   // actually broadcast anything, so a prior attempt's already-sufficient
   // approval is never redundantly re-approved.
-  const approvalCheck = await deps.swapExecutor.checkApproval(position.tokenAddress, amountInRaw);
-  if (approvalCheck.needsApproval && approvalCheck.spender) {
-    const spender = approvalCheck.spender;
-    // The provider's answer decides WHETHER an allowance is needed; this policy
-    // decides WHO may receive it, and the answer is always the same: the
-    // configured Permit2, because that is the only spender the Permit2-enabled
-    // router flow consumes. Granting an allowance is the one irreversible-ish
-    // step available before signing a swap, so it is refused here rather than
-    // validated later. See `exitApprovalSpender.ts` for why this is no longer
-    // the swap-target allowlist -- which refused Permit2 and so could not exit
-    // from a wallet that had not been pre-approved elsewhere.
+  // HIGH-1: the CHAIN is the source of truth for whether this leg is needed.
+  //
+  // The spender is chosen locally (the configured Permit2 -- the only spender
+  // the Permit2-enabled router flow consumes) and the requirement is decided by
+  // reading the real allowance. The provider's `needsApproval` is advisory only:
+  // it was observed answering `false` for a wallet whose on-chain allowance was
+  // genuinely 0 (live, MEME, 2026-09-26), which used to skip this leg and leave
+  // the swap to fail at simulation -- safe, but an exit that could never
+  // complete on a clean wallet. A provider can no longer suppress an approval
+  // the chain says is required, nor choose the token, spender or amount.
+  {
     const spenderCheck = classifyExitApprovalSpender({
-      spender,
+      spender: config.uniswap.v4.permit2,
       configuredPermit2: config.uniswap.v4.permit2,
       amountRaw: amountInRaw,
     });
     if (!spenderCheck.ok) {
       const detail = `${spenderCheck.reason} [${spenderCheck.refusal}]`;
-      await noteDeterministicBlock('APPROVAL_SPENDER_NOT_APPROVED', detail, { spender });
+      await noteDeterministicBlock('APPROVAL_SPENDER_NOT_APPROVED', detail, { spender: config.uniswap.v4.permit2 });
       return { outcome: 'PENDING', reason: `exit swap blocked: ${detail}` };
     }
-    // From here on ONLY the policy-validated address is used -- never the raw
-    // provider value again, so a later edit cannot reintroduce an unchecked
-    // spender by reaching back into the API response.
+    // From here on ONLY the policy-validated address is used -- never a provider
+    // value, so a later edit cannot reintroduce an unchecked spender.
     const approvedSpender = spenderCheck.spender as Address;
-    const currentAllowance = await readAllowance(position.tokenAddress, wallet, approvedSpender);
+
+    let currentAllowance: bigint;
+    try {
+      currentAllowance = await readAllowance(position.tokenAddress, wallet, approvedSpender);
+    } catch (err) {
+      // Not knowing the allowance is never a reason to approve blindly, nor to
+      // proceed into a swap that would revert: defer and re-read next tick.
+      return { outcome: 'PENDING', reason: `could not read the TOKEN allowance to Permit2: ${safeErrorMessage(err)}` };
+    }
+
     if (needsApproval(currentAllowance, amountInRaw)) {
+      // Best-effort telemetry ONLY, and only on the path where the chain says an
+      // approval is required: a provider that disagrees here is the exact drift
+      // that hid this bug, so it is worth recording -- but it can neither
+      // prevent nor redirect the approval, and a failing call is ignored.
+      try {
+        const providerView = await deps.swapExecutor.checkApproval(position.tokenAddress, amountInRaw);
+        const spenderDiffers = providerView.spender !== null && providerView.spender.toLowerCase() !== approvedSpender.toLowerCase();
+        if (!providerView.needsApproval || spenderDiffers) {
+          warnLog('exit_approval_provider_disagrees', {
+            positionId: position.id,
+            token: position.tokenAddress,
+            onChainAllowanceRaw: currentAllowance.toString(),
+            requiredAmountRaw: amountInRaw.toString(),
+            providerNeedsApproval: providerView.needsApproval,
+            providerSpender: providerView.spender,
+            spenderUsed: approvedSpender,
+          });
+        }
+      } catch (err) {
+        warnLog('exit_approval_provider_unavailable', { positionId: position.id, error: safeErrorMessage(err) });
+      }
+
       const approveKey = `${position.closeIdempotencyKey}:approve:${exitState.swapAttemptCount}`;
       const approveDeps = buildApproveDeps(position.tokenAddress, approvedSpender, amountInRaw);
       const approveResult = await executeCriticalTransaction(approveKey, 'exit:approve', approveDeps, deps.txAttempts);

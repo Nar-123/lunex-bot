@@ -59,7 +59,7 @@ async function makeDeps(overrides: { livePositionState?: LivePositionStateProvid
     buildRemoveLiquidityDeps: vi.fn(() => fakeTxDeps({ liquidityZero: true as const, usdgProceedsRaw: 0n, tokenProceedsRaw: USDG(100) })),
     buildSwapDeps: vi.fn(() => fakeTxDeps({ usdgIncreaseRaw: 0n, usdgProceedsRaw: 0n })),
     readTokenBalance: vi.fn(async () => USDG(100)),
-    readAllowance: vi.fn(async () => 0n),
+    readAllowance: vi.fn(async () => 10n ** 30n), // HIGH-1: TOKEN->Permit2 allowance already sufficient, so the approve leg is skipped (it is not this test's subject)
     walletAddress: WALLET,
   };
 }
