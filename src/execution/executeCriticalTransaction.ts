@@ -220,7 +220,39 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
   // `null` inside the nested `withExecutorLock` closure below -- a `let`
   // inferred from a nullable initializer loses its narrowed non-null type
   // across closure boundaries even when a human can see it's always set.
-  let attempt: TransactionAttemptRecord = (await repo.find(idempotencyKey)) ?? (await repo.create(idempotencyKey, purpose));
+  let attempt: TransactionAttemptRecord;
+  const existing = await repo.find(idempotencyKey);
+  if (existing) {
+    attempt = existing;
+  } else {
+    try {
+      attempt = await repo.create(idempotencyKey, purpose);
+    } catch (err) {
+      // Same-key race across PROCESSES: two workers can both see `find` return
+      // null, and only one `create` can win -- `idempotencyKey` is unique, so
+      // the loser's insert is rejected. That rejection is not a failure of the
+      // OPERATION, it is proof the operation already has a row: re-read it and
+      // resume that one. Anything else would either create a second attempt for
+      // one logical operation (defeating the whole idempotency contract, and
+      // able to produce two payloads) or report a FAILED verdict for a
+      // transaction nothing has even tried yet.
+      //
+      // Deliberately not matched against a Prisma error code: the test is
+      // "does the row exist now?", which is the fact that actually decides.
+      // If it does not, the create failed for a real reason and that error
+      // propagates unchanged.
+      const raced = await repo.find(idempotencyKey);
+      if (!raced) throw err instanceof Error ? err : new Error(String(err));
+      log('attempt_create_raced', {
+        idempotencyKey,
+        purpose,
+        resumedExistingId: raced.id,
+        resumedStatus: raced.status,
+        createError: safeErrorMessage(err),
+      });
+      attempt = raced;
+    }
+  }
 
   if (attempt.status === 'VERIFIED') {
     return resumeVerified(attempt, deps, repo);
