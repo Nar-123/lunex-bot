@@ -52,6 +52,10 @@ case "$LABEL" in
       MARKERS="dist/execution/nonceAllocation.js dist/discovery/childEnv.js dist/swap/validateSwapQuote.js dist/execution/transactionAttemptRepository.js"
       MK_SYM=reserveNonce; MK_FILE=dist/execution/transactionAttemptRepository.js
       MIGRATES=yes; MIGRATION=20260927000000_add_executor_scoped_nonce_reservation; AI_EXPECTED=1 ;;
+  D12) EXPECTED_SHA=cde2ba8a2a3393dfedf795a8f571b174e337380d; PREV_SHA=1780220e5a9c9f80e0246cb513df6a3c5c45ccf9
+      MARKERS="dist/execution/executeCriticalTransaction.js dist/execution/nonceAllocation.js dist/discovery/childEnv.js dist/swap/validateSwapQuote.js dist/execution/transactionAttemptRepository.js"
+      MK_SYM=attempt_create_raced; MK_FILE=dist/execution/executeCriticalTransaction.js
+      MIGRATES=no; MIGRATION=; AI_EXPECTED=1 ;;
   *) echo "ABORT: unknown label $LABEL" >&2; exit 1 ;;
 esac
 
@@ -82,7 +86,7 @@ state_line() {
 # The two build-stage exit:swap rows were non-terminal until D4 fenced them,
 # so the expected count is 2 before that deployment and 0 from D5 onwards.
 case "$LABEL" in
-  D5|D6|D8|D9|D10|D11) EXPECT_UNSIGNED_PENDING=0 ;;
+  D5|D6|D8|D9|D10|D11|D12) EXPECT_UNSIGNED_PENDING=0 ;;
   *)  EXPECT_UNSIGNED_PENDING=2 ;;
 esac
 guard_state() {
@@ -96,6 +100,7 @@ case "$LABEL" in
   D9) EXPECT_NONCE=1618 ;;   # the OLD executor, unchanged since the forensic freeze   # the OLD executor's current nonce (unchanged since the forensic freeze)
   D10) EXPECT_NONCE=1618 ;;   # the guard measures the OLD wallet (hardcoded above): assert it has NOT moved since the rotation
   D11) EXPECT_NONCE=1618 ;;   # same as D10: the guard measures the OLD wallet (hardcoded above) -- assert it has not moved
+  D12) EXPECT_NONCE=1618 ;;   # same as D11: the guard measures the OLD wallet (hardcoded above) -- assert it has not moved
   *)  EXPECT_NONCE=1609 ;;
 esac
 
