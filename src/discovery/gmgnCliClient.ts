@@ -11,6 +11,7 @@ import {
   assertValidLimit,
   type RunGmgnCliOptions,
 } from './cliExec';
+import { buildGmgnChildEnv } from './childEnv';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_RETRIES = 2;
@@ -63,10 +64,16 @@ export class GmgnCliClient implements GmgnClient {
     private readonly onTokenInfoFailure: (symbol: string, address: string, err: unknown) => void = defaultWarn,
   ) {}
 
+  /**
+   * The child gets an ALLOWLIST, never `{ ...process.env }` -- see
+   * `childEnv.ts`. Secrets still travel via env rather than argv (argv is
+   * visible to other local processes via `ps`), but the only secret in there
+   * is GMGN's own API key: never PRIVATE_KEY, JWT_SECRET, the admin password
+   * hash, the Telegram token, the Uniswap API key, DATABASE_URL or the RPC
+   * URLs (whose paths embed provider keys).
+   */
   private childEnv(): NodeJS.ProcessEnv {
-    // Secrets travel via env, never argv -- argv is visible to other local
-    // processes (e.g. `ps`), env vars passed this way are not.
-    return this.apiKey ? { ...process.env, GMGN_API_KEY: this.apiKey } : process.env;
+    return buildGmgnChildEnv(process.env, this.apiKey);
   }
 
   async getTopTokens({ interval, limit }: GetTopTokensParams): Promise<CandidateToken[]> {

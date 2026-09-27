@@ -11,6 +11,7 @@ import { config } from '../config';
 import { classifyBroadcastError } from './classifyBroadcastError';
 import { isStuckAttempt } from './stuckAttempt';
 import { ExecutorLockTimeoutError, withExecutorLock } from './executorMutex';
+import { allocateNonce } from './nonceAllocation';
 
 /**
  * Stuck-transaction incident: which pipeline step an unexpected failure
@@ -325,8 +326,46 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
 
       checkpoint = 'NONCE';
       if (notYetReached(attempt.status, 'NONCE_ASSIGNED')) {
-        const nonce = await deps.getNonce();
-        attempt = await repo.update(attempt.id, { status: 'NONCE_ASSIGNED', nonce }, attempt.version);
+        // RPC-failover fix: the chain's `pending` count is a FLOOR, not the
+        // answer. Ordered failover means consecutive nonce reads can be
+        // served by different providers, and `pending` is precisely what
+        // providers disagree about right after a broadcast -- one has the
+        // transaction in its mempool, the next does not. Persisted local
+        // state (crash-durable, shared by every writer on this database, and
+        // unable to lag a mempool) decides the rest. See
+        // `nonceAllocation.ts`. A throw from any of these three reads lands
+        // in this same NONCE checkpoint: nothing is persisted, no nonce is
+        // consumed, and the outer catch keeps the attempt resumable -- never
+        // FAILED just because one provider was unreachable or stale.
+        const chainPendingNonce = await deps.getNonce();
+        const [nonTerminal, signedAtOrAbove] = await Promise.all([
+          repo.findNonTerminal(),
+          repo.findSignedNoncesAtOrAbove(chainPendingNonce),
+        ]);
+        const reserved = nonTerminal
+          .filter((other) => other.id !== attempt.id && other.nonce !== null)
+          .map((other) => other.nonce as number);
+        const allocation = allocateNonce({ chainPendingNonce, reserved, signedAtOrAbove });
+        if (allocation.adjustedBy !== null) {
+          // Not an error: the expected, designed outcome when a provider is
+          // stale or another attempt still holds a nonce. Logged because a
+          // persistent stream of these says a provider is lagging badly.
+          log('nonce_allocation_adjusted', {
+            idempotencyKey,
+            purpose,
+            chainPendingNonce,
+            allocatedNonce: allocation.nonce,
+            adjustedBy: allocation.adjustedBy,
+            skipped: allocation.skipped,
+            reservedCount: reserved.length,
+            signedAtOrAboveCount: signedAtOrAbove.length,
+          });
+        }
+        attempt = await repo.update(
+          attempt.id,
+          { status: 'NONCE_ASSIGNED', nonce: allocation.nonce },
+          attempt.version,
+        );
       }
       const lockedNonce = attempt.nonce;
       if (lockedNonce === null) {

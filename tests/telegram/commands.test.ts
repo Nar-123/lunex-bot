@@ -89,6 +89,219 @@ describe('command handlers -- success replies', () => {
     expect(text).toContain('HARD_STOP_LOSS');
   });
 
+  it('/status renders capital with USDG decimals -- the API sends raw bigints', async () => {
+    // 1_234_567 raw = 1.234567 USDG; 3_500_000 raw = 3.5 USDG. Printed raw,
+    // these read as over a million USDG in a wallet holding a few dollars.
+    const apiClient = fakeApiClient({
+      get: vi.fn(async () => ({
+        paused: false,
+        capital: {
+          freeUsdgBalance: '1234567',
+          totalDeployedUsdg: '3500000',
+          activePositionsCount: 1,
+          exposurePct: 73.9,
+        },
+        positions: { active: 1, opening: 0, closing: 0 },
+      })) as never,
+    });
+    const { ctx, reply } = fakeCtx();
+
+    await handleStatus(apiClient, ctx);
+
+    const text = reply.mock.calls[0]?.[0] as string;
+    expect(text).toContain('Free USDG: 1.234567');
+    expect(text).toContain('Deployed USDG: 3.5');
+    expect(text).not.toContain('1234567');
+    expect(text).not.toContain('3500000');
+  });
+
+  it('/status renders a zero balance as 0, not an empty or raw string', async () => {
+    const apiClient = fakeApiClient({
+      get: vi.fn(async () => ({
+        paused: true,
+        capital: { freeUsdgBalance: '0', totalDeployedUsdg: '0', activePositionsCount: 0, exposurePct: 0 },
+        positions: { active: 0, opening: 0, closing: 0 },
+      })) as never,
+    });
+    const { ctx, reply } = fakeCtx();
+
+    await handleStatus(apiClient, ctx);
+
+    expect(reply.mock.calls[0]?.[0]).toContain('Free USDG: 0');
+  });
+
+  it('/report renders the ENTRY amount with USDG decimals too, fractional and exact', async () => {
+    const apiClient = fakeApiClient({
+      get: vi.fn(async () => ({
+        positions: [
+          {
+            tokenSymbol: 'MEME',
+            entryUsdgRaw: '2999999',
+            closedAt: '2026-09-27T00:00:00.000Z',
+            closeReason: 'TAKE_PROFIT',
+            realizedPnlAvailable: false,
+          },
+        ],
+      })) as never,
+    });
+    const { ctx, reply } = fakeCtx();
+
+    await handleReport(apiClient, ctx);
+
+    const text = reply.mock.calls[0]?.[0] as string;
+    expect(text).toContain('entry 2.999999 USDG');
+    expect(text).not.toContain('entry 2999999');
+  });
+
+  it('/stuck renders recovered USDG scaled, and leaves TOKEN residual raw and labelled', async () => {
+    const apiClient = fakeApiClient({
+      get: vi.fn(async () => ({
+        stuckTransactionAttempts: [],
+        stuckSwapRetryPositionIds: [],
+        closingPositions: [
+          {
+            positionId: 'pos-1',
+            tokenSymbol: 'PONS',
+            phase: 'QUOTE_UNAVAILABLE',
+            operatorActionRequired: true,
+            closingAgeMs: 60_000,
+            tokenResidualRaw: '14467199568916222',
+            usdgRecoveredRaw: '1500001',
+            lastCheckedAt: null,
+          },
+        ],
+      })) as never,
+    });
+    const { ctx, reply } = fakeCtx();
+
+    await handleStuck(apiClient, ctx);
+
+    const text = reply.mock.calls[0]?.[0] as string;
+    expect(text).toContain('USDG kembali 1.500001');
+    // The TOKEN amount must NOT be scaled by the quote asset's decimals --
+    // PONS has its own, which this payload does not carry.
+    expect(text).toContain('TOKEN tersisa 14467199568916222 (raw)');
+  });
+
+  it('/stuck prints ? when the recovered amount is ABSENT, not the string undefined', async () => {
+    // These responses are typed but never runtime-validated, so a field the
+    // interface declares can still arrive missing. The pre-formatting code used
+    // `?? '?'`, which covered that; narrowing it to `=== null` would print
+    // "undefined" to the operator.
+    const apiClient = fakeApiClient({
+      get: vi.fn(async () => ({
+        stuckTransactionAttempts: [],
+        stuckSwapRetryPositionIds: [],
+        closingPositions: [
+          {
+            positionId: 'pos-1',
+            tokenSymbol: 'PONS',
+            phase: 'QUOTE_UNAVAILABLE',
+            operatorActionRequired: true,
+            closingAgeMs: null,
+            tokenResidualRaw: null,
+            lastCheckedAt: null,
+          },
+        ],
+      })) as never,
+    });
+    const { ctx, reply } = fakeCtx();
+
+    await handleStuck(apiClient, ctx);
+
+    const text = reply.mock.calls[0]?.[0] as string;
+    expect(text).toContain('USDG kembali ?');
+    expect(text).not.toContain('undefined');
+  });
+
+  it('/stuck still prints ? for a missing recovered amount rather than 0', async () => {
+    const apiClient = fakeApiClient({
+      get: vi.fn(async () => ({
+        stuckTransactionAttempts: [],
+        stuckSwapRetryPositionIds: [],
+        closingPositions: [
+          {
+            positionId: 'pos-1',
+            tokenSymbol: 'PONS',
+            phase: 'QUOTE_UNAVAILABLE',
+            operatorActionRequired: true,
+            closingAgeMs: null,
+            tokenResidualRaw: null,
+            usdgRecoveredRaw: null,
+            lastCheckedAt: null,
+          },
+        ],
+      })) as never,
+    });
+    const { ctx, reply } = fakeCtx();
+
+    await handleStuck(apiClient, ctx);
+
+    const text = reply.mock.calls[0]?.[0] as string;
+    expect(text).toContain('USDG kembali ?');
+    expect(text).not.toContain('USDG kembali 0');
+  });
+
+  it('/report renders realized PnL with USDG decimals, not 10^18 -- the reporting bug', async () => {
+    // 3_500_000 raw USDG = 3.50 USDG at config.quoteAsset.DECIMALS (6).
+    // Dividing by 10^18 rendered this (and every realistic PnL at this
+    // project's position sizes) as "0", and a loss as "-0".
+    const apiClient = fakeApiClient({
+      get: vi.fn(async () => ({
+        positions: [
+          {
+            tokenSymbol: 'MEME',
+            entryUsdgRaw: '3000000',
+            closedAt: '2026-09-27T00:00:00.000Z',
+            closeReason: 'TAKE_PROFIT',
+            realizedPnlAvailable: true,
+            realizedPnlUsdgRaw: '3500000',
+          },
+          {
+            tokenSymbol: 'PONS',
+            entryUsdgRaw: '3000000',
+            closedAt: '2026-09-27T00:00:00.000Z',
+            closeReason: 'HARD_STOP_LOSS',
+            realizedPnlAvailable: true,
+            realizedPnlUsdgRaw: '-1250000',
+          },
+        ],
+      })) as never,
+    });
+    const { ctx, reply } = fakeCtx();
+
+    await handleReport(apiClient, ctx);
+
+    const text = reply.mock.calls[0]?.[0] as string;
+    expect(text).toContain('realized PnL 3.5 USDG');
+    expect(text).toContain('realized PnL -1.25 USDG');
+    // The specific regression: a real PnL must never collapse to zero.
+    expect(text).not.toContain('realized PnL 0 USDG');
+    expect(text).not.toContain('realized PnL -0 USDG');
+  });
+
+  it('/report leaves an unparseable raw PnL untouched rather than throwing', async () => {
+    const apiClient = fakeApiClient({
+      get: vi.fn(async () => ({
+        positions: [
+          {
+            tokenSymbol: 'MEME',
+            entryUsdgRaw: '3000000',
+            closedAt: null,
+            closeReason: null,
+            realizedPnlAvailable: true,
+            realizedPnlUsdgRaw: 'not-a-number',
+          },
+        ],
+      })) as never,
+    });
+    const { ctx, reply } = fakeCtx();
+
+    await handleReport(apiClient, ctx);
+
+    expect(reply.mock.calls[0]?.[0]).toContain('not-a-number');
+  });
+
   it('/stuck reports both stuck transaction attempts and stuck swap retries', async () => {
     const apiClient = fakeApiClient({
       get: vi.fn(async () => ({
@@ -131,8 +344,13 @@ describe('command handlers -- success replies', () => {
     expect(text).toContain('PERLU TINDAKAN OPERATOR');
     expect(text).toContain('pos-blocked');
     expect(text).toContain('QUOTE_UNAVAILABLE');
-    expect(text).toContain('TOKEN tersisa 3000');
-    expect(text).toContain('USDG kembali 200000');
+    // TOKEN residual stays RAW on purpose: its decimals are per-token and the
+    // API never sends them, so it must not be scaled by the quote asset's.
+    expect(text).toContain('TOKEN tersisa 3000 (raw)');
+    // 200000 raw = 0.2 USDG at config.quoteAsset.DECIMALS -- this used to be
+    // printed as "200000", a million times the real amount.
+    expect(text).toContain('USDG kembali 0.2');
+    expect(text).not.toContain('USDG kembali 200000');
     expect(text).toContain('umur 45m');
     expect(text).not.toContain('pos-normal');
   });

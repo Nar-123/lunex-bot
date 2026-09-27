@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
+import { buildGmgnChildEnv } from './childEnv';
 export class GmgnCliExecutionError extends Error {
   constructor(
     message: string,
@@ -67,6 +68,12 @@ export interface RunGmgnCliOptions {
   timeoutMs: number;
   maxRetries: number;
   retryBaseDelayMs: number;
+  /**
+   * The child's COMPLETE environment (it replaces, never extends, the
+   * parent's). Omitted falls back to `buildGmgnChildEnv(process.env)` -- the
+   * same deny-by-default allowlist -- so no call path can leak the executor
+   * key or the other service secrets into a third-party CLI.
+   */
   env?: NodeJS.ProcessEnv;
 }
 
@@ -184,7 +191,9 @@ export async function runGmgnCliJson(
   let lastError: unknown;
   for (let attempt = 0; attempt <= options.maxRetries; attempt++) {
     try {
-      const stdout = await execFileOnce(cliPath, args, options.timeoutMs, options.env ?? process.env);
+      // `options.env` omitted must NOT mean "inherit every Lunex secret" --
+      // fall back to the same allowlist `GmgnCliClient` passes explicitly.
+      const stdout = await execFileOnce(cliPath, args, options.timeoutMs, options.env ?? buildGmgnChildEnv(process.env));
       try {
         return JSON.parse(stdout);
       } catch (parseErr) {

@@ -64,6 +64,14 @@ export class InMemoryTransactionAttemptRepository implements TransactionAttemptR
     return [...this.byKey.values()].filter((r) => r.status !== 'VERIFIED' && r.status !== 'FAILED');
   }
 
+  /** Mirrors the real repository: nonces >= minNonce on rows with a persisted signed payload, terminal rows included, ascending. */
+  async findSignedNoncesAtOrAbove(minNonce: number): Promise<number[]> {
+    return [...this.byKey.values()]
+      .filter((r) => r.rawTx !== null && r.nonce !== null && r.nonce >= minNonce)
+      .map((r) => r.nonce as number)
+      .sort((a, b) => a - b);
+  }
+
   async findByKeyPrefixes(prefixes: readonly string[]): Promise<TransactionAttemptRecord[]> {
     if (prefixes.length === 0) return [];
     return [...this.byKey.values()].filter((r) => prefixes.some((p) => r.idempotencyKey.startsWith(p))).map((r) => ({ ...r }));

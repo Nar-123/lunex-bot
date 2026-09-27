@@ -165,6 +165,19 @@ export interface TransactionAttemptRepository {
   findNonTerminal(): Promise<TransactionAttemptRecord[]>;
   /** H2: every attempt whose idempotencyKey starts with any of `prefixes` (empty list -> empty result) -- capital accounting's read of CLOSING positions' exit legs. */
   findByKeyPrefixes(prefixes: readonly string[]): Promise<TransactionAttemptRecord[]>;
+  /**
+   * Every nonce >= `minNonce` for which a SIGNED payload was persisted
+   * (`rawTx` set), terminal attempts included, in ascending order.
+   *
+   * Nonce allocation's "already spent" set (see `nonceAllocation.ts`): such a
+   * nonce is either already mined -- with this RPC provider simply not caught
+   * up -- or still in flight. Either way it must be skipped. VERIFIED and
+   * FAILED attempts are terminal and therefore invisible to
+   * `findNonTerminal()`, which is exactly why this cannot be derived from that
+   * query. Bounded by `minNonce` so a long history is never loaded to allocate
+   * one nonce.
+   */
+  findSignedNoncesAtOrAbove(minNonce: number): Promise<number[]>;
 }
 
 export type StepResult<TReason extends string = string> = { ok: true } | { ok: false; reason: TReason };

@@ -49,6 +49,89 @@ describe('PrismaTransactionAttemptRepository (real SQLite DB, real migration)', 
     expect(record.idempotencyKey).toBe('key-1');
   });
 
+  /**
+   * `findSignedNoncesAtOrAbove` is the "already spent" set the nonce allocator
+   * skips (see `nonceAllocation.ts`). Its safety rests on four properties of
+   * THIS query, none of which the in-memory fake can prove: the predicate is
+   * "a signed payload exists" (`rawTx` set), terminal rows count, the
+   * `minNonce` bound is inclusive, and the result is ascending.
+   */
+  describe('findSignedNoncesAtOrAbove -- the nonce allocator spent set', () => {
+    it('returns an empty list when nothing has ever been signed', async () => {
+      const created = await repo.create('spent-none', 'p');
+      await repo.update(created.id, { status: 'NONCE_ASSIGNED', nonce: 4 });
+
+      // A reserved-but-unsigned nonce is NOT spent: nothing was broadcast under
+      // it, so it must stay reclaimable.
+      expect(await repo.findSignedNoncesAtOrAbove(0)).toEqual([]);
+    });
+
+    it('excludes an attempt that reserved a nonce but never signed', async () => {
+      const signed = await repo.create('spent-signed', 'p');
+      await repo.update(signed.id, { status: 'SIGNED', nonce: 7, rawTx: '0xaa', txHash: '0xbb' });
+      const reservedOnly = await repo.create('spent-reserved', 'p');
+      await repo.update(reservedOnly.id, { status: 'NONCE_ASSIGNED', nonce: 99 });
+
+      // 99 is reserved, not signed. The allocator skips it via the reserved set
+      // (from findNonTerminal), never via this query.
+      expect(await repo.findSignedNoncesAtOrAbove(0)).toEqual([7]);
+    });
+
+    it('INCLUDES terminal rows -- a VERIFIED nonce is the most certainly-spent of all', async () => {
+      const verified = await repo.create('spent-verified', 'p');
+      await repo.update(verified.id, {
+        status: 'VERIFIED',
+        nonce: 120,
+        rawTx: '0x11',
+        txHash: '0x22',
+        verifyData: { ok: true },
+      });
+
+      // VERIFIED is invisible to findNonTerminal(), which is exactly why the
+      // allocator cannot derive its spent set from that query alone.
+      expect((await repo.findNonTerminal()).map((a) => a.nonce)).not.toContain(120);
+      expect(await repo.findSignedNoncesAtOrAbove(120)).toContain(120);
+    });
+
+    it('includes a FAILED row that had already signed (its nonce is dead, never free)', async () => {
+      const failed = await repo.create('spent-failed-signed', 'p');
+      await repo.update(failed.id, {
+        status: 'FAILED',
+        failureCode: 'BROADCAST_REJECTED',
+        nonce: 200,
+        rawTx: '0x33',
+        txHash: '0x44',
+      });
+
+      expect(await repo.findSignedNoncesAtOrAbove(200)).toEqual([200]);
+    });
+
+    it('does NOT include a FAILED row that never signed -- that nonce stays reclaimable', async () => {
+      const fenced = await repo.create('spent-failed-unsigned', 'p');
+      await repo.update(fenced.id, { status: 'FAILED', failureCode: 'OPENING_TIMEOUT', nonce: 205 });
+
+      expect(await repo.findSignedNoncesAtOrAbove(205)).toEqual([]);
+    });
+
+    it('applies minNonce inclusively and returns ascending order', async () => {
+      // 7, 120 and 200 were signed by the cases above.
+      expect(await repo.findSignedNoncesAtOrAbove(0)).toEqual([7, 120, 200]);
+      expect(await repo.findSignedNoncesAtOrAbove(7)).toEqual([7, 120, 200]);
+      expect(await repo.findSignedNoncesAtOrAbove(8)).toEqual([120, 200]);
+      expect(await repo.findSignedNoncesAtOrAbove(201)).toEqual([]);
+    });
+
+    it('a rotated executor at nonce 0 sees the old history but none of its own pointer', async () => {
+      // The rotation case: the old wallet's nonces are all >= 0 and so are
+      // returned, but the allocator skips only those exact values -- a fresh
+      // account still starts at its own pointer.
+      const spent = await repo.findSignedNoncesAtOrAbove(0);
+
+      expect(spent).not.toContain(0);
+      expect(spent.every((n) => n > 0)).toBe(true);
+    });
+  });
+
   it('find returns null for a key that was never created', async () => {
     const record = await repo.find('does-not-exist');
     expect(record).toBeNull();

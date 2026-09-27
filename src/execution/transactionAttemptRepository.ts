@@ -148,6 +148,23 @@ export class PrismaTransactionAttemptRepository implements TransactionAttemptRep
     return findAttemptsByKeyPrefixes(this.prisma, prefixes);
   }
 
+  /**
+   * Nonce allocation's "already spent" set -- see the interface doc.
+   * `rawTx: not null` is the precise predicate: a payload exists for that
+   * nonce, so it is mined or in flight. Terminal rows are deliberately
+   * included, since a VERIFIED attempt's nonce is the most certainly-spent of
+   * all. `gte: minNonce` keeps the read proportional to what the allocator can
+   * actually skip rather than to the whole attempt history.
+   */
+  async findSignedNoncesAtOrAbove(minNonce: number): Promise<number[]> {
+    const rows = await this.prisma.transactionAttempt.findMany({
+      where: { rawTx: { not: null }, nonce: { not: null, gte: minNonce } },
+      orderBy: { nonce: 'asc' },
+      select: { nonce: true },
+    });
+    return rows.map((row) => row.nonce as number);
+  }
+
   async findNonTerminal(): Promise<TransactionAttemptRecord[]> {
     const rows = await this.prisma.transactionAttempt.findMany({
       where: { status: { notIn: TERMINAL_STATUSES } },
