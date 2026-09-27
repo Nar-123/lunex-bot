@@ -1,7 +1,8 @@
-import { createWalletClient, http, type WalletClient } from 'viem';
+import { createWalletClient, type WalletClient } from 'viem';
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
 import { config } from '../config';
 import { robinhoodChain } from './viemChain';
+import { buildRpcTransport, resolveRpcEndpoints } from './rpcTransport';
 
 let cachedAccount: PrivateKeyAccount | undefined;
 let cachedClient: WalletClient | undefined;
@@ -24,7 +25,11 @@ export function getWalletClient(): WalletClient {
     cachedClient = createWalletClient({
       account: getAccount(),
       chain: robinhoodChain,
-      transport: http(config.chain.rpcUrl),
+      // The same ordered failover transport as the public client, so no client
+      // can bypass endpoint policy. In practice this one makes NO network call:
+      // signing is local (`getExecutorAccount()`), and broadcast/receipt reads
+      // go through `getPublicClient()`.
+      transport: buildRpcTransport(resolveRpcEndpoints(config.chain.rpcUrl, config.chain.rpcFallbackUrls).urls),
     });
   }
   return cachedClient;
