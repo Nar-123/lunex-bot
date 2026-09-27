@@ -37,13 +37,18 @@ describe('two-layer execution-target validation', () => {
     expect(validateSwapQuote(base(), expected())).toEqual({ to: APPROVED_ROUTER, data: UR_DATA, value: 0n });
   });
 
-  it('2. CASE B: an approved SwapProxy is accepted when the EMBEDDED router is approved', () => {
-    const candidate = viaProxy();
-    expect(validateSwapQuote(candidate, expected())).toEqual({ to: APPROVED_PROXY, data: candidate.data, value: 0n });
+  it('2. CASE B: an approved SwapProxy is REFUSED -- the proxy execution path is disabled', () => {
+    // Was: accepted when the embedded router was approved. The proxy path is
+    // now rejected before any decode, so a well-formed proxy payload naming an
+    // approved router is refused like any other.
+    expect(() => validateSwapQuote(viaProxy(), expected())).toThrow(SwapQuoteValidationError);
+    expect(() => validateSwapQuote(viaProxy(), expected())).toThrow(/SwapProxy execution path is disabled/);
   });
 
   it('3. an approved SwapProxy carrying an UNAUTHORISED embedded router is rejected', () => {
-    expect(() => validateSwapQuote(viaProxy({ router: UNVERIFIED_ROUTER }), expected())).toThrow(/names router .* NOT an approved Universal Router/i);
+    // Still rejected -- now for being a proxy at all, which subsumes the old
+    // embedded-router check.
+    expect(() => validateSwapQuote(viaProxy({ router: UNVERIFIED_ROUTER }), expected())).toThrow(/SwapProxy execution path is disabled/);
   });
 
   it('3b. a proxy payload naming the proxy itself, or an EOA, is still rejected', () => {
@@ -62,38 +67,41 @@ describe('two-layer execution-target validation', () => {
   });
 
   it('6. malformed proxy calldata is rejected (fail closed, never "probably fine")', () => {
-    expect(() => validateSwapQuote(base({ to: APPROVED_PROXY, data: `${SWAP_PROXY_EXECUTE_SELECTOR}${'ff'.repeat(192)}` }), expected())).toThrow(/could not be safely decoded/);
+    expect(() => validateSwapQuote(base({ to: APPROVED_PROXY, data: `${SWAP_PROXY_EXECUTE_SELECTOR}${'ff'.repeat(192)}` }), expected())).toThrow(/SwapProxy execution path is disabled/);
   });
 
   it('7. truncated proxy calldata is rejected', () => {
-    expect(() => validateSwapQuote(base({ to: APPROVED_PROXY, data: proxyCalldata().slice(0, 74) }), expected())).toThrow(/truncated|could not be safely decoded/);
+    expect(() => validateSwapQuote(base({ to: APPROVED_PROXY, data: proxyCalldata().slice(0, 74) }), expected())).toThrow(/SwapProxy execution path is disabled/);
   });
 
   it('8. a wrong selector on an approved proxy is rejected', () => {
-    expect(() => validateSwapQuote(base({ to: APPROVED_PROXY, data: `0x3593564c${proxyCalldata().slice(10)}` }), expected())).toThrow(/selector .* is not 0x2894adf9/);
+    expect(() => validateSwapQuote(base({ to: APPROVED_PROXY, data: `0x3593564c${proxyCalldata().slice(10)}` }), expected())).toThrow(/SwapProxy execution path is disabled/);
   });
 
   it('9. chainId mismatch is still rejected first', () => {
     expect(() => validateSwapQuote(base({ chainId: 1 }), expected())).toThrow(/chainId mismatch/);
   });
 
-  it('10. amount mismatch is rejected -- both the API echo and the amount inside proxy calldata', () => {
+  it('10. amount mismatch is rejected on the direct router path; a proxy is refused before the amount is even looked at', () => {
     expect(() => validateSwapQuote(base({ echoedAmountInRaw: 499n }), expected())).toThrow(/amount-in mismatch/);
-    expect(() => validateSwapQuote(viaProxy({ amount: 499n }), expected())).toThrow(/pulls 499 of the token/);
+    expect(() => validateSwapQuote(viaProxy({ amount: 499n }), expected())).toThrow(/SwapProxy execution path is disabled/);
   });
 
   it('10b. a proxy payload selling a DIFFERENT token than quoted is rejected', () => {
-    expect(() => validateSwapQuote(viaProxy({ token: '0x1111111111111111111111111111111111111111' }), expected())).toThrow(/sells token .* but this swap was quoted for/);
+    expect(() => validateSwapQuote(viaProxy({ token: '0x1111111111111111111111111111111111111111' }), expected())).toThrow(/SwapProxy execution path is disabled/);
   });
 
-  it('11. non-zero value is rejected for both target kinds', () => {
+  it('11. non-zero value is rejected on the router path; a proxy is refused first, for being a proxy', () => {
     expect(() => validateSwapQuote(base({ value: '1' }), expected())).toThrow(/"value" must be 0/);
-    expect(() => validateSwapQuote({ ...viaProxy(), value: '1' }, expected())).toThrow(/"value" must be 0/);
+    expect(() => validateSwapQuote({ ...viaProxy(), value: '1' }, expected())).toThrow(/SwapProxy execution path is disabled/);
   });
 
-  it('12. minimum-received protection still applies on the proxy path', () => {
-    expect(() => validateSwapQuote({ ...viaProxy(), minOutputAmountRaw: 0n }, expected())).toThrow(/minimum-received protection/);
-    expect(() => validateSwapQuote({ ...viaProxy(), minOutputAmountRaw: 0n }, expected({ minReceivedRequired: false }))).not.toThrow();
+  it('12. a proxy payload is refused whatever the minimum-received setting -- disabling the check cannot re-open the path', () => {
+    // Previously the second case was accepted (protection off, proxy allowed).
+    // Now BOTH are refused: turning minimum-received protection off no longer
+    // lets a proxy payload through.
+    expect(() => validateSwapQuote({ ...viaProxy(), minOutputAmountRaw: 0n }, expected())).toThrow(/SwapProxy execution path is disabled/);
+    expect(() => validateSwapQuote({ ...viaProxy(), minOutputAmountRaw: 0n }, expected({ minReceivedRequired: false }))).toThrow(/SwapProxy execution path is disabled/);
   });
 
   it('13. FAIL CLOSED: an empty router allowlist rejects everything, including a proxy target', () => {
@@ -108,10 +116,11 @@ describe('two-layer execution-target validation', () => {
     expect(() => validateSwapQuote(base(), noProxies)).not.toThrow();
   });
 
-  it('address normalization: checksummed vs lowercase target AND embedded router are both accepted', () => {
+  it('address normalization: a lowercase direct router is still accepted, and case does not smuggle a proxy through', () => {
     expect(() => validateSwapQuote(base({ to: APPROVED_ROUTER.toLowerCase() }), expected())).not.toThrow();
-    expect(() => validateSwapQuote(base({ to: APPROVED_PROXY.toUpperCase().replace('0X', '0x'), data: proxyCalldata({ router: APPROVED_ROUTER.toLowerCase() }) }), expected())).not.toThrow();
-    expect(() => validateSwapQuote(viaProxy({ token: TOKEN.toLowerCase() }), expected({ tokenIn: TOKEN.toUpperCase().replace('0X', '0x') }))).not.toThrow();
+    // The proxy is still RECOGNISED whatever its casing -- and then refused.
+    expect(() => validateSwapQuote(base({ to: APPROVED_PROXY.toUpperCase().replace('0X', '0x'), data: proxyCalldata({ router: APPROVED_ROUTER.toLowerCase() }) }), expected())).toThrow(/SwapProxy execution path is disabled/);
+    expect(() => validateSwapQuote(viaProxy({ token: TOKEN.toLowerCase() }), expected({ tokenIn: TOKEN.toUpperCase().replace('0X', '0x') }))).toThrow(/SwapProxy execution path is disabled/);
   });
 
   it('startup identity gate: FAILED blocks every swap; NOT_CHECKED/VERIFIED do not', () => {

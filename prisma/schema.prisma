@@ -52,24 +52,24 @@ model TokenCooldown {
 /// process already knows the exact hash to look up on-chain rather than
 /// guessing whether anything was sent at all.
 model TransactionAttempt {
-  id             String   @id @default(cuid())
+  id               String    @id @default(cuid())
   /// Caller-supplied, unique per logical operation (e.g.
   /// "deploy:0xTOKEN:2026-09-06T12:00:00Z" or "exit:positionId=42"). The
   /// one thing every idempotency/resume decision keys off of.
-  idempotencyKey String   @unique
+  idempotencyKey   String    @unique
   /// Free-form description for logs/diagnostics only.
-  purpose        String
-  status         String
+  purpose          String
+  status           String
   /// JSON-encoded {to, data, value} -- persisted once built so a resumed
   /// process re-verifies against the SAME request rather than rebuilding
   /// (and potentially computing subtly different calldata).
-  txRequest      String?
-  gasLimit       BigInt?
-  gasPrice       BigInt?
-  nonce          Int?
-  rawTx          String?
-  txHash         String?
-  lastError      String?
+  txRequest        String?
+  gasLimit         BigInt?
+  gasPrice         BigInt?
+  nonce            Int?
+  rawTx            String?
+  txHash           String?
+  lastError        String?
   /// JSON-encoded verification payload (e.g. mint's {positionTokenId,
   /// liquidity}), persisted atomically with status VERIFIED. This is what
   /// makes a VERIFIED attempt's result recoverable after a crash: without
@@ -78,7 +78,7 @@ model TransactionAttempt {
   /// execution/executeCriticalTransaction.ts's VERIFIED short-circuit).
   /// Nullable for two reasons: attempts created before this column existed,
   /// and attempts whose TVerifyData is genuinely `undefined`/void.
-  verifyData     String?
+  verifyData       String?
   /// Set only when status is FAILED -- distinguishes WHY: rejected pre-broadcast
   /// (SIMULATION_REJECTED / GAS_UNAFFORDABLE), rejected synchronously by the node
   /// at broadcast time (BROADCAST_REJECTED -- e.g. nonce too low, insufficient
@@ -87,7 +87,7 @@ model TransactionAttempt {
   /// not part of the original spec's status list, but needed so a stuck/failed
   /// attempt's root cause is queryable (e.g. a future `/status` command) without
   /// parsing `lastError` free text.
-  failureCode    String?
+  failureCode      String?
   /// How many times `executeCriticalTransaction` has been called for this
   /// key and actually done pipeline work (short-circuited VERIFIED/FAILED
   /// re-checks don't count). Added per explicit review, for stuck-attempt
@@ -107,10 +107,27 @@ model TransactionAttempt {
   /// a crashed-and-resumed call racing a newer one) could silently
   /// overwrite newer pipeline progress with an older snapshot.
   version          Int       @default(1)
+  /// Which executor wallet owns this attempt's nonce. A nonce is only
+  /// meaningful for one account, and storage outlives PRIVATE_KEY: after a key
+  /// rotation the old wallet's rows must not constrain the new account. NULL
+  /// means "recorded before this column existed", i.e. a previous executor --
+  /// never equal to a current one, so a rotation inherits no nonce history.
+  executorAddress  String?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
   @@index([status])
+  @@index([executorAddress, nonce])
+}
+
+/// Serializes nonce reservation across PROCESSES, exactly like CapitalLock does
+/// for capital. Touched as the first WRITE inside the reservation transaction so
+/// SQLite escalates to a write lock before the allocator's reads -- without it
+/// two processes can both complete their reads under a shared lock and allocate
+/// the same nonce. See `transactionAttemptRepository.reserveNonce`.
+model NonceLock {
+  id        String   @id
+  touchedAt DateTime @updatedAt
 }
 
 /// One row per LP position, active or historical. The source of truth
@@ -119,28 +136,28 @@ model TransactionAttempt {
 /// ACTIVE rows) -- both were left as honest gaps in Module 5 pending
 /// this model existing.
 model Position {
-  id             String  @id @default(cuid())
+  id                  String    @id @default(cuid())
   /// Lowercased EVM address -- normalized the same way as
   /// TokenCooldown.tokenAddress, so lookups can't miss on casing.
-  tokenAddress   String
-  tokenSymbol    String
-  tokenDecimals  Int
+  tokenAddress        String
+  tokenSymbol         String
+  tokenDecimals       Int
   /// v4 pool id (bytes32 hex) and the full PoolKey, decomposed (not a
   /// JSON blob) so monitoring/ can reconstruct a `v4Sdk.Pool` without
   /// re-parsing -- these came from `pools/` (Module 3) at selection time
   /// and never change for this position's lifetime.
-  poolId         String
-  currency0      String
-  currency1      String
-  fee            Int
-  tickSpacing    Int
-  hooks          String
-  tickLower      Int
-  tickUpper      Int
+  poolId              String
+  currency0           String
+  currency1           String
+  fee                 Int
+  tickSpacing         Int
+  hooks               String
+  tickLower           Int
+  tickUpper           Int
   /// PositionManager NFT tokenId -- set once the open transaction is
   /// verified on-chain, not before (per the transaction-safety pipeline:
   /// never record state that hasn't been confirmed).
-  positionTokenId String?
+  positionTokenId     String?
   /// Amount deployed at entry (35% of free USDG balance, per capital/),
   /// raw units, as a decimal STRING -- not BigInt. VERIFIED (an earlier
   /// version of this schema used BigInt and it broke immediately in the
@@ -150,21 +167,21 @@ model Position {
   /// ~9.2 * 10^18) -- this is not an edge case, it's the normal case for
   /// any token with 18 decimals. The PNL basis -- never recomputed,
   /// since "entry" is a point-in-time fact.
-  entryUsdgRaw   String
+  entryUsdgRaw        String
   /// sqrtPriceX96 at entry, as a decimal STRING -- not BigInt, same
   /// reasoning: Uniswap's sqrtPriceX96 can reach ~2^160, also far beyond
   /// the 64-bit range.
-  entrySqrtPriceX96 String
-  entryTick      Int
-  status         String // OPENING | ACTIVE | CLOSING | CLOSED | FAILED
+  entrySqrtPriceX96   String
+  entryTick           Int
+  status              String // OPENING | ACTIVE | CLOSING | CLOSED | FAILED
   /// Ties this position to the `TransactionAttempt` that opened it.
-  openIdempotencyKey  String  @unique
+  openIdempotencyKey  String    @unique
   /// Ties this position to the `TransactionAttempt` that closed it, once
   /// exiting starts (Module 8, exits/ -- not built yet).
-  closeIdempotencyKey String? @unique
-  openedAt       DateTime?
-  closedAt       DateTime?
-  closeReason    String?
+  closeIdempotencyKey String?   @unique
+  openedAt            DateTime?
+  closedAt            DateTime?
+  closeReason         String?
   /// VALIDATION PHASE: total USDG (raw) this position's exit actually
   /// returned to the wallet, measured from the CONFIRMED receipts of the
   /// remove-liquidity and swap transactions (ERC20 Transfer logs to the
@@ -174,7 +191,7 @@ model Position {
   /// than a fabricated one. Realized PnL = realizedUsdgRaw - entryUsdgRaw
   /// (computed at read time in reporting; only the measured proceeds are
   /// stored). Decimal STRING, same SQLite-overflow reason as entryUsdgRaw.
-  realizedUsdgRaw String?
+  realizedUsdgRaw     String?
   /// C7 concurrency fix: set by `PositionRepository.claimForResume()`'s
   /// atomic `UPDATE ... WHERE id = ? AND status = ?` compare-and-swap --
   /// makes "which process/cycle gets to resume this position" a single
@@ -184,7 +201,7 @@ model Position {
   /// immediately re-claimed by a second concurrent cycle (e.g. the 30-min
   /// screening cycle's `openPosition()` and the 15s exit cycle's
   /// OPENING-resume pass both discovering the same brand-new position).
-  resumeClaimedAt DateTime?
+  resumeClaimedAt     DateTime?
   /// P0-1 fix: a random per-claim ownership token, set atomically together
   /// with `resumeClaimedAt` by `claimForResume()`. `releaseResumeClaim()`
   /// now requires the CALLER's own token to match this column (`UPDATE ...
@@ -193,12 +210,9 @@ model Position {
   /// second worker legitimately re-claimed the same row) later returns and
   /// unconditionally releases, deleting the SECOND worker's still-active
   /// claim out from under it. NULL = unclaimed, same as `resumeClaimedAt`.
-  resumeClaimToken String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-
-  @@index([status])
-  @@index([tokenAddress, status])
+  resumeClaimToken    String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
   // P1-2 fix: a partial UNIQUE index -- `Position_tokenAddress_active_unique`
   // ON ("tokenAddress") WHERE "status" IN ('OPENING','ACTIVE','CLOSING') --
   // is applied via raw SQL in migration
@@ -210,6 +224,9 @@ model Position {
   // rather than a racy application-level check-then-create. Do NOT remove
   // this index by "fixing" apparent schema drift -- it is intentionally
   // absent from the declarative model above.
+
+  @@index([status])
+  @@index([tokenAddress, status])
 }
 
 /// Persistent state for exits/'s stateful exit triggers (Module 8) — Trailing
@@ -225,15 +242,15 @@ model ExitState {
   /// Highest PNL % ever observed once Trailing TP has armed (null = not yet
   /// armed). Armed once PNL reaches the effective threshold (+5% normally,
   /// 0% once PNL Protection has activated, see pnlProtectionActivatedAt).
-  trailingPeakPnlPct Float?
+  trailingPeakPnlPct          Float?
   /// Set the moment PNL first breaches (peak - 2%) after arming; cleared the
   /// moment PNL recovers back above that line OR a new peak is set. Trailing
   /// TP closes once `now - this >= EXITS.TRAILING_TP.CONFIRM_WINDOW_MS`.
-  drawdownConfirmStartedAt DateTime?
+  drawdownConfirmStartedAt    DateTime?
   /// Set the moment price first goes out of [tickLower, tickUpper); cleared
   /// the moment it's back in range. OOR closes once
   /// `now - this >= EXITS.OOR.GRACE_WINDOW_MS`.
-  oorStartedAt DateTime?
+  oorStartedAt                DateTime?
   /// TIER 3 (renamed from pnlProtectionActivatedAt, same arming
   /// condition so existing rows carry over): set ONCE, the first time this
   /// position's MAXIMUM DRAWDOWN reached EXITS.SAFETY_EXIT.TRIGGER_PCT
@@ -241,16 +258,16 @@ model ExitState {
   /// cannot disarm it and a restart cannot forget it. Non-null means the
   /// position closes as soon as PnL recovers to
   /// EXITS.SAFETY_EXIT.TARGET_PCT (0%).
-  safetyExitArmedAt DateTime?
+  safetyExitArmedAt           DateTime?
   /// TIER 3: the most negative PnL ever observed for this position, as a
   /// fraction. Only ever moves down. Safety Exit arms against THIS rather
   /// than against the current reading, so a position that dips to -9% and
   /// bounces back to -1% between two 15s polls still arms.
-  maxDrawdownPnlPct Float?
+  maxDrawdownPnlPct           Float?
   /// Set on the first tick this position's live metrics fail to read
   /// (PositionMetricsResult.ok === false); cleared on the next successful
   /// read. Safety Exit condition (a) — see EXITS.SAFETY_EXIT in constants.ts.
-  metricsFailureSince DateTime?
+  metricsFailureSince         DateTime?
   /// Incremented every time the exit SWAP sub-transaction (not the
   /// remove-liquidity one) is found FAILED (definitive). Used to derive a
   /// FRESH idempotencyKey for each swap retry
@@ -258,7 +275,7 @@ model ExitState {
   /// key would make executeCriticalTransaction return the cached FAILED
   /// result forever (see exits/executeExit.ts). Also the basis for
   /// EXITS.SWAP_RETRY.STUCK_THRESHOLD detection.
-  swapAttemptCount Int @default(0)
+  swapAttemptCount            Int       @default(0)
   /// USDG balance observed the moment the CURRENT swap attempt's tx was
   /// built -- decimal STRING, not BigInt/Int, same 64-bit-overflow reason
   /// as Position.entryUsdgRaw (an 18-decimal USDG amount routinely exceeds
@@ -266,12 +283,12 @@ model ExitState {
   /// exits/swapTx.ts's buildTransaction, which runs exactly once and is
   /// skipped on resume) so a resumed verifyOnChain call -- potentially in a
   /// different process after a restart -- still has the correct baseline.
-  swapUsdgBalanceBeforeRaw String?
+  swapUsdgBalanceBeforeRaw    String?
   /// Minimum USDG increase required for the CURRENT swap attempt to verify
   /// as successful (decimal STRING, same overflow reasoning) -- 0/absent
   /// when EXITS.MIN_RECEIVED_PROTECTION_ENABLED is false, in which case
   /// verification degrades to "genuinely increased at all."
-  swapMinOutputAmountRaw String?
+  swapMinOutputAmountRaw      String?
   /// USDG increase the CURRENT swap attempt's balance check already
   /// accepted (decimal STRING, same overflow reasoning). Reset to null when
   /// a new attempt is built; lets a resumed verifyOnChain (after a failed
@@ -283,7 +300,7 @@ model ExitState {
   /// markClosed() once the exit actually completes, potentially ticks or a
   /// restart later. Must be persisted here, not carried in a JS variable
   /// across the two DB writes, since a restart can happen in between.
-  pendingCloseReason String?
+  pendingCloseReason          String?
 
   /// Stale-writer fix: optimistic-concurrency version, +1 on EVERY write
   /// (see `exits/exitStateRepository.ts`). Decision-state writes are a
@@ -385,15 +402,15 @@ model CapitalLock {
 /// window durations that interact with an already-running persisted
 /// countdown in `ExitState` stay frozen in `config`, restart-only).
 model BotSettings {
-  id                   String   @id @default("singleton")
+  id                   String    @id @default("singleton")
   /// True = the 30-min screening cycle skips entirely (no new
   /// deployments). Monitoring and exit are NEVER affected by this flag --
   /// see `composition/screeningCycle.ts`'s doc comment.
-  paused               Boolean  @default(false)
+  paused               Boolean   @default(false)
   /// Fraction 0-1 -- replaces CAPITAL.POSITION_SIZE_PCT_OF_FREE_BALANCE (0.35).
-  positionSizePct      Float    @default(0.35)
+  positionSizePct      Float     @default(0.35)
   /// Replaces CAPITAL.MAX_ACTIVE_POSITIONS (3).
-  maxActivePositions   Int      @default(3)
+  maxActivePositions   Int       @default(3)
   /// Fraction, always negative -- replaces EXITS.HARD_STOP_LOSS_PCT.
   /// TIER 3: default -0.15 -> -0.06, Meridian's measured stop. No longer
   /// cross-validated against the Safety Exit trigger at the settings-range
@@ -406,10 +423,10 @@ model BotSettings {
   /// "arm at -8%, wait for recovery to 0%" semantics are genuinely
   /// reachable via a price gap or a failed/retried Hard Stop close --
   /// see that file's doc comment for the full mechanism and history.
-  hardStopLossPct      Float    @default(-0.06)
+  hardStopLossPct      Float     @default(-0.06)
   /// Fraction, always positive -- replaces EXITS.TRAILING_TP.TRIGGER_PEAK_PNL_PCT.
   /// TIER 3: default 0.05 -> 0.06, Meridian's measured trailing arm.
-  trailingTpTriggerPct Float    @default(0.06)
+  trailingTpTriggerPct Float     @default(0.06)
   /// AI Supervisor entry control -- SEPARATE from the operator's `paused`
   /// (Telegram /pause, POST /control/pause). New entries are allowed only
   /// when BOTH are false, so an AI resume can never undo an operator's
@@ -417,12 +434,12 @@ model BotSettings {
   /// in SettingsRepository.aiPauseEntry/aiResumeEntry; re-checked inside the
   /// capital-reservation transaction (under CapitalLock) before every
   /// deployment. Never affects monitoring, exits or OPENING resumes.
-  aiEntryPaused        Boolean  @default(false)
+  aiEntryPaused        Boolean   @default(false)
   /// When the AI entry flag last CHANGED (a no-op pause/resume leaves it).
   aiEntryChangedAt     DateTime?
   /// Correlation id of the AI request that last changed the flag.
   aiEntryRequestId     String?
-  updatedAt            DateTime @updatedAt
+  updatedAt            DateTime  @updatedAt
 }
 
 /// Manual TOKEN settlement via receipt: the operator-supplied transaction

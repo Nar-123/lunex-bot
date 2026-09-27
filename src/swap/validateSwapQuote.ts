@@ -1,6 +1,6 @@
 import type { Address } from 'viem';
 import type { TxRequest } from '../execution/types';
-import { classifyExecutionTarget, decodeSwapProxyExecute, isApprovedUniversalRouter, type ExecutionTargetMatch, type ExecutionTargetPolicy } from './executionTargets';
+import { classifyExecutionTarget, type ExecutionTargetMatch, type ExecutionTargetPolicy } from './executionTargets';
 import type { ExecutionTargetVerificationState } from './executionTargetGate';
 import { assertUniversalRouterCallSafe, UniversalRouterCalldataError } from './universalRouterCalldata';
 
@@ -161,32 +161,29 @@ export function validateSwapQuote(candidate: RawSwapTxCandidate, expected: SwapQ
     }
   }
 
-  // Layer 2b -- when the target is a SwapProxy, the router it will call must be approved too.
+  // Layer 2b -- SWAP_PROXY is REFUSED OUTRIGHT, before anything can be signed.
+  //
+  // The proxy path was validated by decoding `execute()` and checking the
+  // router/token/amount it named. That decode only covers the three head words
+  // it understands; it cannot establish what the proxy actually DOES with the
+  // approval it pulls, and the proxy is not a contract this project verified
+  // the bytecode of beyond a code-hash presence check. A swap is only as safe
+  // as the last hop that moves the funds, so the router batch itself has to be
+  // the thing under validation -- which is exactly what CASE A does with
+  // `assertUniversalRouterCallSafe`.
+  //
+  // Deliberately NOT a new/stricter proxy decoder: the direct Universal Router
+  // path is the production path (D7 onwards) and covers every exit this bot
+  // builds, so the proxy branch is dead weight carrying live risk. It is
+  // rejected here -- inside the same pre-sign validation every swap must pass
+  // -- rather than by editing the allowlist, so the refusal holds no matter how
+  // `EXECUTION_TARGETS` is configured and cannot be re-enabled by config drift.
   if (match.kind === 'SWAP_PROXY') {
-    let decoded;
-    try {
-      decoded = decodeSwapProxyExecute(candidate.data);
-    } catch (err) {
-      throw new SwapQuoteValidationError(
-        `swap tx targets approved SwapProxy ${match.address} but its calldata could not be safely decoded: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-    if (!isApprovedUniversalRouter(decoded.router, expected.targets)) {
-      throw new SwapQuoteValidationError(
-        `SwapProxy calldata names router ${decoded.router}, which is NOT an approved Universal Router for chain ${expected.targets.chainId} ` +
-          `(approved: [${expected.targets.universalRouters.join(', ') || 'none'}]) -- refusing to sign a proxy call into an unrecognized router`,
-      );
-    }
-    if (decoded.token.toLowerCase() !== expected.tokenIn.toLowerCase()) {
-      throw new SwapQuoteValidationError(
-        `SwapProxy calldata sells token ${decoded.token}, but this swap was quoted for ${expected.tokenIn} -- refusing to sign a payload for a different asset`,
-      );
-    }
-    if (decoded.amount !== expected.amountInRaw) {
-      throw new SwapQuoteValidationError(
-        `SwapProxy calldata pulls ${decoded.amount} of the token, but ${expected.amountInRaw} was requested -- refusing to sign a payload for a different amount`,
-      );
-    }
+    throw new SwapQuoteValidationError(
+      `swap tx targets SwapProxy ${match.address}, and the SwapProxy execution path is disabled -- ` +
+        'only a direct call to an approved Universal Router may be signed (fail closed). ' +
+        'Refusing to sign proxy calldata.',
+    );
   }
   if (!HEX_DATA_RE.test(candidate.data) || candidate.data.length < MIN_DATA_LENGTH) {
     throw new SwapQuoteValidationError(`swap tx "data" is not well-formed calldata (got length ${candidate.data.length})`);

@@ -11,7 +11,7 @@ import { config } from '../config';
 import { classifyBroadcastError } from './classifyBroadcastError';
 import { isStuckAttempt } from './stuckAttempt';
 import { ExecutorLockTimeoutError, withExecutorLock } from './executorMutex';
-import { allocateNonce } from './nonceAllocation';
+
 
 /**
  * Stuck-transaction incident: which pipeline step an unexpected failure
@@ -27,6 +27,7 @@ export type CriticalStepCode =
   | 'GAS_CHECK_FAILED'
   | 'EXECUTOR_BUSY'
   | 'NONCE_FAILED'
+  | 'EXECUTOR_MISMATCH'
   | 'SIGN_TRANSACTION_FAILED'
   | 'SIGNED_CHECKPOINT_PERSIST_FAILED'
   | 'BROADCAST_FAILED'
@@ -338,15 +339,20 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
         // consumed, and the outer catch keeps the attempt resumable -- never
         // FAILED just because one provider was unreachable or stale.
         const chainPendingNonce = await deps.getNonce();
-        const [nonTerminal, signedAtOrAbove] = await Promise.all([
-          repo.findNonTerminal(),
-          repo.findSignedNoncesAtOrAbove(chainPendingNonce),
-        ]);
-        const reserved = nonTerminal
-          .filter((other) => other.id !== attempt.id && other.nonce !== null)
-          .map((other) => other.nonce as number);
-        const allocation = allocateNonce({ chainPendingNonce, reserved, signedAtOrAbove });
-        if (allocation.adjustedBy !== null) {
+        // Allocate AND persist in one database transaction, scoped to the
+        // current executor. `ExecutorMutex` (above) serializes callers inside
+        // THIS process; it cannot serialize a second bot process sharing this
+        // database, and a read-then-write allocation would let both compute the
+        // same nonce from the same snapshot. The repository takes a
+        // cross-process write lock and the DB's partial unique index on
+        // (executorAddress, nonce) is the backstop.
+        const reservation = await repo.reserveNonce({
+          attemptId: attempt.id,
+          expectedVersion: attempt.version,
+          chainPendingNonce,
+        });
+        attempt = reservation.attempt;
+        if (reservation.adjustedBy !== null) {
           // Not an error: the expected, designed outcome when a provider is
           // stale or another attempt still holds a nonce. Logged because a
           // persistent stream of these says a provider is lagging badly.
@@ -354,22 +360,50 @@ export async function executeCriticalTransaction<TVerifyData = unknown>(
             idempotencyKey,
             purpose,
             chainPendingNonce,
-            allocatedNonce: allocation.nonce,
-            adjustedBy: allocation.adjustedBy,
-            skipped: allocation.skipped,
-            reservedCount: reserved.length,
-            signedAtOrAboveCount: signedAtOrAbove.length,
+            allocatedNonce: reservation.nonce,
+            adjustedBy: reservation.adjustedBy,
+            skipped: reservation.skipped,
           });
         }
-        attempt = await repo.update(
-          attempt.id,
-          { status: 'NONCE_ASSIGNED', nonce: allocation.nonce },
-          attempt.version,
-        );
       }
       const lockedNonce = attempt.nonce;
       if (lockedNonce === null) {
         throw new Error('invariant violated: status is past NONCE_ASSIGNED but nonce is missing');
+      }
+
+      // EXECUTOR-OWNERSHIP FENCE.
+      //
+      // Invariant: a nonce is owned by the executor that RESERVED it, and an
+      // attempt is never re-signed under a different wallet.
+      //
+      // `find(idempotencyKey)` is deliberately not executor-scoped -- the key is
+      // globally unique and a terminal attempt's cached result must be readable
+      // whoever asks. But that means a rotation (`PRIVATE_KEY` replaced) leaves
+      // older non-terminal attempts reachable, and re-signing one would produce
+      // a payload from the NEW key carrying the OLD wallet's nonce. On a fresh
+      // account that nonce is far in the future: a node accepts it into the
+      // mempool and it never mines -- no broadcast error, no revert, nothing to
+      // classify. The quietest possible failure, so it is refused here.
+      //
+      // Only RE-SIGNING is fenced. An attempt already past SIGNED carries a
+      // payload the owning executor produced and may legitimately still be in
+      // flight; re-broadcasting those exact bytes and verifying them uses no key
+      // at all, so crash recovery for the previous wallet's transaction is
+      // preserved. Resume under the SAME executor is untouched.
+      if (notYetReached(attempt.status, 'SIGNED') && attempt.nonce !== null) {
+        const owner = attempt.executorAddress ?? null;
+        const current = repo.executorAddress || null;
+        if (owner !== current) {
+          const message =
+            `attempt holds nonce ${lockedNonce} reserved by executor ${owner ?? 'unknown/legacy'}, ` +
+            `but this process signs as ${current ?? 'unknown'} -- refusing to re-sign another wallet's nonce. ` +
+            'Retire this attempt (new idempotencyKey) instead of resuming it.';
+          report('EXECUTOR_MISMATCH', message, attempt, { nonce: lockedNonce, owner, current });
+          // Resumable, never FAILED: this is an ownership/configuration fact, not
+          // a verdict about the transaction. It surfaces through the existing
+          // stuck-attempt reporting so an operator decides what to retire.
+          return ambiguousFailure(message, attempt);
+        }
       }
 
       if (notYetReached(attempt.status, 'SIGNED')) {

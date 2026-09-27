@@ -117,6 +117,14 @@ export interface TransactionAttemptRecord {
    * `update()`'s doc comment below for what a mismatch means.
    */
   version: number;
+  /**
+   * The executor wallet that owns this attempt's nonce. A nonce is only
+   * meaningful for one account, and storage outlives `PRIVATE_KEY`: `null`
+   * means the row predates executor scoping, i.e. it belongs to a PREVIOUS
+   * wallet. Null never matches a current executor, so a key rotation inherits
+   * no nonce history.
+   */
+  executorAddress: string | null;
 }
 
 /**
@@ -131,6 +139,27 @@ export interface TransactionAttemptRecord {
  * response), but future callers that DO want to distinguish "genuinely
  * stale" from "some other failure" can catch this specifically.
  */
+/**
+ * The nonce could not be reserved right now -- the cross-process reservation
+ * lock was unavailable (SQLITE_BUSY/timeout), or the database's
+ * `(executorAddress, nonce)` unique index rejected the write because another
+ * process took that nonce first.
+ *
+ * Always AMBIGUOUS, never definitive: nothing was signed and no nonce was
+ * consumed, so the caller must resume, not fail. Deliberately distinct from
+ * `StaleTransactionAttemptWriteError` so contention can be logged as
+ * contention rather than looking like a stale-writer bug.
+ */
+export class NonceReservationUnavailableError extends Error {
+  constructor(
+    message: string,
+    public readonly kind: 'LOCK_CONTENTION' | 'NONCE_TAKEN',
+  ) {
+    super(message);
+    this.name = 'NonceReservationUnavailableError';
+  }
+}
+
 export class StaleTransactionAttemptWriteError extends Error {
   constructor(id: string, expectedVersion: number) {
     super(`TransactionAttempt ${id} was not at expected version ${expectedVersion} -- a different writer has since updated it`);
@@ -139,6 +168,13 @@ export class StaleTransactionAttemptWriteError extends Error {
 }
 
 export interface TransactionAttemptRepository {
+  /**
+   * The executor identity this repository scopes nonce state to, lowercased
+   * (empty string = unscoped, which stores NULL). Exposed so the pipeline can
+   * refuse to RE-SIGN an attempt whose nonce was reserved by a different
+   * wallet -- see `executeCriticalTransaction`'s executor-ownership fence.
+   */
+  readonly executorAddress: string;
   find(idempotencyKey: string): Promise<TransactionAttemptRecord | null>;
   create(idempotencyKey: string, purpose: string): Promise<TransactionAttemptRecord>;
   /**
@@ -178,6 +214,36 @@ export interface TransactionAttemptRepository {
    * one nonce.
    */
   findSignedNoncesAtOrAbove(minNonce: number): Promise<number[]>;
+  /**
+   * Atomically allocates and persists this attempt's nonce, scoped to the
+   * repository's executor identity.
+   *
+   * This is ONE database transaction, not a read followed by a write:
+   * `ExecutorMutex` serializes callers inside a single process, but two bot
+   * processes sharing this database have no such mutex, and a read-then-write
+   * allocation lets both compute the same nonce from the same snapshot. The
+   * implementation therefore takes a cross-process write lock before reading
+   * (the same technique `PositionRepository` uses for capital), and the
+   * database's partial unique index on `(executorAddress, nonce)` is the
+   * backstop if anything still races.
+   *
+   * `chainPendingNonce` is the chain's answer, used only as the starting point
+   * -- see `nonceAllocation.ts` for why it is never taken as authoritative.
+   *
+   * Throws `NonceReservationUnavailableError` when the lock is unavailable or
+   * the nonce was taken concurrently: both mean "resume", never "failed".
+   * Throws `StaleTransactionAttemptWriteError` if the attempt moved on.
+   */
+  reserveNonce(input: {
+    attemptId: string;
+    expectedVersion: number;
+    chainPendingNonce: number;
+  }): Promise<{
+    attempt: TransactionAttemptRecord;
+    nonce: number;
+    adjustedBy: 'ALREADY_SIGNED' | 'RESERVED_BY_ANOTHER_ATTEMPT' | null;
+    skipped: number;
+  }>;
 }
 
 export type StepResult<TReason extends string = string> = { ok: true } | { ok: false; reason: TReason };

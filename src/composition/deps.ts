@@ -35,8 +35,11 @@ import type { AppDeps } from './types';
 export function createRealAppDeps(): AppDeps {
   const prisma = getPrismaClient();
   const positions = new PrismaPositionRepository(prisma);
-  const txAttempts = new PrismaTransactionAttemptRepository(prisma);
   const walletAddress = getExecutorAddress();
+  // Nonce state is scoped to the executor identity: storage outlives
+  // PRIVATE_KEY, so a rotated wallet must not inherit the previous wallet's
+  // nonce history (see transactionAttemptRepository.reserveNonce).
+  const txAttempts = new PrismaTransactionAttemptRepository(prisma, walletAddress);
 
   return {
     positions,

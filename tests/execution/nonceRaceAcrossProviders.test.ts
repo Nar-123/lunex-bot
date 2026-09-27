@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { executeCriticalTransaction } from '../../src/execution/executeCriticalTransaction';
 import type { TxRequest, TxSafetyDeps } from '../../src/execution/types';
+import { NonceReservationUnavailableError } from '../../src/execution/types';
 import { InMemoryTransactionAttemptRepository } from './inMemoryTransactionAttemptRepository';
 
 /**
@@ -475,9 +476,14 @@ describe('failure handling is unchanged -- staleness never becomes a FAILED verd
     expect(deps.broadcastRaw).not.toHaveBeenCalled();
   });
 
-  it('a findNonTerminal failure during allocation is resumable, never FAILED, and signs nothing', async () => {
+  it('a reservation-lock failure is resumable, never FAILED, and signs nothing', async () => {
+    // Cross-process contention on the reservation lock: somebody else is
+    // holding it. Nothing was signed and no nonce was consumed, so this must
+    // resume, never fail.
     const repo = new InMemoryTransactionAttemptRepository();
-    vi.spyOn(repo, 'findNonTerminal').mockRejectedValueOnce(new Error('database is locked'));
+    vi.spyOn(repo, 'reserveNonce').mockRejectedValueOnce(
+      new NonceReservationUnavailableError('nonce reservation lock unavailable: database is locked', 'LOCK_CONTENTION'),
+    );
     const deps = makeDeps('t', { answers: [5] });
 
     const result = await executeCriticalTransaction('throw-3', 'p', deps, repo);
@@ -493,9 +499,13 @@ describe('failure handling is unchanged -- staleness never becomes a FAILED verd
     expect(deps.broadcastRaw).not.toHaveBeenCalled();
   });
 
-  it('a findSignedNoncesAtOrAbove failure during allocation is resumable, never FAILED, and signs nothing', async () => {
+  it('a NONCE_TAKEN rejection from the DB unique index is resumable, never FAILED, and signs nothing', async () => {
+    // The database refused the claim because another process got that nonce
+    // first -- the backstop behind the lock. Still resumable.
     const repo = new InMemoryTransactionAttemptRepository();
-    vi.spyOn(repo, 'findSignedNoncesAtOrAbove').mockRejectedValueOnce(new Error('database is locked'));
+    vi.spyOn(repo, 'reserveNonce').mockRejectedValueOnce(
+      new NonceReservationUnavailableError('UNIQUE constraint failed: TransactionAttempt.executorAddress, TransactionAttempt.nonce', 'NONCE_TAKEN'),
+    );
     const deps = makeDeps('t', { answers: [5] });
 
     const result = await executeCriticalTransaction('throw-2', 'p', deps, repo);
