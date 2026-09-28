@@ -126,6 +126,13 @@ export function createFakeAppDeps(overrides: Partial<AppDeps> = {}): AppDeps {
           { index: -887220, liquidityNet: 10n ** 24n, liquidityGross: 10n ** 24n },
           { index: 887220, liquidityNet: -(10n ** 24n), liquidityGross: 10n ** 24n },
         ],
+        // Models a full-range scan: the whole tick space is known, so
+        // `estimateExitPriceImpact`'s completeness check never fires and
+        // these fixtures keep exercising what they were written for. The
+        // bounds are the SDK's absolute MIN/MAX ticks, not the nearest
+        // spacing multiple -- a swap that exhausts the pool legitimately
+        // walks all the way there, and that must stay inside the window.
+        tickWindow: { lowerTick: -887272, upperTick: 887272 },
       })),
     },
     poolVolume: { get6hVolumeUsd: vi.fn(async () => 500_000) },

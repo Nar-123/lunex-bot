@@ -41,6 +41,10 @@ function stateWithLiquidity(liquidity: bigint): V4PoolStateSnapshot {
       { index: FULL_RANGE_LOWER, liquidityNet: liquidity, liquidityGross: liquidity },
       { index: FULL_RANGE_UPPER, liquidityNet: -liquidity, liquidityGross: liquidity },
     ],
+    // A full-range scan: these fixtures model a pool whose whole tick range
+    // was read, so the completeness check in `priceImpact.ts` never fires
+    // and these cases keep exercising what they were written to exercise.
+    tickWindow: { lowerTick: FULL_RANGE_LOWER, upperTick: FULL_RANGE_UPPER },
   };
 }
 

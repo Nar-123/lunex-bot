@@ -3,7 +3,7 @@ import { getAddress } from 'viem';
 import { getPublicClient } from '../blockchain/viemClient';
 import { config } from '../config';
 import { V4_STATE_VIEW_ABI } from '../blockchain/abis/v4StateView';
-import type { PoolStateProviderPort, V4PoolRef, V4PoolStateSnapshot } from './types';
+import type { PoolStateProviderPort, V4PoolRef, V4PoolStateSnapshot, V4TickWindow } from './types';
 
 /**
  * Bitmap words scanned on each side of the current tick when fetching
@@ -46,6 +46,26 @@ function setBitsToCompressedTicks(word: number, bitmap: bigint): number[] {
     }
   }
   return ticks;
+}
+
+/**
+ * The inclusive raw-tick range covered by the scanned bitmap words — the
+ * exact region the returned tick list is COMPLETE for. Word `w` covers
+ * compressed ticks `w * 256 .. w * 256 + 255`, and an initialized tick
+ * always sits at `compressed * tickSpacing`, so the extreme knowable
+ * initialized-tick positions are the two endpoints below.
+ *
+ * Pure and exported so the boundary arithmetic is unit-testable without an
+ * RPC call: an off-by-one here would silently widen the window the
+ * completeness check in `priceImpact.ts` trusts.
+ */
+export function tickWindowForWords(centerWord: number, wordRange: number, tickSpacing: number): V4TickWindow {
+  const lowWord = centerWord - wordRange;
+  const highWord = centerWord + wordRange;
+  return {
+    lowerTick: lowWord * BITS_PER_WORD * tickSpacing,
+    upperTick: (highWord * BITS_PER_WORD + (BITS_PER_WORD - 1)) * tickSpacing,
+  };
 }
 
 /**
@@ -158,9 +178,10 @@ export class StateViewPoolStateProvider implements PoolStateProviderPort {
       liquidity,
       tickCurrent,
       ticks,
+      tickWindow: tickWindowForWords(centerWord, TICK_BITMAP_WORD_RANGE, key.tickSpacing),
     };
   }
 }
 
 /** Exported for unit testing the bitmap math without a live RPC connection. */
-export const __internal = { compress, wordPosition, bitPosition, setBitsToCompressedTicks };
+export const __internal = { compress, wordPosition, bitPosition, setBitsToCompressedTicks, tickWindowForWords, TICK_BITMAP_WORD_RANGE, BITS_PER_WORD };
