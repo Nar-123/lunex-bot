@@ -1,0 +1,87 @@
+# Lunex Bot -- the real trading engine (Robinhood USDG concentrated-liquidity
+# bot). PROPOSED unit, authored 2026-09-15 without VPS access in this
+# session -- not installed, not started, not verified against a real
+# systemd. Confirm every path below against the actual VPS before
+# `systemctl daemon-reload && systemctl enable lunex-bot` (deliberately not
+# enabled by default -- do that only when explicitly ready to run).
+#
+# Binds ONLY to a private interface (API_HOST=127.0.0.1 in the real .env --
+# see ../Caddyfile, which terminates public TLS and reverse-proxies to it).
+# Never expose Lunex's own plain-HTTP listener to 0.0.0.0 on a real deploy.
+[Unit]
+Description=Lunex Bot -- USDG concentrated-liquidity trading engine (Robinhood Chain)
+Documentation=file:///opt/lunex/production/lunex-bot/ops/lunex-bot/DEPLOYMENT.md
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=lunex-bot
+Group=lunex-bot
+UMask=0027
+
+# PROPOSED layout -- confirm/adjust against the real VPS filesystem:
+#   /opt/lunex/production/lunex-bot         repo checkout + dist/ (this project)
+#   /opt/lunex/production/lunex-bot/.env    secrets, mode 600, owned by lunex-bot
+#   /opt/lunex/production/lunex-bot/data    sqlite db + backups
+#   /opt/lunex/production/lunex-bot/logs    structured log file
+WorkingDirectory=/opt/lunex/production/lunex-bot
+EnvironmentFile=/opt/lunex/production/lunex-bot/.env
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/node /opt/lunex/production/lunex-bot/dist/index.js
+
+# Restart=on-failure (not `always`): a clean, intentional exit (e.g. a
+# future admin-triggered drain) must not be treated as a crash and
+# auto-restarted underneath the operator. `src/index.ts`'s own SIGTERM
+# handler already refuses to force-exit while a critical transaction may
+# still be in flight -- TimeoutStopSec here must stay >= that same margin
+# (config.composition.shutdownTimeoutMs, 10 minutes by default) or systemd
+# will SIGKILL mid-write, which is exactly what graceful shutdown exists
+# to prevent.
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=630
+
+# ---- Resource ceiling (shares the VPS with finance-bot/guardian/lunex-ai;
+# unlike lunex-ai, this IS the production tenant, so no Nice/CPUQuota
+# throttling by default -- only a hard MemoryMax as a runaway-leak safety
+# net, not a fairness throttle). Tune against real observed usage.
+MemoryHigh=1536M
+MemoryMax=2560M
+TasksMax=512
+
+# ---- OS-level hardening (mirrors ops/lunex-ai/systemd/lunex-ai.service's
+# proven pattern) ----
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Writable: only its own data/log directories.
+ReadWritePaths=/opt/lunex/production/lunex-bot/data /opt/lunex/production/lunex-bot/logs
+# The secret file and deployed code itself: read-only to the service.
+ReadOnlyPaths=-/opt/lunex/production/lunex-bot/.env -/opt/lunex/production/lunex-bot/dist
+# Never visible to this service, even if Unix permissions on them are ever too open.
+InaccessiblePaths=-/opt/finance-bot -/opt/guardian -/opt/lunex/ai -/opt/lunex/workspace -/root -/etc/lunex -/opt/other-bots
+
+[Install]
+WantedBy=multi-user.target

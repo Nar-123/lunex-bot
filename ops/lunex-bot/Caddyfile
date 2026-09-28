@@ -1,0 +1,36 @@
+# Lunex Bot -- minimal TLS reverse proxy (Caddy).
+# PROPOSED, authored 2026-09-15 without VPS access in this session -- this
+# session could not confirm whether Caddy, nginx, or any reverse proxy
+# already exists on the target VPS. If one already exists, adapt this
+# config's `reverse_proxy` block into it instead of installing a second
+# proxy; do not run two TLS terminators on the same host.
+#
+# Why Caddy: automatic Let's Encrypt certificate issuance/renewal with no
+# separate certbot step -- smallest operational surface for a single-app
+# VPS. If the VPS already standardizes on nginx (common alongside other
+# services on a shared host), see the nginx-equivalent notes in
+# DEPLOYMENT.md instead of installing Caddy.
+#
+# Prerequisite: Lunex itself must be configured with API_HOST=127.0.0.1
+# (NOT 0.0.0.0) in its real .env, so the only way to reach it at all is
+# through this proxy. Confirm that change is in place before opening the
+# firewall on 443 -- otherwise Lunex is still directly reachable on 8443
+# in parallel, defeating the point of this file.
+
+lunex.example.com {
+	# Replace with the real hostname/IP the operator will use. A bare IP
+	# address (no DNS) cannot get a Let's Encrypt cert automatically --
+	# either point real DNS at this VPS first, or use `tls internal` for a
+	# self-signed cert (browsers will warn; acceptable for admin-only use
+	# behind a VPN, not for anything public-facing).
+
+	reverse_proxy 127.0.0.1:8443
+
+	# Admin credentials and JWTs must never be logged in plaintext.
+	log {
+		output file /var/log/caddy/lunex-bot-access.log
+		format json
+	}
+
+	encode gzip
+}
