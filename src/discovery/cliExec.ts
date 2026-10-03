@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { join, resolve, sep } from 'node:path';
+import { existsSync, lstatSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { buildGmgnChildEnv } from './childEnv';
 export class GmgnCliExecutionError extends Error {
   constructor(
@@ -145,12 +146,80 @@ export function resolveWindowsCliEntry(
   return { command: cliPath, args: [] };
 }
 
+/**
+ * Private runtime directory for every `gmgn-cli` child: it is the child's
+ * working directory AND its HOME.
+ *
+ * `buildGmgnChildEnv` keeps the executor key and the other service secrets
+ * out of the child's ENVIRONMENT, but that alone is not enough: gmgn-cli's
+ * own `config.js` (verified against the installed 1.5.7) loads two dotenv
+ * files on start-up --
+ *   1. `~/.config/gmgn/.env` with `override: true`, resolved via `homedir()`;
+ *   2. `${process.cwd()}/.env` (dotenv's default path).
+ * The service's WorkingDirectory and its HOME are both the production tree,
+ * whose `.env` holds `PRIVATE_KEY`. A child that inherited either would load
+ * production files straight back into the third-party process, undoing the
+ * allowlist -- and the override in (1) could even replace the GMGN_API_KEY
+ * we pass explicitly.
+ *
+ * `mkdtemp` creates the directory fresh with mode 0700, so no other account
+ * can plant a dotenv file in it. It is created lazily, reused for the life of
+ * the process, and re-created if something (e.g. tmpfiles cleanup) removed
+ * it. Nothing Lunex itself reads is resolved against this directory.
+ */
+let gmgnRuntimeDir: string | undefined;
+
+export function gmgnChildRuntimeDir(): string {
+  if (gmgnRuntimeDir === undefined || !existsSync(gmgnRuntimeDir)) {
+    gmgnRuntimeDir = mkdtempSync(join(tmpdir(), 'lunex-gmgn-'));
+  }
+  return gmgnRuntimeDir;
+}
+
+// The files gmgn-cli's two dotenv calls would read when cwd = HOME = the
+// runtime directory.
+const GMGN_DOTENV_FILES = ['.env', join('.config', 'gmgn', '.env')];
+
+/**
+ * Checked before every spawn; any failure refuses the call (fail closed)
+ * rather than running the CLI somewhere it could read secrets from.
+ */
+function assertSafeRuntimeDir(dir: string): void {
+  const st = lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error(`refusing to run gmgn-cli: runtime directory ${dir} is not a plain directory`);
+  }
+  if (!IS_WINDOWS) {
+    if ((st.mode & 0o077) !== 0) {
+      throw new Error(`refusing to run gmgn-cli: runtime directory ${dir} is not private (mode ${(st.mode & 0o777).toString(8)})`);
+    }
+    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) {
+      throw new Error(`refusing to run gmgn-cli: runtime directory ${dir} is not owned by this process`);
+    }
+  }
+  // e.g. TMPDIR pointed into the service tree: never run the CLI there.
+  const rel = relative(resolve(process.cwd()), resolve(dir));
+  if (rel === '' || !(rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel))) {
+    throw new Error(`refusing to run gmgn-cli: runtime directory ${dir} is inside the service working directory`);
+  }
+  for (const file of GMGN_DOTENV_FILES) {
+    if (existsSync(join(dir, file))) {
+      throw new Error(`refusing to run gmgn-cli: its runtime directory contains ${file}`);
+    }
+  }
+}
+
 function execFileOnce(
   cliPath: string,
   args: readonly string[],
   timeoutMs: number,
   env: NodeJS.ProcessEnv,
+  runtimeDir: string,
 ): Promise<string> {
+  assertSafeRuntimeDir(runtimeDir);
+  // Enforced here, at the single spawn point, so it holds whatever env the
+  // caller built: `homedir()` reads HOME on POSIX and USERPROFILE on Windows.
+  const childEnv: NodeJS.ProcessEnv = { ...env, HOME: runtimeDir, USERPROFILE: runtimeDir };
   // Resolve per-call rather than at module load so a missing CLI surfaces
   // as the same GmgnCliExecutionError path on every attempt.
   const resolved = IS_WINDOWS ? resolveWindowsCliEntry(cliPath) : { command: cliPath, args: [] as string[] };
@@ -159,7 +228,7 @@ function execFileOnce(
     execFile(
       resolved.command,
       argv,
-      { timeout: timeoutMs, env, maxBuffer: 10 * 1024 * 1024 },
+      { timeout: timeoutMs, env: childEnv, cwd: runtimeDir, maxBuffer: 10 * 1024 * 1024 },
       (error, stdout) => {
         if (error) {
           // execFile's error is an ExecFileException (an Error carrying
@@ -193,7 +262,16 @@ export async function runGmgnCliJson(
     try {
       // `options.env` omitted must NOT mean "inherit every Lunex secret" --
       // fall back to the same allowlist `GmgnCliClient` passes explicitly.
-      const stdout = await execFileOnce(cliPath, args, options.timeoutMs, options.env ?? buildGmgnChildEnv(process.env));
+      // The runtime directory is resolved and checked inside this try, so a
+      // failure is a GmgnCliExecutionError like any other -- never a fallback
+      // to the service's own (production) working directory or HOME.
+      const stdout = await execFileOnce(
+        cliPath,
+        args,
+        options.timeoutMs,
+        options.env ?? buildGmgnChildEnv(process.env),
+        gmgnChildRuntimeDir(),
+      );
       try {
         return JSON.parse(stdout);
       } catch (parseErr) {
