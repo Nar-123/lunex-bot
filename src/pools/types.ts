@@ -30,6 +30,30 @@ export interface V4PoolRef {
   key: V4PoolKey;
 }
 
+/**
+ * The inclusive raw-tick range the provider actually scanned when building
+ * a snapshot. This is the ONLY region where `ticks` is known to be
+ * complete: every initialized tick inside it was read from the pool's tick
+ * bitmap, so a gap inside the window is genuinely uninitialized liquidity.
+ * Outside it nothing is known at all.
+ *
+ * This distinction is load-bearing, not bookkeeping. `@uniswap/v3-sdk`'s
+ * `TickList.nextInitializedTickWithinOneWord` (which v4-sdk's `Pool` uses)
+ * does NOT throw when a swap walks past the end of the supplied tick list:
+ * `tickList.js:88-89` and `:98-99` return `[wordBoundary, false]`, i.e.
+ * "no initialized tick here". The swap loop therefore continues as if
+ * liquidity never changed again out there — which makes a truncated pool
+ * look DEEPER than it is and UNDER-reports price impact, the
+ * money-losing direction. `priceImpact.ts` fails closed instead, by
+ * proving the simulated price walk never leaves this window.
+ */
+export interface V4TickWindow {
+  /** Lowest raw tick index whose initialization state is known. */
+  lowerTick: number;
+  /** Highest raw tick index whose initialization state is known. */
+  upperTick: number;
+}
+
 /** Real on-chain state needed to construct a v4-sdk `Pool` for simulation. */
 export interface V4PoolStateSnapshot {
   sqrtPriceX96: bigint;
@@ -42,6 +66,13 @@ export interface V4PoolStateSnapshot {
    * rather than silently under/over-estimating impact.
    */
   ticks: Array<{ index: number; liquidityNet: bigint; liquidityGross: bigint }>;
+  /**
+   * The scanned range `ticks` is complete for. Required, so that a provider
+   * physically cannot hand the simulator a tick list without saying how far
+   * its knowledge extends — the completeness check in `priceImpact.ts` has
+   * no safe default to fall back on.
+   */
+  tickWindow: V4TickWindow;
 }
 
 export type PriceImpactEstimate =

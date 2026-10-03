@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Address } from 'viem';
 import { __internal, checkStateViewBinding } from '../../src/pools/poolStateProvider';
 
-const { compress, wordPosition, bitPosition, setBitsToCompressedTicks } = __internal;
+const { compress, wordPosition, bitPosition, setBitsToCompressedTicks, tickWindowForWords, BITS_PER_WORD } = __internal;
 
 describe('checkStateViewBinding', () => {
   const poolManager: Address = '0x8366a39cc670b4001a1121b8f6a443a643e40951';
@@ -63,5 +63,35 @@ describe('tick bitmap math', () => {
 
   it('returns an empty array for an all-zero bitmap', () => {
     expect(setBitsToCompressedTicks(0, 0n)).toEqual([]);
+  });
+});
+
+describe('tickWindowForWords -- the range the tick list is provably complete for', () => {
+  it('covers exactly the scanned words, inclusive of both edge bits', () => {
+    // One word either side of word 0, tickSpacing 1: compressed ticks
+    // -256 .. 511, i.e. the first bit of the lowest word through the last
+    // bit of the highest.
+    expect(tickWindowForWords(0, 1, 1)).toEqual({ lowerTick: -256, upperTick: 511 });
+  });
+
+  it('scales with tick spacing', () => {
+    expect(tickWindowForWords(0, 1, 60)).toEqual({ lowerTick: -256 * 60, upperTick: 511 * 60 });
+  });
+
+  it('follows the centre word', () => {
+    expect(tickWindowForWords(3, 0, 1)).toEqual({ lowerTick: 3 * BITS_PER_WORD, upperTick: 3 * BITS_PER_WORD + 255 });
+  });
+
+  it('handles negative centre words without an off-by-one', () => {
+    expect(tickWindowForWords(-1, 0, 1)).toEqual({ lowerTick: -256, upperTick: -1 });
+  });
+
+  it('always produces a non-empty, correctly ordered window', () => {
+    for (const centre of [-5, -1, 0, 1, 7]) {
+      for (const range of [0, 1, 10]) {
+        const w = tickWindowForWords(centre, range, 60);
+        expect(w.lowerTick).toBeLessThan(w.upperTick);
+      }
+    }
   });
 });

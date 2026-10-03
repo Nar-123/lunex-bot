@@ -2,7 +2,7 @@ import { Token, CurrencyAmount, Percent, computePriceImpact } from '@uniswap/sdk
 import JSBI from 'jsbi';
 import { v4Sdk } from '../blockchain/uniswapSdk';
 import { config } from '../config';
-import type { V4PoolKey, V4PoolStateSnapshot, PriceImpactEstimate } from './types';
+import type { V4PoolKey, V4PoolStateSnapshot, V4TickWindow, PriceImpactEstimate } from './types';
 
 function buildPool(
   key: V4PoolKey,
@@ -56,43 +56,73 @@ function thresholdPercent(fraction: number): Percent {
  * a hook's effect. Callers must treat `ok: false` as a rejection, never a
  * pass.
  *
- * ## H7 fix — corrected tick-window-truncation documentation
+ * ## Tick-window completeness — why zero-net is NOT proof
  *
- * An EARLIER version of this comment claimed a too-narrow fetched window
- * "fails safe toward 100% impact" because the swap math supposedly treats
- * unfetched regions as zero liquidity. That claim was FACTUALLY WRONG,
- * verified directly against the installed SDK: `@uniswap/v4-sdk`'s
- * `Pool`/`TickListDataProvider` enforces a `ZERO_NET` invariant at
- * CONSTRUCTION time (liquidityNet across the supplied tick list must sum
- * to exactly zero, since every position's addition at tickLower has a
- * matching subtraction at tickUpper) — a genuinely truncated window
- * (missing ticks at either edge) generally breaks this and throws a
- * cryptic `"Invariant failed: ZERO_NET"` error, not a smoothly-degrading
- * high-impact number. The MONEY-SAFETY outcome is still fine either way
- * (a throw is caught below and returns `ok: false`, same as a genuine
- * high-impact rejection) — but the mechanism and the diagnostic message
- * were both wrong, which made a real truncation bug hard to distinguish
- * from other failures. `estimateExitPriceImpact` now checks the SAME
- * zero-net invariant itself, BEFORE constructing the `Pool`, so a
- * truncated window produces a clear, self-describing reason instead of
- * the SDK's internal invariant message.
+ * Two earlier versions of this comment were wrong in opposite directions,
+ * so the mechanism is spelled out here against the installed SDK.
+ *
+ * The first claimed a too-narrow window "fails safe toward 100% impact"
+ * because unfetched regions read as zero liquidity. Wrong.
+ *
+ * The second claimed a truncated window "generally breaks the SDK's
+ * `ZERO_NET` invariant and throws". Also wrong, and more dangerous,
+ * because it was used to justify treating `sum(liquidityNet) === 0` as
+ * PROOF that the window is complete. It is not. Zero-net is a NECESSARY
+ * condition, never a sufficient one: a window that drops a `+L` tick and
+ * a `-L` tick still sums to zero, constructs a `Pool` without complaint,
+ * and simulates happily.
+ *
+ * What actually happens past the edge of the supplied tick list is worse
+ * than a throw. `@uniswap/v3-sdk`'s `TickList.nextInitializedTickWithinOneWord`
+ * (used by v4-sdk's `Pool`) returns `[wordBoundary, false]` rather than
+ * throwing — `tickList.js:88-89` for a downward walk, `:98-99` for an
+ * upward one. "Not initialized" makes the swap loop carry the CURRENT
+ * liquidity onward as if it never changed again, so a truncated pool
+ * simulates as DEEPER than it really is and the reported impact is
+ * UNDER-estimated. That is the money-losing direction, and it is silent.
+ *
+ * So completeness is proven positively instead, from the window the
+ * provider actually scanned (`state.tickWindow`, see `types.ts`):
+ *
+ *   1. every fetched tick must lie inside that window (a snapshot whose
+ *      own tick list escapes its stated coverage is malformed);
+ *   2. the current tick must lie inside it;
+ *   3. zero-net must still hold — kept as the cheap necessary check, with
+ *      an honest reason string;
+ *   4. and, after simulating, the price walk from `tickCurrent` to the
+ *      post-swap tick must stay STRICTLY inside the window. Touching a
+ *      boundary is rejected too: at the boundary the next tick beyond is
+ *      exactly what was never read.
+ *
+ * Only (4) can catch the cancelling-pair case, because only (4) asks the
+ * question that actually matters — did this simulation depend on data we
+ * never fetched?
  *
  * On window sizing: `poolStateProvider.ts`'s `TICK_BITMAP_WORD_RANGE`
  * (±10 words) already scales with `tickSpacing` for free -- each bitmap
  * word covers `256 * tickSpacing` raw ticks, so a coarser-tickSpacing pool
  * (which also has coarser, more widely-spaced real positions) gets a
  * proportionally wider absolute tick range fetched for the same word
- * count. Ten words either side of the current tick is wide enough to
- * contain both boundaries of the ~50%-below-entry one-sided range this
- * strategy itself creates (see `strategies/computeLpRange.ts`) for any
- * `tickSpacing` this project's pool selection accepts. A pool with
- * genuinely unusual liquidity concentration far outside that window still
- * fails SAFE (rejected, self-describing reason) rather than silently
- * passing, so widening the window further is a thoroughness/cost
- * trade-off, not a correctness requirement.
+ * count. A pool whose exit swap genuinely walks outside that window is
+ * now REJECTED with a self-describing reason rather than simulated on
+ * data that does not exist, so widening the window is a
+ * thoroughness/cost trade-off, not a correctness requirement.
  */
 function tickNetSum(ticks: V4PoolStateSnapshot['ticks']): bigint {
   return ticks.reduce((sum, t) => sum + t.liquidityNet, 0n);
+}
+
+/**
+ * True when the whole walked span `[low, high]` is covered by the scanned
+ * window. Containment is INCLUSIVE: the boundary ticks themselves were
+ * read from the bitmap, so a walk that ends exactly on `lowerTick` or
+ * `upperTick` still used only data we actually have. What is unknown
+ * begins one tick BEYOND each edge, which is why a swap that ends past an
+ * edge — the case where the SDK has silently extrapolated — is the one
+ * that must be rejected.
+ */
+function spanProvenInsideWindow(low: number, high: number, window: V4TickWindow): boolean {
+  return low >= window.lowerTick && high <= window.upperTick;
 }
 export async function estimateExitPriceImpact(
   key: V4PoolKey,
@@ -102,17 +132,35 @@ export async function estimateExitPriceImpact(
   positionSizeUsdgRaw: bigint,
 ): Promise<PriceImpactEstimate> {
   try {
-    // H7 fix: pre-check the SAME zero-net invariant the SDK enforces
-    // internally, so a truncated fetch window produces a clear,
-    // self-describing reason instead of the SDK's own cryptic invariant
-    // message. Skipped for an empty tick list (sum trivially 0, and an
-    // empty pool is its own separate, already-safe rejection path via
-    // whatever `Pool`/`getOutputAmount` does with zero liquidity).
+    const window = state.tickWindow;
+    if (window.lowerTick >= window.upperTick) {
+      return { ok: false, reason: `tick window is empty or inverted (lowerTick ${window.lowerTick} >= upperTick ${window.upperTick}) -- nothing can be proven complete` };
+    }
+
+    // (1) The snapshot must be internally consistent: a tick outside the
+    // range the provider says it scanned means the window is not describing
+    // the data, and every completeness claim below would be built on it.
+    const escaped = state.ticks.find((t) => t.index < window.lowerTick || t.index > window.upperTick);
+    if (escaped) {
+      return { ok: false, reason: `malformed snapshot -- fetched tick ${escaped.index} lies outside the scanned window [${window.lowerTick}, ${window.upperTick}]` };
+    }
+
+    // (2) The simulation starts at the current tick; if that is already
+    // outside the scanned range there is no trustworthy ground to start on.
+    if (state.tickCurrent < window.lowerTick || state.tickCurrent > window.upperTick) {
+      return { ok: false, reason: `current tick ${state.tickCurrent} lies outside the scanned window [${window.lowerTick}, ${window.upperTick}] -- cannot simulate on unfetched data` };
+    }
+
+    // (3) Zero-net: a NECESSARY condition only. Non-zero proves truncation
+    // cheaply and with a clear message (and pre-empts the SDK's cryptic
+    // `ZERO_NET` construction invariant); zero proves nothing on its own --
+    // see the cancelling-pair case in this module's doc comment, which only
+    // check (4) can catch.
     const netSum = tickNetSum(state.ticks);
     if (state.ticks.length > 0 && netSum !== 0n) {
       return {
         ok: false,
-        reason: `fetched tick window appears truncated -- liquidityNet across the ${state.ticks.length} fetched ticks sums to ${netSum} instead of 0, meaning some initialized ticks fall outside the fetched range. Cannot safely simulate; widen the tick-fetch window (see poolStateProvider.ts's TICK_BITMAP_WORD_RANGE).`,
+        reason: `fetched tick window is truncated -- liquidityNet across the ${state.ticks.length} fetched ticks sums to ${netSum} instead of 0, meaning some initialized ticks fall outside the fetched range. Cannot safely simulate; widen the tick-fetch window (see poolStateProvider.ts's TICK_BITMAP_WORD_RANGE).`,
       };
     }
 
@@ -121,7 +169,23 @@ export async function estimateExitPriceImpact(
     const usdgAmount = CurrencyAmount.fromRawAmount(usdg, JSBI.BigInt(positionSizeUsdgRaw.toString()));
     const tokenAmountIn = midPrice.invert().quote(usdgAmount);
 
-    const [outputAmount] = await pool.getOutputAmount(tokenAmountIn);
+    const [outputAmount, poolAfter] = await pool.getOutputAmount(tokenAmountIn);
+
+    // (4) The real completeness invariant. The SDK does not throw when the
+    // swap walks off the end of the tick list -- it silently carries the
+    // current liquidity onward, under-reporting impact. So require the
+    // whole walk to have stayed strictly inside the region actually read
+    // from the bitmap; anything else was simulated partly on data that was
+    // never fetched, and is rejected rather than estimated.
+    const walkedLow = Math.min(state.tickCurrent, poolAfter.tickCurrent);
+    const walkedHigh = Math.max(state.tickCurrent, poolAfter.tickCurrent);
+    if (!spanProvenInsideWindow(walkedLow, walkedHigh, window)) {
+      return {
+        ok: false,
+        reason: `exit simulation could not be proven complete -- the swap walked ticks [${walkedLow}, ${walkedHigh}], leaving the scanned window [${window.lowerTick}, ${window.upperTick}]. Beyond that window the SDK assumes liquidity never changes again, which UNDER-reports impact, so the result is rejected instead of estimated; widen the tick-fetch window (see poolStateProvider.ts's TICK_BITMAP_WORD_RANGE).`,
+      };
+    }
+
     const impact = computePriceImpact(midPrice, tokenAmountIn, outputAmount);
     const threshold = thresholdPercent(config.rules.priceImpact.MAX_EXIT_IMPACT_PCT);
     const priceImpactPct = Number(impact.toFixed(10)) / 100;
