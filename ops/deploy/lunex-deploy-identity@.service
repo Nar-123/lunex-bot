@@ -1,0 +1,45 @@
+# Lunex deployment identity probe -- one-shot, read-only, no network.
+#
+# Instance name (%i) = the deploy tool's own RELEASE_SHA, so the probe runs the
+# exact sealed build the operator is deploying with. It loads the production
+# configuration as the service account (same User and EnvironmentFile as
+# lunex-bot.service), derives the executor ADDRESS with the bot's own code, and
+# prints one JSON line to the journal. The private key never leaves the process.
+#
+# Install once (operator, reviewed):
+#   sudo install -m 0644 ops/deploy/lunex-deploy-identity@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+# Never enable it; the deploy tool starts it on demand.
+
+[Unit]
+Description=Lunex deployment identity probe (deploy tool %i)
+
+[Service]
+Type=oneshot
+# Keeps the finished probe "active (exited)" so its InvocationID stays readable
+# (a plain oneshot drops it on exit -- verified). The tool stops it before and
+# after every probe, so each run is a fresh invocation.
+RemainAfterExit=yes
+User=lunex-bot
+Group=lunex-bot
+EnvironmentFile=/opt/lunex/production/lunex-bot/.env
+WorkingDirectory=/opt/lunex/releases/%i
+ExecStart=/usr/bin/node /opt/lunex/releases/%i/dist/deploy/identityCli.js
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=60
+
+NoNewPrivileges=true
+PrivateNetwork=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadOnlyPaths=/opt/lunex/releases/%i
+InaccessiblePaths=-/opt/lunex/production/lunex-bot/data -/opt/lunex/production/lunex-bot/logs -/opt/lunex/rollback
