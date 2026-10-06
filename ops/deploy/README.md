@@ -41,7 +41,7 @@ current tree is kept, with the race-safe defence below.
 
 ```
 identity probe        lunex-deploy-identity@<TOOL>.service as lunex-bot, PrivateNetwork: executor + chainId from the PRODUCTION config
-read-only gates       chain id · release manifest + seal · previous release · DB · schema · service running · prod layout · executor nonce #1 · retired-wallet tripwire (warn)
+read-only gates       chain id · release manifest + seal · release layout · previous release · DB · schema · service running · prod layout · executor nonce #1 · retired-wallet tripwire (warn)
 start-lock            /run/systemd/system/lunex-bot.service.d/50-lunex-deploy-lock.conf (AssertPathExists on a path that never exists)
 stop                  then journal cursor
 post-stop             quiescent · layout · DB · schema · nonce #2
@@ -103,14 +103,42 @@ current production run). Any other error event makes the result
 **NEEDS_VERIFICATION** (exit code 4): deployed, but not to be resumed until checked.
 There is no unauthenticated health endpoint (`/status` is behind the admin JWT).
 
+## Preparing a release (two stages)
+
+The integration test suite runs `prisma migrate deploy` against
+`<project>/data/test-*.db` and removes only the database files, so every test run
+leaves an empty `data/` behind. When the suite ran inside the release directory,
+that `data/` was sealed into the release (found 2026-10-06 in fb4d330 and 5f26f40;
+both releases are **STALE** and must not be deployed). `prepare-release.sh` now:
+
+* **Stage A — validate** in a private `mktemp` workspace: unpack + blob check,
+  `npm ci`, Prisma 7.10.0 gate, `npm run test / typecheck / lint / build`. Every
+  test byproduct stays in the workspace (removed on success, kept on failure).
+* **Stage B — release**: unpack the pristine archive again into
+  `/opt/lunex/releases/<sha>`, its own `npm ci` + `npm run build` (HOME in the
+  workspace, never a test run), and require the release build to be byte-identical
+  to the validated build.
+* `check-release-layout.sh` before and after the seal: the tree may hold only the
+  archive's files and directories, `dist/`, `ui/dist/`, `node_modules/`,
+  `RELEASE_SHA` and `.lunex-release/`. Forbidden names (`data`, `logs`, `.env`,
+  `.env.*` except the tracked `.env.example`, `.home`, caches, `coverage`, `tmp`,
+  `rollback`, `*.db*`, `*.log`, …), top-level symlinks and anything untracked fail.
+
+## Release layout gate (deploy tool)
+
+Independently of the manifest, the tool lists the release directory's actual top
+level (lstat) and applies the same forbidden-name rules (`RELEASE_LAYOUT_INVALID`).
+It runs in `plan`, and in `execute` before the start lock and the stop, and again at
+pre-replace and post-replace. The copy primitive also refuses those names.
+
 ## Release integrity (L-1 / L-2)
 
 `prepare-release.sh` seals the release (root:root, `go-w,ug-s`), then writes
-`.lunex-release/release-manifest.v2` describing **every** entry (path, type, mode,
-sha256 or link target), installs it 0444 root, and prints
-`EXPECTED_MANIFEST_SHA256`. The operator passes that value; the tool re-walks the
-release with lstat and requires byte equality plus the seal on every entry, at
-pre-stop, pre-replace and post-replace.
+`.lunex-release/release-manifest.v2` describing **every** entry except the
+`.lunex-release/` metadata itself (path, type, mode, sha256 or link target),
+installs it 0444 root, and prints `EXPECTED_MANIFEST_SHA256`. The operator passes
+that value; the tool re-walks the release with lstat and requires byte equality
+plus the seal on every entry, at pre-stop, pre-replace and post-replace.
 
 ## M-4: schema
 

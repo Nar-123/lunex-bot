@@ -20,7 +20,8 @@ const ITEMS = [
   { name: 'RELEASE_SHA', type: 'f' as const },
 ];
 const LAYOUT: LayoutFacts = { rootIsRealDirectory: true, unsafeAncestors: [], entries: [...ITEMS, { name: '.env', type: 'f' }, { name: 'data', type: 'd' }] };
-const STAGED: StagedRelease = { artifactCommitId: RELEASE, stagedReleaseSha: RELEASE, manifestVerified: true, manifestProblems: [], items: ITEMS };
+const TOP_LEVEL = [...ITEMS, { name: '.lunex-release', type: 'd' as const }];
+const STAGED: StagedRelease = { artifactCommitId: RELEASE, stagedReleaseSha: RELEASE, manifestVerified: true, manifestProblems: [], items: ITEMS, topLevel: TOP_LEVEL };
 const MIGRATIONS = { release: [{ name: '20260927000000_x', checksum: 'c' }], db: [{ name: '20260927000000_x', checksum: 'c', finished: true, rolledBack: false }] };
 
 interface Opts {

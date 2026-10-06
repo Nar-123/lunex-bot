@@ -50,7 +50,7 @@ interface Node {
   content?: string;
 }
 
-function buildNodes(): Record<string, Node> {
+function buildNodes(extra: Record<string, Node> = {}): Record<string, Node> {
   const d = (mode = 0o755, uid = 0): Node => ({ type: 'd', mode, uid });
   const f = (content: string, mode = 0o644): Node => ({ type: 'f', mode, uid: 0, content });
   return {
@@ -66,6 +66,7 @@ function buildNodes(): Record<string, Node> {
     [`${REL}/.lunex-release`]: d(),
     [`${REL}/.lunex-release/commit-id`]: f(`${RELEASE}\n`, 0o444),
     [`${L.releasesDir}/${TOOL}/ops/deploy/lunex-bot-deploy-lock.conf`]: f(START_LOCK_CONTENT, 0o444),
+    ...extra,
   };
 }
 
@@ -101,8 +102,8 @@ beforeEach(() => {
   for (const spy of writeSpies.values()) spy.mockClear();
 });
 
-async function runPlanCli() {
-  const nodes = buildNodes();
+async function runPlanCli(extra: Record<string, Node> = {}) {
+  const nodes = buildNodes(extra);
   const fsFake = fakeFs(nodes);
   const manifest = renderManifest(walkRelease(REL, fsFake));
   nodes[`${REL}/${MANIFEST_RELATIVE_PATH}`] = { type: 'f', mode: 0o444, uid: 0, content: manifest };
@@ -192,6 +193,16 @@ describe('plan is 100% read-only (M-5)', () => {
     const mutating = calls.filter((c) => !isReadOnlyInvocation(c.file, c.args));
     expect(mutating).toEqual([]);
     expect(calls.some((c) => c.args.includes('start') || c.args.includes('stop'))).toBe(false);
+  });
+
+  it('a release carrying the test-generated data/ fails plan -- still with zero writes and zero mutating commands', async () => {
+    const { code, writes } = await runPlanCli({ [`${REL}/data`]: { type: 'd', mode: 0o755, uid: 0 } });
+    const events = writes.map((w) => JSON.parse(w) as { event: string; code?: string; status?: string });
+    expect(events.find((e) => e.event === 'gate' && e.code === 'RELEASE_LAYOUT_INVALID')).toBeDefined();
+    expect(events.find((e) => e.event === 'deploy_tool_result')?.status).toBe('ABORTED');
+    expect(code).toBe(2);
+    expect([...writeSpies.values()].filter((s) => s.mock.calls.length > 0)).toEqual([]);
+    expect(calls.filter((c) => !isReadOnlyInvocation(c.file, c.args))).toEqual([]);
   });
 
   it('never runs the identity probe unit', async () => {

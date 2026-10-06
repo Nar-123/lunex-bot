@@ -23,8 +23,12 @@ import type { EntryType } from './gate';
 
 export const MANIFEST_HEADER = 'lunex-release-manifest-v2';
 export const MANIFEST_RELATIVE_PATH = '.lunex-release/release-manifest.v2';
-/** Top-level release entries that are build bookkeeping, never part of the deployed tree. */
-export const MANIFEST_EXCLUDED_TOP = new Set(['.lunex-release', '.home']);
+/**
+ * The release's own metadata directory is the only top-level entry outside the
+ * manifest. (Releases no longer carry a build HOME: npm runs with HOME in the
+ * separate build workspace, and the layout gate rejects a .home if one appears.)
+ */
+export const MANIFEST_EXCLUDED_TOP = new Set(['.lunex-release']);
 
 export interface ManifestFs {
   lstatSync(path: string): { isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean; mode: number; uid: number; gid: number; size: number };

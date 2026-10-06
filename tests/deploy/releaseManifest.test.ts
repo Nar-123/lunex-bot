@@ -56,8 +56,6 @@ beforeEach(() => {
   fs.writeFileSync(join(rel, 'node_modules', 'pkg', 'index.js'), 'pkg\n');
   fs.writeFileSync(join(rel, 'RELEASE_SHA'), 'fb4d3306d32f61f093b41507b5e1a548cdb61863\n');
   fs.writeFileSync(join(rel, 'shared', 'a.txt'), 'a\n');
-  fs.mkdirSync(join(rel, '.home'), { recursive: true });
-  fs.writeFileSync(join(rel, '.home', 'npm-cache'), 'excluded\n');
 });
 
 afterEach(() => {
@@ -79,8 +77,17 @@ describe('release manifest v2 (L-1 / L-2)', () => {
     expect(text.startsWith(`${MANIFEST_HEADER}\n`)).toBe(true);
     expect(text).toContain('node_modules/pkg/index.js\tf\t');
     expect(text).toContain('RELEASE_SHA\tf\t');
-    expect(text).not.toContain('.home');
     expect(text).not.toContain('.lunex-release');
+  });
+
+  it('only the metadata dir is outside the manifest: a stray build HOME or data/ is recorded, never hidden', () => {
+    fs.mkdirSync(join(rel, '.home'));
+    fs.writeFileSync(join(rel, '.home', 'npm-cache'), 'x\n');
+    fs.mkdirSync(join(rel, 'data'));
+    seal();
+    const text = fs.readFileSync(join(rel, MANIFEST_RELATIVE_PATH), 'utf8');
+    expect(text).toContain('.home/npm-cache\tf\t');
+    expect(text).toContain('data\td\t');
   });
 
   it.each([

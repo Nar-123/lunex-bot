@@ -8,7 +8,10 @@ import {
   evaluateProdLayout,
   evaluateQuiescence,
   evaluateReleaseIdentity,
+  evaluateReleaseLayout,
   evaluateRollbackReady,
+  forbiddenTopLevelReason,
+  RELEASE_METADATA_DIR,
   evaluateRollbackSource,
   evaluateSchema,
   evaluateServiceRunning,
@@ -61,6 +64,8 @@ export interface StagedRelease {
   manifestProblems: string[];
   /** Top-level items from the anchored manifest -- the authoritative replace set. */
   items: { name: string; type: EntryType }[];
+  /** The release directory's top level as it ACTUALLY exists on disk (lstat), metadata dir included. */
+  topLevel: { name: string; type: EntryType }[];
 }
 
 export type ReleaseItems = readonly { name: string; type: EntryType }[];
@@ -159,7 +164,14 @@ async function stagedReleaseGate(input: DeploymentInput, ports: ReadPorts, rec: 
     stagedManifestVerified: staged.manifestVerified,
   });
   rec.add(r.level === 'fail' && staged.manifestProblems.length > 0 ? { ...r, details: { problems: staged.manifestProblems.slice(0, 20) } } : r);
-  return r.level === 'fail' ? null : staged;
+  // The release tree itself, independent of the manifest: a forbidden or
+  // malformed top-level entry fails here -- in plan, and in execute before the
+  // start lock and the stop -- never later in snapshot or replace.
+  const layout = r.code === 'RELEASE_NOT_STAGED' ? null : evaluateReleaseLayout(staged.topLevel);
+  if (layout) rec.add(layout);
+  if (r.level === 'fail' || layout?.level === 'fail') return null;
+  // Defence in depth: the replace set never contains a forbidden name, whatever the manifest says.
+  return { ...staged, items: staged.items.filter((i) => forbiddenTopLevelReason(i.name) === null && i.name !== RELEASE_METADATA_DIR) };
 }
 
 async function layoutGate(ports: ReadPorts, items: ReleaseItems, rec: Recorder): Promise<void> {

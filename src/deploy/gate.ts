@@ -195,6 +195,9 @@ export function evaluateReleaseIdentity(input: ReleaseIdentityInput): GateResult
   if (!isFullCommitSha(input.expectedReleaseSha)) {
     return fail(gate, 'EXPECTED_RELEASE_INVALID', `EXPECTED_RELEASE_SHA "${input.expectedReleaseSha}" is not a full 40-hex commit id`);
   }
+  if (input.artifactCommitId === '' && input.stagedReleaseSha === '') {
+    return fail(gate, 'RELEASE_NOT_STAGED', `no sealed release for ${input.expectedReleaseSha} is staged (prepare-release.sh has not produced it)`);
+  }
   if (input.artifactCommitId !== input.expectedReleaseSha) {
     return fail(gate, 'ARTIFACT_SHA_MISMATCH', `artifact was built from ${input.artifactCommitId || '(unknown)'}, not ${input.expectedReleaseSha}`);
   }
@@ -205,6 +208,61 @@ export function evaluateReleaseIdentity(input: ReleaseIdentityInput): GateResult
     return fail(gate, 'STAGED_MANIFEST_MISMATCH', 'the staged build no longer matches the manifest recorded when it was validated');
   }
   return pass(gate, 'RELEASE_MATCH', `artifact and staged build are ${input.expectedReleaseSha}`);
+}
+
+// ---------------------------------------------------------------------------
+// Release layout (top level of the sealed release tree, as it exists on disk)
+// ---------------------------------------------------------------------------
+
+/** The release's own bookkeeping directory; never deployed. */
+export const RELEASE_METADATA_DIR = '.lunex-release';
+
+/**
+ * Top-level names a release must never carry: runtime state, secrets, caches,
+ * tool homes, VCS and test byproducts, rollback/session material. Mirrors the
+ * repository's .gitignore (data/, .env, .env.*, *.db, coverage/) and the
+ * production entries the deploy tool protects.
+ */
+const FORBIDDEN_TOP_LEVEL_NAMES = new Set([
+  'data', 'logs', '.env', '.home', '.cache', '.config', '.npm', '.npm-cache', '.git', '.nyc_output',
+  'coverage', 'tmp', '.tmp', 'session', 'sessions', 'rollback', 'backups',
+]);
+/** The one tracked .env-family file: a placeholder template (verified: no secret values). */
+const ALLOWED_ENV_TEMPLATE = '.env.example';
+
+/** Why a top-level release entry is not allowed, or null when it is. */
+export function forbiddenTopLevelReason(name: string): string | null {
+  if (name === '' || name === '.' || name === '..') return 'empty or relative name';
+  if (/[/\\\u0000-\u001f\u007f]/.test(name)) return 'path separator or control character in name';
+  if (name.startsWith('-')) return 'name starts with "-"';
+  if (FORBIDDEN_TOP_LEVEL_NAMES.has(name)) return 'runtime/secret/cache/session entry';
+  if (/^\.env(\..*)?$/.test(name) && name !== ALLOWED_ENV_TEMPLATE) return 'environment file';
+  if (/\.(db|sqlite|sqlite3)(-journal|-wal|-shm)?$/i.test(name)) return 'database file';
+  if (/\.log$/i.test(name)) return 'log file';
+  return null;
+}
+
+/**
+ * Validates the release tree's ACTUAL top level (read from disk, not from the
+ * manifest). Runs in plan and in execute before the start lock and the stop,
+ * so an invalid artifact can never get as far as touching production.
+ */
+export function evaluateReleaseLayout(entries: readonly { name: string; type: EntryType }[]): GateResult {
+  const gate = 'release-layout';
+  if (entries.length === 0) return fail(gate, 'RELEASE_LAYOUT_INVALID', 'the release tree is empty or unreadable');
+  const problems: string[] = [];
+  const meta = entries.find((e) => e.name === RELEASE_METADATA_DIR);
+  if (!meta || meta.type !== 'd') problems.push(`${RELEASE_METADATA_DIR} is ${meta ? `a ${meta.type}` : 'missing'}, not a directory`);
+  for (const e of entries) {
+    if (e.name === RELEASE_METADATA_DIR) continue;
+    const reason = forbiddenTopLevelReason(e.name);
+    if (reason) problems.push(`${JSON.stringify(e.name)}: ${reason}`);
+    else if (e.type !== 'd' && e.type !== 'f') problems.push(`${JSON.stringify(e.name)}: top-level ${e.type === 'l' ? 'symlink' : 'special file'}`);
+  }
+  if (problems.length > 0) {
+    return fail(gate, 'RELEASE_LAYOUT_INVALID', `release tree carries entries that must never reach production: ${problems.join('; ')}`, { problems });
+  }
+  return pass(gate, 'RELEASE_LAYOUT_CLEAN', `${entries.length - 1} top-level release entries are plain, allowed files/directories`);
 }
 
 export function evaluatePreviousRelease(expectedPreviousSha: string, deployedSha: string): GateResult {

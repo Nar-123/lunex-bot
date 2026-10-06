@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as nodeFs from 'node:fs';
 import { createPublicClient, http } from 'viem';
-import { isFullCommitSha, normalizeAddress, type AppliedMigration, type DbSnapshot, type EntryType, type GateResult, type HealthFacts, type LayoutFacts, type MigrationRecord, type NonceObservation, type QuiescenceFacts, type RollbackSnapshot, type RollbackSourceFacts, type ServiceSnapshot } from './gate';
+import { forbiddenTopLevelReason, isFullCommitSha, normalizeAddress, type AppliedMigration, type DbSnapshot, type EntryType, type GateResult, type HealthFacts, type LayoutFacts, type MigrationRecord, type NonceObservation, type QuiescenceFacts, type RollbackSnapshot, type RollbackSourceFacts, type ServiceSnapshot } from './gate';
 import { ROOT_SEAL, verifyRelease, type ManifestFs, type SealPolicy } from './releaseManifest';
 import type { DeployPorts, ReadPorts, StagedRelease } from './pipeline';
 
@@ -230,7 +230,9 @@ export function parseListing(stdout: string): ListingEntry[] {
 
 /** Copy one top-level item into dstRoot without ever writing through a symlink (see module doc). */
 export function itemRsyncArgs(srcRoot: string, dstRoot: string, item: string, extra: readonly string[]): string[] {
-  if (item === '' || item.includes('/') || item === '.' || item === '..' || FORBIDDEN_ITEMS.has(item)) throw new Error(`refusing item name ${JSON.stringify(item)}`);
+  if (item === '' || item.includes('/') || item === '.' || item === '..' || FORBIDDEN_ITEMS.has(item) || forbiddenTopLevelReason(item) !== null) {
+    throw new Error(`refusing item name ${JSON.stringify(item)}`);
+  }
   return [...extra, ...(item === 'ops' ? [OPS_EXCLUDE] : []), '--', `${srcRoot}/${item}`, `${dstRoot}/`];
 }
 
@@ -406,7 +408,17 @@ function buildReadPorts(
       } catch (err) {
         v.problems.push(`release metadata unreadable: ${err instanceof Error ? err.message : String(err)}`);
       }
-      return Promise.resolve({ artifactCommitId, stagedReleaseSha, manifestVerified: v.ok && v.problems.length === 0, manifestProblems: v.problems, items: v.items });
+      // The actual top level of the release tree (lstat, never the manifest), for the layout gate.
+      const topLevel: { name: string; type: EntryType }[] = [];
+      try {
+        for (const name of fs.readdirSync(releaseDir)) {
+          const st = fs.lstatSync(`${releaseDir}/${name}`);
+          topLevel.push({ name, type: st.isSymbolicLink() ? 'l' : st.isDirectory() ? 'd' : st.isFile() ? 'f' : 'other' });
+        }
+      } catch (err) {
+        v.problems.push(`release tree unreadable: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return Promise.resolve({ artifactCommitId, stagedReleaseSha, manifestVerified: v.ok && v.problems.length === 0, manifestProblems: v.problems, items: v.items, topLevel });
     },
 
     async readSchema(): Promise<{ release: MigrationRecord[]; db: AppliedMigration[] }> {
